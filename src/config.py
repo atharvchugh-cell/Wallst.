@@ -43,6 +43,11 @@ MAX_CONCURRENT_POSITIONS = 5
 # SMA-50/RSI-14 are valid by the time the requested start date arrives.
 MEAN_REVERSION_WARMUP_CALENDAR_DAYS = 200
 
+# Minimum fraction of the configured mean-reversion universe that must survive
+# data fetch/gap checks. Below this, the run hard-fails instead of silently
+# producing a thin (or all-cash, "no trade") backtest on a degraded universe.
+MIN_MEAN_REVERSION_UNIVERSE_FRACTION = 0.8
+
 # --- Sector rotation ---
 SECTOR_ETFS = [
     "XLK", "XLF", "XLE", "XLV", "XLY",

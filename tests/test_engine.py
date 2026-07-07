@@ -133,6 +133,46 @@ def test_average_cost_partial_sell_accounting():
     assert full_exit.avg_cost_basis == pytest.approx(100.0)  # unchanged after partial sell
 
 
+def test_holding_days_is_trading_days_not_calendar_days():
+    dates = pd.bdate_range("2024-01-01", periods=10)  # Jan1(Mon)..Jan12(Fri), skips the Jan6-7 weekend
+    price_data = {"A": make_price_df([100.0] * 10, dates)}
+    schedule = {
+        dates[0]: [("A", dates[1], 1.0, "entry")],  # fills Jan2 (index 1)
+        dates[4]: [("A", dates[5], 0.0, "exit")],   # signal Fri Jan5, fills Mon Jan8 (index 5)
+    }
+    strat = ScriptedStrategy(["A"], schedule)
+    result = run_backtest(strat, price_data, dates, dates[0], dates[-1], capital=1000.0, cost_bps=0.0)
+
+    trade = result.trades[0]
+    assert trade.event_type == "full_exit"
+    assert trade.holding_days == 4  # trading days between fill index 1 and fill index 5
+    assert trade.holding_calendar_days == (dates[5] - dates[1]).days  # 6 calendar days -- crosses a weekend
+    assert trade.holding_calendar_days > trade.holding_days
+
+
+def test_net_pnl_reflects_transaction_costs_gross_does_not():
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    close = [100.0, 100.0, 100.0]
+    price_data = {"A": make_price_df(close, dates)}
+    schedule = {
+        dates[0]: [("A", dates[1], 1.0, "entry")],
+        dates[1]: [("A", dates[2], 0.0, "exit")],
+    }
+    strat = ScriptedStrategy(["A"], schedule)
+    result = run_backtest(strat, price_data, dates, dates[0], dates[-1], capital=1000.0, cost_bps=100.0)  # 1%
+
+    trade = result.trades[0]
+    assert trade.event_type == "full_exit"
+    # Price never moved, so GROSS P&L (which ignores transaction costs) is ~0...
+    assert trade.realized_pnl == pytest.approx(0.0, abs=1e-9)
+    # ...but NET P&L reflects the buy+sell cost drag and is meaningfully negative.
+    assert trade.realized_pnl_net < 0
+    qty = result.transactions[0].shares_traded
+    cost_rate = 100.0 / 10000.0
+    expected_net = qty * (100.0 * (1 - cost_rate) - 100.0 * (1 + cost_rate))
+    assert trade.realized_pnl_net == pytest.approx(expected_net, rel=1e-6)
+
+
 def test_cash_constrained_buy_scaling():
     dates = pd.bdate_range("2024-01-01", periods=4)
     close_a = [100.0, 100.0, 100.0, 100.0]

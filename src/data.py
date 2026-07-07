@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,10 +74,15 @@ def _meta_matches(meta: dict, auto_adjust: bool, interval: str) -> bool:
 
 
 def _fetch_range(ticker: str, start, end, auto_adjust: bool, interval: str) -> pd.DataFrame:
+    # yfinance's `end` is EXCLUSIVE of that calendar date in practice (confirmed
+    # against real downloads, not just mocked tests) -- request one extra day so
+    # the requested end date's own bar is actually included. Callers slice back
+    # down to the exact requested [start, end] afterward, so this is safe.
+    fetch_end = pd.Timestamp(end) + pd.Timedelta(days=1)
     df = yf.download(
         ticker,
         start=start,
-        end=end,
+        end=fetch_end,
         auto_adjust=auto_adjust,
         interval=interval,
         progress=False,
@@ -149,8 +155,17 @@ def get_price_history(
             meta_out["cached_end"] = str(combined.index.max())
             _write_cache(ticker, cache_dir, combined, meta_out)
             cached_df = combined
-        except FetchError:
-            pass  # no new bars yet (e.g. weekend) -- fall back to what's cached
+        except FetchError as fetch_err:
+            # No new bars available (e.g. weekend) OR a real network/API failure --
+            # either way, we fall back to stale cached data instead of failing the
+            # run. That fallback must not be silent: warn so the caller can surface
+            # it in the report rather than the run quietly using an earlier-than-
+            # requested effective end.
+            warnings.warn(
+                f"{ticker}: could not extend cached data through {end.date()} "
+                f"({fetch_err}); falling back to cached data through "
+                f"{cached_df.index.max().date()}. Requested end may not be reflected."
+            )
 
     return cached_df.loc[(cached_df.index >= start) & (cached_df.index <= end)]
 

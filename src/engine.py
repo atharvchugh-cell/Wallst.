@@ -49,10 +49,13 @@ class Trade:
     shares_sold: float
     sale_price: float
     avg_cost_basis: float
-    realized_pnl: float
-    realized_return_pct: float
+    realized_pnl: float  # gross, ignores buy/sell transaction costs
+    realized_return_pct: float  # gross
     reason: str | None
-    holding_days: int
+    holding_days: int  # trading days held (fill day counts as 0), matches config.MAX_HOLDING_DAYS units
+    holding_calendar_days: int = 0
+    realized_pnl_net: float | None = None  # net of this lot's buy+sell transaction costs
+    realized_return_pct_net: float | None = None
 
 
 @dataclass
@@ -118,6 +121,7 @@ def run_backtest(
     cash = float(capital)
     shares: dict[str, float] = {}
     avg_cost: dict[str, float] = {}
+    avg_cost_incl_fees: dict[str, float] = {}  # basis including this lot's buy-side transaction cost
     lot_entry_date: dict[str, pd.Timestamp] = {}
 
     target_events_log: list[TargetEvent] = []
@@ -148,8 +152,8 @@ def run_backtest(
     for d in calendar_walk:
         events_today = pending_by_fill_date.pop(d, [])
         todays_transactions, cash = _execute_events(
-            events_today, d, close_lookup, cash, shares, avg_cost, lot_entry_date,
-            cost_bps, fractional_shares, trades,
+            events_today, d, close_lookup, cash, shares, avg_cost, avg_cost_incl_fees, lot_entry_date,
+            cost_bps, fractional_shares, trades, calendar_walk,
         )
 
         sleeve_equity_today = cash + sum(
@@ -207,10 +211,12 @@ def _execute_events(
     cash: float,
     shares: dict[str, float],
     avg_cost: dict[str, float],
+    avg_cost_incl_fees: dict[str, float],
     lot_entry_date: dict[str, pd.Timestamp],
     cost_bps: float,
     fractional_shares: bool,
     trades: list[Trade],
+    calendar_walk: pd.DatetimeIndex,
 ) -> tuple[list[Transaction], float]:
     if not events_today:
         return [], cash
@@ -232,7 +238,10 @@ def _execute_events(
         qty = -delta
         if qty * fill_price < MIN_TRADE_NOTIONAL:
             continue
-        tx = _apply_sell(e, fill_price, qty, shares, avg_cost, lot_entry_date, cost_bps, d, trades)
+        tx = _apply_sell(
+            e, fill_price, qty, shares, avg_cost, avg_cost_incl_fees, lot_entry_date,
+            cost_bps, d, trades, calendar_walk,
+        )
         cash += tx.executed_notional - tx.transaction_cost
         tx.cash_after = cash
         todays_transactions.append(tx)
@@ -251,7 +260,7 @@ def _execute_events(
             qty = float(int(qty))
         if qty * fill_price < MIN_TRADE_NOTIONAL:
             continue
-        tx = _apply_buy(e, fill_price, qty, shares, avg_cost, lot_entry_date, cost_bps, d)
+        tx = _apply_buy(e, fill_price, qty, shares, avg_cost, avg_cost_incl_fees, lot_entry_date, cost_bps, d)
         cash -= tx.executed_notional + tx.transaction_cost
         tx.cash_after = cash
         todays_transactions.append(tx)
@@ -259,30 +268,44 @@ def _execute_events(
     return todays_transactions, cash
 
 
-def _apply_sell(e, fill_price, qty, shares, avg_cost, lot_entry_date, cost_bps, d, trades) -> Transaction:
+def _apply_sell(
+    e, fill_price, qty, shares, avg_cost, avg_cost_incl_fees, lot_entry_date, cost_bps, d, trades, calendar_walk,
+) -> Transaction:
     ticker = e.ticker
     current_shares = shares.get(ticker, 0.0)
     basis = avg_cost.get(ticker, fill_price)
+    basis_incl_fees = avg_cost_incl_fees.get(ticker, fill_price)
     cost = qty * fill_price * (cost_bps / 10000.0)
     new_shares = current_shares - qty
     if abs(new_shares) < EPSILON_SHARES:
         new_shares = 0.0
-    realized_pnl = qty * (fill_price - basis)
+
+    realized_pnl = qty * (fill_price - basis)  # gross, ignores all transaction costs
     realized_return_pct = (fill_price / basis - 1.0) if basis else 0.0
+
+    net_sale_price = fill_price - (cost / qty if qty else 0.0)  # sell-side fee reduces effective proceeds
+    realized_pnl_net = qty * (net_sale_price - basis_incl_fees)  # basis already includes buy-side fee
+    realized_return_pct_net = (net_sale_price / basis_incl_fees - 1.0) if basis_incl_fees else 0.0
+
     entry_date = lot_entry_date.get(ticker, d)
-    holding_days = (d - entry_date).days
+    holding_calendar_days = (d - entry_date).days
+    entry_idx = int(calendar_walk.searchsorted(entry_date))
+    exit_idx = int(calendar_walk.searchsorted(d))
+    holding_trading_days = max(0, exit_idx - entry_idx)
     event_type = "full_exit" if new_shares == 0.0 else "partial_sell"
     trades.append(
         Trade(
             strategy=e.strategy, ticker=ticker, event_type=event_type, date=d,
             shares_sold=qty, sale_price=fill_price, avg_cost_basis=basis,
             realized_pnl=realized_pnl, realized_return_pct=realized_return_pct,
-            reason=e.reason, holding_days=holding_days,
+            reason=e.reason, holding_days=holding_trading_days, holding_calendar_days=holding_calendar_days,
+            realized_pnl_net=realized_pnl_net, realized_return_pct_net=realized_return_pct_net,
         )
     )
     shares[ticker] = new_shares
     if new_shares == 0.0:
         avg_cost.pop(ticker, None)
+        avg_cost_incl_fees.pop(ticker, None)
         lot_entry_date.pop(ticker, None)
     return Transaction(
         strategy=e.strategy, ticker=ticker, signal_date=e.signal_date, fill_date=e.fill_date,
@@ -293,17 +316,23 @@ def _apply_sell(e, fill_price, qty, shares, avg_cost, lot_entry_date, cost_bps, 
     )
 
 
-def _apply_buy(e, fill_price, qty, shares, avg_cost, lot_entry_date, cost_bps, d) -> Transaction:
+def _apply_buy(e, fill_price, qty, shares, avg_cost, avg_cost_incl_fees, lot_entry_date, cost_bps, d) -> Transaction:
     ticker = e.ticker
     current_shares = shares.get(ticker, 0.0)
     cost = qty * fill_price * (cost_bps / 10000.0)
     current_basis = avg_cost.get(ticker, 0.0)
+    current_basis_incl_fees = avg_cost_incl_fees.get(ticker, 0.0)
     new_shares = current_shares + qty
+    fill_price_incl_fee = fill_price + (cost / qty if qty else 0.0)
     new_basis = (current_shares * current_basis + qty * fill_price) / new_shares if new_shares else 0.0
+    new_basis_incl_fees = (
+        (current_shares * current_basis_incl_fees + qty * fill_price_incl_fee) / new_shares if new_shares else 0.0
+    )
     if current_shares == 0.0:
         lot_entry_date[ticker] = d
     shares[ticker] = new_shares
     avg_cost[ticker] = new_basis
+    avg_cost_incl_fees[ticker] = new_basis_incl_fees
     return Transaction(
         strategy=e.strategy, ticker=ticker, signal_date=e.signal_date, fill_date=e.fill_date,
         action="buy", requested_target_weight=e.target_weight, requested_notional=e.requested_notional,

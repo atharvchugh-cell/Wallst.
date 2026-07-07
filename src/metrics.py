@@ -10,19 +10,32 @@ from . import config
 from .engine import BacktestResult, Trade, Transaction
 
 
-def total_return(equity: pd.Series) -> float:
-    if len(equity) < 2 or equity.iloc[0] == 0:
+def total_return(equity: pd.Series, start_capital: float | None = None) -> float:
+    """By default (start_capital=None) measures growth relative to the first
+    recorded equity point, equity.iloc[0]. That point is recorded AFTER any
+    same-day-as-start fills execute, so if start_capital (the true pre-trade
+    starting cash) is passed instead, day-0 transaction costs are correctly
+    included in the reported return rather than silently excluded."""
+    if len(equity) < 2:
         return 0.0
-    return float(equity.iloc[-1] / equity.iloc[0] - 1.0)
+    basis = equity.iloc[0] if start_capital is None else start_capital
+    if basis == 0:
+        return 0.0
+    return float(equity.iloc[-1] / basis - 1.0)
 
 
-def cagr(equity: pd.Series) -> float:
-    if len(equity) < 2 or equity.iloc[0] <= 0:
+def cagr(equity: pd.Series, start_capital: float | None = None) -> float:
+    """See `total_return` for why passing start_capital (the true pre-trade
+    starting cash) gives a more accurate basis than equity.iloc[0]."""
+    if len(equity) < 2:
+        return 0.0
+    basis = equity.iloc[0] if start_capital is None else start_capital
+    if basis <= 0:
         return 0.0
     years = (equity.index[-1] - equity.index[0]).days / 365.25
     if years <= 0:
         return 0.0
-    return float((equity.iloc[-1] / equity.iloc[0]) ** (1.0 / years) - 1.0)
+    return float((equity.iloc[-1] / basis) ** (1.0 / years) - 1.0)
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -31,6 +44,64 @@ def max_drawdown(equity: pd.Series) -> float:
     running_max = equity.cummax()
     drawdown = equity / running_max - 1.0
     return float(drawdown.min())
+
+
+def max_drawdown_duration_days(equity: pd.Series) -> int:
+    """Longest stretch (in calendar days) spent below a prior equity peak
+    before recovering to a new high. 0 if the equity curve never drops
+    below its running peak."""
+    if len(equity) == 0:
+        return 0
+    running_max = equity.cummax()
+    underwater = equity < running_max
+    if not underwater.any():
+        return 0
+    longest = pd.Timedelta(0)
+    peak_date = equity.index[0]
+    for d, under in zip(equity.index, underwater):
+        if not under:
+            peak_date = d
+        else:
+            longest = max(longest, d - peak_date)
+    return int(longest.days)
+
+
+def sortino_ratio(equity: pd.Series, risk_free_rate: float = 0.0, periods_per_year: int = 252) -> float:
+    """Like sharpe_ratio but penalizes only downside deviation. NaN when there
+    are no negative-return days (downside deviation undefined/zero)."""
+    if len(equity) < 3:
+        return float("nan")
+    returns = equity.pct_change().dropna()
+    excess = returns - risk_free_rate / periods_per_year
+    downside = excess[excess < 0]
+    if len(downside) == 0:
+        return float("nan")
+    downside_std = downside.std(ddof=0)
+    if downside_std == 0 or pd.isna(downside_std):
+        return float("nan")
+    return float((excess.mean() / downside_std) * np.sqrt(periods_per_year))
+
+
+def calmar_ratio(equity: pd.Series, start_capital: float | None = None) -> float:
+    """CAGR / |max drawdown|. NaN when there is no drawdown to divide by."""
+    mdd = max_drawdown(equity)
+    if mdd == 0:
+        return float("nan")
+    return float(cagr(equity, start_capital=start_capital) / abs(mdd))
+
+
+def monthly_returns(equity: pd.Series) -> pd.Series:
+    if len(equity) < 2:
+        return pd.Series(dtype=float)
+    month_end_vals = equity.resample("ME").last().dropna()
+    return month_end_vals.pct_change().dropna()
+
+
+def best_worst_month(equity: pd.Series) -> dict:
+    m = monthly_returns(equity)
+    if len(m) == 0:
+        return {"best_month": float("nan"), "worst_month": float("nan")}
+    return {"best_month": float(m.max()), "worst_month": float(m.min())}
 
 
 def sharpe_ratio(equity: pd.Series, risk_free_rate: float = 0.0, periods_per_year: int = 252) -> float:
@@ -47,13 +118,25 @@ def sharpe_ratio(equity: pd.Series, risk_free_rate: float = 0.0, periods_per_yea
     return float((excess.mean() / std) * np.sqrt(periods_per_year))
 
 
-def win_rate(trades: list[Trade]) -> float:
+def win_rate(trades: list[Trade], net: bool = True) -> float:
     """Fraction of round-trip (full_exit) trades with positive realized P&L.
-    Partial sells are excluded -- they're not a completed round trip."""
+    Partial sells are excluded -- they're not a completed round trip.
+
+    net=True (the default) counts a win only if the trade was profitable
+    AFTER buy+sell transaction costs (Trade.realized_pnl_net) -- a trade that
+    is barely profitable gross but a loser net of costs should not count as a
+    win. Falls back to gross realized_pnl for any Trade that doesn't have
+    realized_pnl_net populated (e.g. hand-constructed in tests)."""
     full_exits = [t for t in trades if t.event_type == "full_exit"]
     if not full_exits:
         return 0.0
-    wins = sum(1 for t in full_exits if t.realized_pnl > 0)
+
+    def pnl(t: Trade) -> float:
+        if net and t.realized_pnl_net is not None:
+            return t.realized_pnl_net
+        return t.realized_pnl
+
+    wins = sum(1 for t in full_exits if pnl(t) > 0)
     return wins / len(full_exits)
 
 
@@ -146,11 +229,15 @@ def benchmark_metrics(strategy_equity: pd.Series, benchmark_close: pd.Series) ->
 def compute_all_metrics(result: BacktestResult, benchmark_close: pd.Series | None = None) -> dict:
     equity = result.equity_curve
     metrics = {
-        "total_return": total_return(equity),
-        "cagr": cagr(equity),
+        "total_return": total_return(equity, start_capital=result.capital),
+        "cagr": cagr(equity, start_capital=result.capital),
         "max_drawdown": max_drawdown(equity),
+        "max_drawdown_duration_days": max_drawdown_duration_days(equity),
         "sharpe_ratio": sharpe_ratio(equity),
+        "sortino_ratio": sortino_ratio(equity),
+        "calmar_ratio": calmar_ratio(equity, start_capital=result.capital),
         "win_rate": win_rate(result.trades),
+        "win_rate_gross": win_rate(result.trades, net=False),
         "num_trades": len([t for t in result.trades if t.event_type == "full_exit"]),
         "num_partial_sells": len([t for t in result.trades if t.event_type == "partial_sell"]),
         "num_transactions": len(result.transactions),
@@ -161,6 +248,7 @@ def compute_all_metrics(result: BacktestResult, benchmark_close: pd.Series | Non
         "short_period_warning": is_short_period(result.start, result.end),
         "final_equity": float(equity.iloc[-1]) if len(equity) else result.capital,
     }
+    metrics.update(best_worst_month(equity))
     metrics.update(exposure_stats(result.positions, result.universe))
     if benchmark_close is not None:
         metrics.update(benchmark_metrics(equity, benchmark_close))

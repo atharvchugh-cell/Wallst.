@@ -5,3 +5,17 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
+
+# Secrets / credentials -- this repo does not use any today, but future
+# brokerage-integration work must never accidentally commit these.
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+credentials.csv
+secrets.json
+*.secret
+*_secret*
+account_export*
+*.log

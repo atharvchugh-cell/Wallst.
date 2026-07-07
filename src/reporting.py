@@ -21,11 +21,23 @@ from .engine import BacktestResult  # noqa: E402
 
 EXECUTION_MODEL_LINE = (
     "Execution model: close-to-close, one-day signal-to-fill lag, "
-    "no intraday stops, no bid/ask spread, no market impact."
+    "no intraday stops, no bid/ask spread, no market impact. This is LESS "
+    "BIASED than same-close fills, not a claim of realistic live execution."
 )
 ADJUSTED_PRICE_LINE = (
-    "All prices/trades are auto_adjust=True adjusted-price units, not literal "
-    "historical execution prices."
+    "All prices/trades are auto_adjust=True adjusted-price units -- synthetic "
+    "adjusted share counts and fill prices, not literal historical execution "
+    "prices you could have actually transacted at."
+)
+STOP_LOSS_WORDING_LINE = (
+    "The mean-reversion 'stop-loss' is a DELAYED EXIT RULE, not a real stop: "
+    "it only reacts to a day's closing price and exits at the following "
+    "day's close, so it will not protect against an intraday or overnight gap."
+)
+PRETAX_WARNING_LINE = (
+    "All returns/metrics are PRE-TAX. Short-term trading gains (common in "
+    "mean reversion) are typically taxed at ordinary income rates; after-tax "
+    "results can be materially worse than shown here."
 )
 SURVIVORSHIP_WARNING = (
     "WARNING: the mean-reversion universe is a SURVIVORSHIP-BIASED research "
@@ -46,7 +58,8 @@ TRANSACTION_COLUMNS = [
 ]
 TRADE_COLUMNS = [
     "strategy", "ticker", "event_type", "date", "shares_sold", "sale_price", "avg_cost_basis",
-    "realized_pnl", "realized_return_pct", "reason", "holding_days",
+    "realized_pnl", "realized_return_pct", "realized_pnl_net", "realized_return_pct_net",
+    "reason", "holding_days", "holding_calendar_days",
 ]
 POSITION_COLUMNS = [
     "date", "strategy", "ticker", "shares", "adjusted_close", "market_value",
@@ -152,6 +165,9 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
     lines.append("")
     lines.append(EXECUTION_MODEL_LINE)
     lines.append(ADJUSTED_PRICE_LINE)
+    lines.append(PRETAX_WARNING_LINE)
+    if result.strategy_name in ("mean_reversion", "both"):
+        lines.append(STOP_LOSS_WORDING_LINE)
 
     lines.append("")
     lines.append("--- Performance ---")
@@ -161,15 +177,27 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
     if metrics.get("short_period_warning"):
         lines.append("  (WARNING: effective period < 90 days -- CAGR/Sharpe are unstable over short windows)")
     lines.append(f"Max drawdown: {_fmt_pct(metrics.get('max_drawdown'))}")
+    lines.append(f"Max drawdown duration: {metrics.get('max_drawdown_duration_days')} calendar days")
     sharpe = metrics.get("sharpe_ratio")
     lines.append(f"Sharpe ratio (rf=0): {sharpe:.2f}" if pd.notna(sharpe) else "Sharpe ratio (rf=0): n/a")
+    sortino = metrics.get("sortino_ratio")
+    lines.append(f"Sortino ratio (rf=0): {sortino:.2f}" if pd.notna(sortino) else "Sortino ratio (rf=0): n/a")
+    calmar = metrics.get("calmar_ratio")
+    lines.append(f"Calmar ratio (CAGR / |max DD|): {calmar:.2f}" if pd.notna(calmar) else "Calmar ratio: n/a")
+    best_m, worst_m = metrics.get("best_month"), metrics.get("worst_month")
+    lines.append(
+        f"Best month: {_fmt_pct(best_m)}  |  Worst month: {_fmt_pct(worst_m)}"
+    )
 
     if result.strategy_name == "sector_rotation":
         lines.append(
             "(Win rate de-emphasized for sector rotation -- long holds + partial "
             "rebalances make it a weak signal here.)"
         )
-    lines.append(f"Win rate (full-exit trades): {_fmt_pct(metrics.get('win_rate'))}")
+    lines.append(
+        f"Win rate, net of costs (full-exit trades): {_fmt_pct(metrics.get('win_rate'))}  "
+        f"(gross, pre-costs: {_fmt_pct(metrics.get('win_rate_gross'))})"
+    )
     lines.append(
         f"Round-trip trades: {metrics.get('num_trades')}  |  "
         f"Partial rebalance sells: {metrics.get('num_partial_sells')}"

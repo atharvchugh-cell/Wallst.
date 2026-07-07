@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings as warnings_module
 
 import pandas as pd
 import yfinance as yf
@@ -51,15 +52,20 @@ def validate_args(args: argparse.Namespace) -> None:
 def run_mean_reversion_sleeve(start, end, capital, cost_bps, fractional_shares, refresh_cache, output_dir):
     warnings: list[str] = []
     strat = MeanReversionStrategy()
+    original_universe_size = len(strat.universe)
 
-    price_data, fetch_dropped = data.get_price_data(
-        strat.universe, start, end,
-        warmup_calendar_days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS,
-        hard_fail_on_missing=False, force_refresh=refresh_cache,
-    )
+    with warnings_module.catch_warnings(record=True) as caught:
+        warnings_module.simplefilter("always")
+        price_data, fetch_dropped = data.get_price_data(
+            strat.universe, start, end,
+            warmup_calendar_days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS,
+            hard_fail_on_missing=False, force_refresh=refresh_cache,
+        )
 
-    fetch_start = pd.Timestamp(start) - pd.Timedelta(days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS)
-    spy_df = data.get_benchmark_data(fetch_start, end, force_refresh=refresh_cache)
+        fetch_start = pd.Timestamp(start) - pd.Timedelta(days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS)
+        spy_df = data.get_benchmark_data(fetch_start, end, force_refresh=refresh_cache)
+        warnings.extend(f"Data fetch: {w.message}" for w in caught)
+
     full_calendar = data.build_canonical_calendar(spy_df, fetch_start, end)
     full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
     if excluded_today:
@@ -77,6 +83,16 @@ def run_mean_reversion_sleeve(start, end, capital, cost_bps, fractional_shares, 
 
     strat.universe = [t for t in strat.universe if t in clean_price_data]
     pre_drops = list(fetch_dropped) + gap_dropped
+
+    min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
+    if len(strat.universe) < min_required:
+        raise data.FetchError(
+            f"Only {len(strat.universe)}/{original_universe_size} mean-reversion tickers have usable "
+            f"data (minimum required: {min_required}, "
+            f"{config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION:.0%} of configured universe). Refusing to run "
+            f"on a degraded universe rather than silently produce a thin/no-trade backtest. "
+            f"Dropped: {pre_drops}"
+        )
 
     effective_end = full_calendar[-1] if len(full_calendar) else pd.Timestamp(end)
     result = run_backtest(
@@ -107,10 +123,14 @@ def run_sector_rotation_sleeve(start, end, capital, cost_bps, fractional_shares,
     warnings: list[str] = []
     strat = SectorRotationStrategy()
 
-    price_data, _ = data.get_price_data(
-        strat.universe, SECTOR_BROAD_FETCH_START, end,
-        warmup_calendar_days=0, hard_fail_on_missing=True, force_refresh=refresh_cache,
-    )
+    with warnings_module.catch_warnings(record=True) as caught:
+        warnings_module.simplefilter("always")
+        price_data, _ = data.get_price_data(
+            strat.universe, SECTOR_BROAD_FETCH_START, end,
+            warmup_calendar_days=0, hard_fail_on_missing=True, force_refresh=refresh_cache,
+        )
+        spy_df = data.get_benchmark_data(SECTOR_BROAD_FETCH_START, end, force_refresh=refresh_cache)
+        warnings.extend(f"Data fetch: {w.message}" for w in caught)
 
     effective_start, first_dates = data.compute_sector_effective_start(
         price_data, start, config.SECTOR_LOOKBACK_MONTHS
@@ -122,7 +142,6 @@ def run_sector_rotation_sleeve(start, end, capital, cost_bps, fractional_shares,
             f"(latest ETF inception + {config.SECTOR_LOOKBACK_MONTHS} months)."
         )
 
-    spy_df = data.get_benchmark_data(SECTOR_BROAD_FETCH_START, end, force_refresh=refresh_cache)
     full_calendar = data.build_canonical_calendar(spy_df, SECTOR_BROAD_FETCH_START, end)
     full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
     if excluded_today:
