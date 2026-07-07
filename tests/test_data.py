@@ -153,10 +153,13 @@ def test_end_date_is_inclusive_in_cache_slice(tmp_cache_dir, monkeypatch):
 
 
 def test_fetch_range_requests_one_day_past_end_since_yfinance_end_is_exclusive(monkeypatch):
-    # Real yfinance downloads (not the mocked _fetch_range used elsewhere in this
-    # file) exclude the `end` date itself -- confirmed against actual backtest
-    # runs where the last bar came back short of the requested end. _fetch_range
-    # must compensate by requesting end+1 day from yf.download.
+    # yfinance's `end` appears to exclude that calendar date in practice --
+    # inferred from observed backtest runs where the last bar came back short
+    # of the requested end, but NOT independently confirmed against a live
+    # download (this sandbox has no network egress to finance.yahoo.com). This
+    # test only proves _fetch_range asks yf.download for end+1 day; it does
+    # not prove yfinance's real exclusivity behavior. That still needs a real
+    # local run to confirm.
     captured = {}
 
     class FakeDownload:

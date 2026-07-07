@@ -51,15 +51,21 @@ Each run writes a timestamped directory under `output/` (e.g. `output/20250101T1
 
 ### Mean reversion ($7,500 sleeve)
 - Universe: ~25 liquid, sector-diverse large caps (`src/config.py: MEAN_REVERSION_UNIVERSE`).
-- **Entry**: RSI(14) drops below 30, if a slot is free (max 5 concurrent positions, sized at 1/5 of the sleeve each). If more candidates than free slots signal the same day, the lowest RSI (most oversold) wins.
-- **Exit** (priority order — first match wins): (1) delayed exit rule ("stop-loss"), close ≤ 92% of the entry fill price; (2) timeout, configured trading days held; (3) close crosses back above the configured SMA; (4) RSI rises back to 50. See "Design decisions" for why (1) is not a real intraday stop.
+- **Entry**: RSI(14) drops below `RSI_ENTRY_THRESHOLD` (`src/config.py`, default **35**), if a slot is free (`MAX_CONCURRENT_POSITIONS`, default 5, sized at 1/5 of the sleeve each). If more candidates than free slots signal the same day, the lowest RSI (most oversold) wins.
+- **Exit** (priority order — first match wins): (1) delayed exit rule ("stop-loss"), close ≤ 92% of the entry fill price; (2) timeout, `MAX_HOLDING_DAYS` trading days held (default **10**); (3) close crosses back above `SMA_PERIOD` (default **30**); (4) RSI rises back to `RSI_EXIT_THRESHOLD` (default 50). See "Design decisions" for why (1) is not a real intraday stop.
 - All signals fill at the **next** trading day's close, never the signal day's close (see "Execution timing" below).
 
 ### Sector rotation ($7,500 sleeve)
 - Universe: the 11 SPDR sector ETFs (XLK, XLF, XLE, XLV, XLY, XLP, XLU, XLI, XLB, XLRE, XLC).
-- Every month-end, rank all 11 by trailing *completed-calendar-month* return over the configured lookback (not a fixed trading-day lag). The top-K (see `src/config.py: SECTOR_TOP_K`) get equal weight; the rest get 0.
+- Every month-end, rank all 11 by trailing *completed-calendar-month* return over `SECTOR_LOOKBACK_MONTHS` (default 3 — not a fixed trading-day lag). The top `SECTOR_TOP_K` (`src/config.py`, default **2**) get equal weight; the rest get 0.
 - **Every** ETF gets a rebalance decision each month — including ones that stay in the top-K, since price drift since the last rebalance means their actual dollar weight has moved and a monthly rebalance corrects that. This is why `target_events.csv` always has 11 rows per rebalance while `transactions.csv` may have fewer (a ticker whose weight didn't drift enough to cross a minimum trade threshold generates no transaction).
 - XLC (inception 2018) and XLRE (2015) have shorter histories than the rest. The effective backtest start date is clipped to `(latest ETF inception + 3 months)` if the requested start predates that — this is reported explicitly, not silently applied.
+
+### A note on these particular default values
+
+The defaults above (RSI 35 / SMA-30 / 10-day timeout / top-2 sectors) are **not the strategy's original design defaults** (RSI 30 / SMA-50 / 20-day timeout / top-3 sectors). They were changed mid-development, in response to a single 2024 backtest run that underperformed SPY (~11% vs. SPY's ~25%), specifically to trade more often and hold more concentrated positions and try to close that gap.
+
+This is disclosed here deliberately because tuning parameters to fit one specific historical window is a real overfitting risk, not just a caveat to note in passing — see "No walk-forward or out-of-sample validation" below. Nothing about the more aggressive defaults has been validated out-of-sample; they were chosen to see if a more aggressive posture would help in the one window already looked at, which is close to the textbook definition of curve-fitting. Before trusting any comparison between these settings and the original ones, re-run both across multiple non-overlapping periods and compare, rather than taking either single run at face value.
 
 ## Design decisions worth knowing about
 

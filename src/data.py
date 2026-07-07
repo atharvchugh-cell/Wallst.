@@ -74,10 +74,15 @@ def _meta_matches(meta: dict, auto_adjust: bool, interval: str) -> bool:
 
 
 def _fetch_range(ticker: str, start, end, auto_adjust: bool, interval: str) -> pd.DataFrame:
-    # yfinance's `end` is EXCLUSIVE of that calendar date in practice (confirmed
-    # against real downloads, not just mocked tests) -- request one extra day so
-    # the requested end date's own bar is actually included. Callers slice back
-    # down to the exact requested [start, end] afterward, so this is safe.
+    # yfinance's `end` appears to be EXCLUSIVE of that calendar date in practice
+    # -- inferred from observed backtest runs where the reported effective_end
+    # came back short of the requested end date. NOT independently confirmed
+    # against a live download in this environment (no network egress to
+    # finance.yahoo.com here); this fix is verified only via a mocked
+    # yf.download in tests/test_data.py. Treat as unverified until a real run
+    # confirms it. Request one extra day so the requested end date's own bar
+    # is actually included; callers slice back down to the exact requested
+    # [start, end] afterward, so this is safe either way.
     fetch_end = pd.Timestamp(end) + pd.Timedelta(days=1)
     df = yf.download(
         ticker,
