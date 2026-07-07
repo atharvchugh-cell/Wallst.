@@ -32,11 +32,11 @@ MEAN_REVERSION_UNIVERSE_ALT = [
 ]
 
 RSI_PERIOD = 14
-RSI_ENTRY_THRESHOLD = 30.0
+RSI_ENTRY_THRESHOLD = 35.0     # increased from 30 for more aggressive entry in bull markets
 RSI_EXIT_THRESHOLD = 50.0
-SMA_PERIOD = 50
+SMA_PERIOD = 30                # reduced from 50 for faster exits
 STOP_LOSS_PCT = -0.08          # delayed close-to-close stop, see README
-MAX_HOLDING_DAYS = 20          # trading days; fill day counts as days_held == 0
+MAX_HOLDING_DAYS = 10          # reduced from 20 for faster mean reversion turnover
 MAX_CONCURRENT_POSITIONS = 5
 
 # Warmup buffer (calendar days) fetched before the requested start date so that
@@ -49,7 +49,7 @@ SECTOR_ETFS = [
     "XLP", "XLU", "XLI", "XLB", "XLRE", "XLC",
 ]
 SECTOR_LOOKBACK_MONTHS = 3
-SECTOR_TOP_K = 3
+SECTOR_TOP_K = 2                # reduced from 3 for more concentrated momentum bet
 # Extra calendar-day buffer fetched beyond the "latest ETF inception + lookback
 # months" effective-start calculation, to comfortably cover month-end alignment.
 SECTOR_WARMUP_BUFFER_CALENDAR_DAYS = 40
