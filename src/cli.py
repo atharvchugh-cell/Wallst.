@@ -12,8 +12,8 @@ import yfinance as yf
 
 from . import config, data
 from .engine import combine_results, run_backtest
-from .metrics import compute_all_metrics
-from .reporting import write_run_artifacts
+from .metrics import compute_all_metrics, spy_standalone_metrics
+from .reporting import write_run_artifacts, write_comparison_report, compute_sleeve_contribution
 from .strategies.mean_reversion import MeanReversionStrategy
 from .strategies.sector_rotation import SectorRotationStrategy
 
@@ -25,7 +25,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Backtest mean-reversion and/or sector-rotation strategies. "
         "Research/educational tool only -- does not place live trades."
     )
-    parser.add_argument("--strategy", choices=["mean_reversion", "sector_rotation", "both"], required=True)
+    parser.add_argument(
+        "--strategy", choices=["mean_reversion", "sector_rotation", "both", "compare"], required=True
+    )
     today = pd.Timestamp.now().normalize()
     default_start = (today - pd.DateOffset(years=config.DEFAULT_START_YEARS_BACK)).date().isoformat()
     parser.add_argument("--start", default=default_start, help="YYYY-MM-DD")
@@ -35,6 +37,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=config.OUTPUT_DIR)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fractional-shares", action="store_true")
+    parser.add_argument(
+        "--compare-years", default=None,
+        help="Comma-separated calendar years for --strategy compare's annual-returns table, "
+        "e.g. 2022,2023,2024 (default: every calendar year spanned by --start/--end). "
+        "Ignored for other --strategy values.",
+    )
     return parser.parse_args(argv)
 
 
@@ -201,23 +209,23 @@ def main(argv=None) -> int:
     mr_result = sr_result = None
 
     try:
-        if args.strategy in ("mean_reversion", "both"):
-            capital = args.capital / 2.0 if args.strategy == "both" else args.capital
+        if args.strategy in ("mean_reversion", "both", "compare"):
+            capital = args.capital / 2.0 if args.strategy in ("both", "compare") else args.capital
             mr_result, mr_metrics, mr_config, mr_dir = run_mean_reversion_sleeve(
                 args.start, args.end, capital, args.cost_bps, fractional_shares,
                 args.refresh_cache, args.output_dir,
             )
             _print_summary("mean_reversion", mr_metrics, mr_dir)
 
-        if args.strategy in ("sector_rotation", "both"):
-            capital = args.capital / 2.0 if args.strategy == "both" else args.capital
+        if args.strategy in ("sector_rotation", "both", "compare"):
+            capital = args.capital / 2.0 if args.strategy in ("both", "compare") else args.capital
             sr_result, sr_metrics, sr_config, sr_dir = run_sector_rotation_sleeve(
                 args.start, args.end, capital, args.cost_bps, fractional_shares,
                 args.refresh_cache, args.output_dir,
             )
             _print_summary("sector_rotation", sr_metrics, sr_dir)
 
-        if args.strategy == "both":
+        if args.strategy in ("both", "compare"):
             combined = combine_results(mr_result, sr_result)
             spy_df = data.get_benchmark_data(combined.start, combined.end, force_refresh=args.refresh_cache)
             combined_metrics = compute_all_metrics(combined, benchmark_close=spy_df["Close"])
@@ -241,6 +249,46 @@ def main(argv=None) -> int:
             }
             combined_dir = write_run_artifacts(combined, combined_metrics, combined_config, output_dir=args.output_dir)
             _print_summary("both (combined)", combined_metrics, combined_dir)
+
+        if args.strategy == "compare":
+            if args.compare_years:
+                years = [int(y.strip()) for y in args.compare_years.split(",")]
+            else:
+                years = list(range(pd.Timestamp(args.start).year, pd.Timestamp(args.end).year + 1))
+
+            spy_metrics = spy_standalone_metrics(spy_df["Close"])
+            contribution = compute_sleeve_contribution(mr_result, sr_result, combined)
+
+            metrics_by_label = {
+                "mean_reversion": mr_metrics,
+                "sector_rotation": sr_metrics,
+                "both": combined_metrics,
+                "SPY": spy_metrics,
+            }
+            equity_by_label = {
+                "mean_reversion": mr_result.equity_curve,
+                "sector_rotation": sr_result.equity_curve,
+                "both": combined.equity_curve,
+                "SPY": spy_df["Close"],
+            }
+            ranges_by_label = {
+                "mean_reversion": f"{mr_result.start.date()} to {mr_result.end.date()}",
+                "sector_rotation": f"{sr_result.start.date()} to {sr_result.end.date()}",
+                "both": f"{combined.start.date()} to {combined.end.date()}",
+                "SPY": f"{combined.start.date()} to {combined.end.date()} (combined/intersection window)",
+            }
+            compare_run_config = {
+                "requested_start": str(pd.Timestamp(args.start).date()),
+                "requested_end": str(pd.Timestamp(args.end).date()),
+                "capital": args.capital,
+                "cost_bps": args.cost_bps,
+                "years": years,
+            }
+            comparison_dir = write_comparison_report(
+                metrics_by_label, equity_by_label, ranges_by_label, years, compare_run_config,
+                contribution=contribution, output_dir=args.output_dir,
+            )
+            print(f"\n[compare] artifacts written to: {comparison_dir}")
 
     except (data.FetchError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)

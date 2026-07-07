@@ -104,6 +104,66 @@ def best_worst_month(equity: pd.Series) -> dict:
     return {"best_month": float(m.max()), "worst_month": float(m.min())}
 
 
+def annual_returns(equity: pd.Series, years: list[int] | None = None) -> dict[int, float]:
+    """Calendar-year return for each requested year the equity curve
+    overlaps (years with no data at all are simply omitted, not zeroed).
+
+    For a year fully contained within the equity curve, this is last value
+    of that year vs. last value of the PRIOR year (true Dec31-to-Dec31
+    style calendar return). For the first year the curve has any data in
+    (there being no prior-year value to anchor to), it instead uses that
+    year's own first recorded value -- i.e. "how did the strategy do since
+    it started, within that partial year" rather than a fabricated
+    full-year figure."""
+    if len(equity) == 0:
+        return {}
+    equity = equity.sort_index()
+    available_years = sorted(set(equity.index.year))
+    target_years = years if years is not None else available_years
+    result: dict[int, float] = {}
+    for y in target_years:
+        year_mask = equity.index.year == y
+        if not year_mask.any():
+            continue
+        year_data = equity[year_mask]
+        end_val = year_data.iloc[-1]
+        prior_mask = equity.index.year < y
+        start_val = equity[prior_mask].iloc[-1] if prior_mask.any() else year_data.iloc[0]
+        if start_val == 0:
+            continue
+        result[y] = float(end_val / start_val - 1.0)
+    return result
+
+
+def spy_standalone_metrics(spy_close: pd.Series) -> dict:
+    """Absolute (not benchmark-relative) performance of SPY itself over the
+    given date range, formatted with the same key names used by
+    compute_all_metrics's core performance fields, so it can sit as its own
+    row in a comparison table alongside strategy results. Cost/turnover/
+    trade-count fields are None (not applicable to a passive buy-and-hold
+    benchmark, not to be confused with a strategy that legitimately had
+    zero trades)."""
+    metrics = {
+        "total_return": total_return(spy_close),
+        "cagr": cagr(spy_close),
+        "max_drawdown": max_drawdown(spy_close),
+        "max_drawdown_duration_days": max_drawdown_duration_days(spy_close),
+        "sharpe_ratio": sharpe_ratio(spy_close),
+        "sortino_ratio": sortino_ratio(spy_close),
+        "calmar_ratio": calmar_ratio(spy_close),
+        "total_turnover": None,
+        "total_transaction_costs": None,
+        "cost_drag_pct": None,
+        "num_transactions": None,
+        "num_trades": None,
+        "average_capital_invested_pct": 1.0,
+        "correlation_to_benchmark": 1.0,
+        "excess_return": 0.0,
+    }
+    metrics.update(best_worst_month(spy_close))
+    return metrics
+
+
 def sharpe_ratio(equity: pd.Series, risk_free_rate: float = 0.0, periods_per_year: int = 252) -> float:
     """Annualized Sharpe on daily returns, risk_free_rate default 0.0.
     Returns NaN (not 0) when the return std is 0 -- Sharpe is undefined
