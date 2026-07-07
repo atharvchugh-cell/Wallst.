@@ -88,8 +88,12 @@ def test_fresh_cache_with_extended_end_does_delta_fetch_only(tmp_cache_dir, monk
     result = data_module.get_price_history("AAPL", dates.min(), new_end, cache_dir=tmp_cache_dir)
     assert len(fetch_calls) == 1
     fetched_start, fetched_end = fetch_calls[0]
-    # Delta fetch should start AFTER the cached end, not from the original start
-    assert pd.Timestamp(fetched_start) > dates.max()
+    # Delta fetch deliberately widens its start to a few days BEFORE the
+    # cached end (not the original start, and not the exact missing tail) --
+    # yfinance handles very narrow date ranges unreliably in practice, so a
+    # single-day delta request is avoided by design. The overlap is deduped
+    # on merge; see test_stale_cache_narrow_tail_delta_widens_and_merges.
+    assert dates.min() < pd.Timestamp(fetched_start) <= dates.max()
     assert result.index.min() == dates.min()  # old cached rows preserved
 
 
@@ -198,3 +202,63 @@ def test_stale_cache_fallback_warns_instead_of_silent(tmp_cache_dir, monkeypatch
         result = data_module.get_price_history("AAPL", dates.min(), new_end, cache_dir=tmp_cache_dir)
     # Falls back to what's cached rather than raising -- but the warning above proves it's not silent.
     assert result.index.max() == dates.max()
+
+
+def test_stale_cache_narrow_tail_delta_widens_and_merges(tmp_cache_dir, monkeypatch):
+    # Reproduces the real bug seen on a local run: cache ends 2024-12-30,
+    # requested end is 2024-12-31 (one trading day later). A naive delta fetch
+    # would request only that single missing day, which yfinance handled
+    # unreliably in practice ("possibly delisted; no price data found" on
+    # SPY, a highly liquid ticker, for a one-day range). The delta fetch must
+    # widen its start well before the cached end so yfinance gets a
+    # reasonable multi-day window, then merge/dedup the overlap correctly.
+    cached_dates = pd.bdate_range("2024-12-01", "2024-12-30")
+    cached_df = make_df(cached_dates)
+    meta = {
+        "ticker": "SPY", "cached_start": str(cached_dates.min()), "cached_end": str(cached_dates.max()),
+        "yfinance_version": data_module.yf.__version__, "auto_adjust": True, "interval": "1d",
+        "last_full_refresh": datetime.now(timezone.utc).isoformat(), "fetch_success": True,
+    }
+    data_module._write_cache("SPY", tmp_cache_dir, cached_df, meta)
+
+    fetch_calls = []
+
+    def fake_fetch_range(ticker, start, end, auto_adjust, interval):
+        fetch_calls.append((start, end))
+        # Simulate yfinance's observed real-world failure on a too-narrow
+        # (<=2 day) range, even though a wider range works fine.
+        if (pd.Timestamp(end) - pd.Timestamp(start)).days <= 2:
+            raise data_module.FetchError("simulated: possibly delisted; no price data found")
+        return make_df(pd.bdate_range(start, end))
+
+    monkeypatch.setattr(data_module, "_fetch_range", fake_fetch_range)
+    requested_end = pd.Timestamp("2024-12-31")
+    result = data_module.get_price_history("SPY", cached_dates.min(), requested_end, cache_dir=tmp_cache_dir)
+
+    assert len(fetch_calls) == 1
+    fetched_start, fetched_end = fetch_calls[0]
+    assert (pd.Timestamp(fetched_end) - pd.Timestamp(fetched_start)).days > 2  # wide enough to succeed
+    assert pd.Timestamp(fetched_start) <= cached_dates.max()  # deliberately overlaps the cached tail
+    assert result.index.max() == requested_end  # 2024-12-31 successfully merged in
+
+
+def test_benchmark_hard_fails_when_short_of_a_requested_weekday_end(monkeypatch):
+    dates = pd.bdate_range("2024-12-01", "2024-12-30")  # short of 2024-12-31 (a Tuesday)
+
+    def fake_get_price_history(ticker, start, end, **kwargs):
+        return make_df(dates)
+
+    monkeypatch.setattr(data_module, "get_price_history", fake_get_price_history)
+    with pytest.raises(data_module.FetchError, match="SPY"):
+        data_module.get_benchmark_data("2024-12-01", "2024-12-31")
+
+
+def test_benchmark_does_not_hard_fail_when_short_end_is_a_weekend(monkeypatch):
+    dates = pd.bdate_range("2024-12-01", "2024-12-27")  # 2024-12-28/29 are a weekend
+
+    def fake_get_price_history(ticker, start, end, **kwargs):
+        return make_df(dates)
+
+    monkeypatch.setattr(data_module, "get_price_history", fake_get_price_history)
+    result = data_module.get_benchmark_data("2024-12-01", "2024-12-29")  # a Sunday
+    assert result.index.max() == dates.max()  # no exception -- weekend shortfall is expected

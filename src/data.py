@@ -151,7 +151,16 @@ def get_price_history(
         return df.loc[(df.index >= start) & (df.index <= end)]
 
     if end > cached_df.index.max():
-        delta_start = cached_df.index.max() + pd.Timedelta(days=1)
+        # Widen the delta-fetch start well before the cached end, rather than
+        # requesting just the exact missing tail (which can be a single day).
+        # In practice yfinance handles/returns very narrow date ranges badly
+        # -- observed as "possibly delisted; no price data found" on a
+        # single-trading-day request even for a liquid ticker like SPY. A
+        # several-day overlap avoids that, and is harmless: overlapping dates
+        # are deduped below (keeping the freshly-fetched row), which also
+        # naturally re-syncs any retroactive adjusted-price revision in that
+        # window rather than trusting the stale cached values for it.
+        delta_start = cached_df.index.max() - pd.Timedelta(days=5)
         try:
             delta_df = _fetch_range(ticker, delta_start, end, auto_adjust, interval)
             combined = pd.concat([cached_df, delta_df])
@@ -170,6 +179,20 @@ def get_price_history(
                 f"{ticker}: could not extend cached data through {end.date()} "
                 f"({fetch_err}); falling back to cached data through "
                 f"{cached_df.index.max().date()}. Requested end may not be reflected."
+            )
+
+        if cached_df.index.max() < end:
+            # Even after a (successful or failed) extension attempt, data still
+            # falls short of the requested end. This is expected if `end` lands
+            # on a weekend; anything else (a weekday, most plausibly a real
+            # trading day) means the effective end has been silently shortened
+            # unless this warning is surfaced -- which get_benchmark_data below
+            # escalates to a hard failure, since the benchmark's date range
+            # drives the canonical trading calendar for the whole run.
+            warnings.warn(
+                f"{ticker}: final data ends {cached_df.index.max().date()}, short of "
+                f"requested end {end.date()}. Expected if that date is a non-trading "
+                f"day (weekend/holiday); otherwise the effective end was shortened."
             )
 
     return cached_df.loc[(cached_df.index >= start) & (cached_df.index <= end)]
@@ -208,7 +231,27 @@ def get_price_data(
 
 
 def get_benchmark_data(start, end, ticker: str = config.BENCHMARK_TICKER, **kwargs) -> pd.DataFrame:
-    return get_price_history(ticker, start, end, **kwargs)
+    """Like get_price_history, but hard-fails (rather than only warning) if
+    the benchmark's data falls short of a requested weekday end -- the
+    benchmark drives the canonical trading calendar for the whole run, so a
+    silently shortened benchmark range would silently shorten everything
+    downstream of it. Weekends, and `end == today` (the well-known
+    not-yet-finalized-today-bar case, already handled explicitly downstream
+    by exclude_unfinalized_today), are not treated as failures here."""
+    df = get_price_history(ticker, start, end, **kwargs)
+    end_ts = pd.Timestamp(end).normalize()
+    today = pd.Timestamp.now().normalize()
+    is_weekday = end_ts.dayofweek < 5
+    if len(df) and df.index.max() < end_ts and is_weekday and end_ts != today:
+        raise FetchError(
+            f"Benchmark {ticker}: data ends {df.index.max().date()}, short of the "
+            f"requested end {end_ts.date()} (a weekday, and not today, so this is "
+            f"not the known not-yet-finalized-today-bar case). Refusing to silently "
+            f"shorten the effective end for the whole run. If {end_ts.date()} is a "
+            f"market holiday, request an end date that is an actual trading day; "
+            f"otherwise this indicates a real data-fetch problem."
+        )
+    return df
 
 
 def compute_sector_effective_start(
