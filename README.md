@@ -33,7 +33,7 @@ python backtest.py --strategy both \
   --output-dir output --refresh-cache
 ```
 
-Flags: `--strategy {mean_reversion,sector_rotation,both}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares).
+Flags: `--strategy {mean_reversion,sector_rotation,both,compare}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares), `--compare-years` (comma-separated years for `--strategy compare`'s annual-returns table, e.g. `2022,2023,2024`; default: every calendar year spanned by `--start`/`--end`; ignored for other `--strategy` values).
 
 Each run writes a timestamped directory under `output/` (e.g. `output/20250101T120000_mean_reversion_2018-01-01_to_2025-01-01/`) containing:
 
@@ -46,6 +46,27 @@ Each run writes a timestamped directory under `output/` (e.g. `output/20250101T1
 | `transactions.csv` | Every executed (nonzero) buy/sell, with requested vs. actual weight/notional |
 | `trades.csv` | Realized P&L events (`partial_sell` and `full_exit`) |
 | `positions.csv` | Daily snapshot of shares/value/weight per ticker |
+
+### `--strategy compare`: diagnostics, not optimization
+
+```bash
+python backtest.py --strategy compare --start 2022-01-01 --end 2024-12-31 --capital 15000
+```
+
+Runs mean reversion, sector rotation, and combined exactly as `--strategy both` does (writing all of their normal individual artifacts, unchanged), **plus** a side-by-side comparison against each other and against a plain SPY buy-and-hold. This exists to help answer *"is underperformance coming from mean reversion, sector rotation, transaction costs, or the combined allocation?"* before touching any strategy parameter — it changes no RSI/SMA/holding-day/top-K/stop/allocation/cost setting, it only reports on runs made with whatever those settings already are.
+
+Writes an extra `output/{ts}_comparison_{start}_to_{end}/` directory:
+
+| File | Contents |
+|---|---|
+| `comparison.csv` / `.txt` | One row per metric, one column per {mean_reversion, sector_rotation, both, SPY}: total return, CAGR, max drawdown (+ duration), Sharpe, Sortino, Calmar, best/worst month, turnover, transaction costs, cost drag, transaction/trade counts, average capital invested, correlation to SPY, excess return vs. SPY |
+| `annual_returns.csv` | Calendar-year return per strategy/SPY for each requested year (a year with no data for a given row is blank, not 0%) |
+| `monthly_returns.csv` | Month-by-month return per strategy/SPY, for finer-grained comparison than the annual table |
+| `comparison.json` | Same data as the CSVs/txt, machine-readable |
+
+`comparison.txt` also includes a **strategy contribution** section for the combined sleeve: each sleeve's starting/final equity over the combined (intersection) window, each sleeve's dollar contribution to the combined gain, and each sleeve's share of combined transaction costs — computed directly from each sleeve's own equity curve and transactions (not the naive concatenation `both` uses internally), so a sleeve that started trading before the intersection window began doesn't get misattributed gains/costs from before that window.
+
+Each row's underlying date range can differ (mean reversion needs indicator warmup; sector rotation clips to `latest ETF inception + lookback`; `both`/SPY use the intersection) — `comparison.txt` prints the effective range used per row so this isn't hidden.
 
 ## Strategy rules
 
@@ -100,4 +121,4 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 pytest tests/
 ```
 
-81 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), and the CLI's minimum-usable-universe guard. CI runs this suite on every push via GitHub Actions.
+90 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, and the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run). CI runs this suite on every push via GitHub Actions.

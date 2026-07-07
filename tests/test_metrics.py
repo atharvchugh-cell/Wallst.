@@ -5,7 +5,7 @@ import pytest
 from src.engine import Trade
 from src.metrics import (
     max_drawdown, max_drawdown_duration_days, cagr, total_return, win_rate, sharpe_ratio,
-    sortino_ratio, calmar_ratio, is_short_period,
+    sortino_ratio, calmar_ratio, is_short_period, annual_returns, spy_standalone_metrics,
 )
 
 
@@ -115,3 +115,50 @@ def test_sharpe_positive_series_finite():
 def test_is_short_period_warning_threshold():
     assert is_short_period(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-30")) is True  # 29 days < 90
     assert is_short_period(pd.Timestamp("2024-01-01"), pd.Timestamp("2024-12-31")) is False  # 365 days
+
+
+def test_annual_returns_full_calendar_years():
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2022-01-03"),   # first trading day of 2022
+        pd.Timestamp("2022-12-30"),   # last trading day of 2022
+        pd.Timestamp("2023-01-03"),
+        pd.Timestamp("2023-12-29"),   # last trading day of 2023
+    ])
+    equity = pd.Series([100.0, 110.0, 110.0, 132.0], index=idx)
+    ar = annual_returns(equity, years=[2022, 2023])
+    # 2022 has no prior-year data, so it's measured from its own first value.
+    assert ar[2022] == pytest.approx(0.10)  # 110/100 - 1
+    # 2023 is measured against 2022's LAST value (true calendar-year return).
+    assert ar[2023] == pytest.approx(0.20)  # 132/110 - 1
+
+
+def test_annual_returns_omits_years_with_no_data_not_zero():
+    idx = pd.bdate_range("2023-01-01", periods=5)
+    equity = pd.Series([100.0] * 5, index=idx)
+    ar = annual_returns(equity, years=[2022, 2023, 2024])
+    assert 2022 not in ar
+    assert 2024 not in ar
+    assert 2023 in ar
+
+
+def test_annual_returns_defaults_to_all_years_present():
+    idx = pd.DatetimeIndex([pd.Timestamp("2022-06-01"), pd.Timestamp("2022-12-30"), pd.Timestamp("2023-06-01")])
+    equity = pd.Series([100.0, 105.0, 110.0], index=idx)
+    ar = annual_returns(equity)
+    assert set(ar.keys()) == {2022, 2023}
+
+
+def test_spy_standalone_metrics_basic_fields():
+    idx = pd.bdate_range("2024-01-01", periods=100)
+    spy = pd.Series(np.linspace(100, 120, 100), index=idx)
+    m = spy_standalone_metrics(spy)
+    assert m["total_return"] == pytest.approx(0.20, abs=1e-6)
+    assert m["correlation_to_benchmark"] == 1.0
+    assert m["excess_return"] == 0.0
+    assert m["average_capital_invested_pct"] == 1.0
+    # Cost/trade fields are None (not applicable), not 0 -- 0 would wrongly
+    # imply "measured and found to be zero trades/costs".
+    assert m["total_turnover"] is None
+    assert m["total_transaction_costs"] is None
+    assert m["num_trades"] is None
+    assert m["num_transactions"] is None
