@@ -25,15 +25,27 @@ and `.info` can each trigger multiple additional sub-requests (share count,
 last price, history metadata) per ticker, so scanning thousands of
 candidates took minutes with no progress output and looked like a hang.
 
-The Nasdaq Trader symbol directories (`nasdaqlisted.txt`, `otherlisted.txt`)
-are still fetched and parsed (`build_candidate_universe`) -- not to drive
-per-ticker lookups anymore, but as a source of company name/exchange
-metadata for tickers the screener response doesn't already carry, and
-because the same warrant/right/unit/preferred/notes/fund name-pattern
-filter used there is also applied to whatever name the screener itself
-returns, as a safety net (Yahoo's screener already restricts results to
-`quoteType=EQUITY`, which excludes ETFs, but that alone doesn't guarantee
-every result is what we'd call plain common stock).
+## Nasdaq Trader directories are a required ELIGIBILITY GATE, not just metadata
+
+Yahoo's screener alone is not reliable enough to define "US-listed publicly
+traded common stock" -- in practice it can return symbols that aren't
+tradable/normal listings at all (observed live: a ~$2T "Space Exploration
+Technologies Corp." result that isn't actually a public company). So every
+screener result is cross-checked against the Nasdaq Trader candidate set
+(`build_candidate_universe`, parsed from `nasdaqlisted.txt`/`otherlisted.txt`,
+excluding test issues/ETFs/warrants/rights/units/preferreds/notes/funds) --
+a screener ticker NOT present in that set is excluded and counted as
+`num_excluded_not_listed`, never silently included.
+
+Because this is a real eligibility gate (not optional enrichment), the
+Nasdaq Trader fetch is REQUIRED by default: if it fails, `build_us_50b_universe`
+raises `UniverseError` rather than silently proceeding screener-only, since
+that's exactly the failure mode that let the SpaceX-shaped bad result
+through in the first place. Pass `allow_screener_only=True` (`--universe-
+allow-screener-only` from the CLI) to explicitly opt into the reduced-
+guarantee fallback if the Nasdaq Trader endpoint is unavailable and you
+still want to proceed -- this is a deliberate opt-in debug escape hatch,
+not the default.
 
 SURVIVORSHIP BIAS / NOT POINT-IN-TIME (read before trusting any `us_50b`
 result): like the default hardcoded universe, this is a CURRENT SNAPSHOT of
@@ -51,6 +63,7 @@ currently-large-cap set of names, not a general historical edge.
 
 from __future__ import annotations
 
+import re
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -131,6 +144,9 @@ class UniverseSnapshot:
     exchanges: dict[str, str] = field(default_factory=dict)
     num_candidates: int | None = None
     num_dropped_lookup_failed: int | None = None
+    num_excluded_not_listed: int | None = None
+    num_excluded_non_common: int | None = None
+    num_duplicate_companies_collapsed: int | None = None
     snapshot_date: str | None = None
     cache_file: str | None = None
 
@@ -454,9 +470,77 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
         exchanges=exchanges,
         num_candidates=len(tickers),
         num_dropped_lookup_failed=0,
+        num_excluded_not_listed=None,
+        num_excluded_non_common=None,
+        num_duplicate_companies_collapsed=None,
         snapshot_date=snapshot_date,
         cache_file=str(path),
     )
+
+
+# --- Company-level deduplication (multiple share classes of one issuer) ----
+#
+# Some companies list more than one share class as separate tickers, each of
+# which can independently clear a $50B market-cap bar even though they
+# represent claims on the same underlying company (e.g. GOOGL/GOOG, BRK-A/
+# BRK-B). Since the stated universe goal is "companies with market cap >=
+# $50B," this collapses each such group down to one ticker per company
+# rather than listing (and potentially trading) the same company twice.
+#
+# This is a heuristic, not a perfect company-identity resolution (Nasdaq
+# Trader/Yahoo don't expose a stable company ID): it groups by a normalized
+# version of the listed security name with common corporate-structure/
+# share-class wording stripped, then within each group keeps the one ticker
+# WITHOUT a share-class suffix (a plain ticker, assumed to be the primary/
+# most commonly quoted class) if there's exactly one such candidate,
+# otherwise the highest-market-cap ticker in the group (alphabetical
+# tie-break for determinism).
+_CORP_SUFFIX_PATTERN = re.compile(
+    r"\b(incorporated|inc|corporation|corp|company|co|limited|ltd|plc|holdings?|group|"
+    r"class\s+[a-z]|common\s+stock|common\s+shares?|ordinary\s+shares?|the)\b",
+    re.IGNORECASE,
+)
+_NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]+")
+
+
+def _company_key(name: str) -> str:
+    """Normalize a listed security name to a company-grouping key -- see
+    the section docstring above for what this is used for and why it's a
+    heuristic, not a guaranteed-correct company identity resolution."""
+    key = _CORP_SUFFIX_PATTERN.sub("", (name or "").lower())
+    return _NON_ALNUM_PATTERN.sub("", key)
+
+
+def _dedupe_by_company(
+    market_caps: dict[str, float], names: dict[str, str], exchanges: dict[str, str]
+) -> tuple[dict[str, float], dict[str, str], dict[str, str], int]:
+    """Collapse multiple tickers that appear to be different share classes
+    of the same company down to one ticker per company. Returns
+    (market_caps, names, exchanges, num_collapsed) where num_collapsed is
+    how many tickers were DROPPED (group size - 1, summed across groups)."""
+    groups: dict[str, list[str]] = {}
+    for ticker in market_caps:
+        key = _company_key(names.get(ticker, "")) or ticker
+        groups.setdefault(key, []).append(ticker)
+
+    kept_market_caps: dict[str, float] = {}
+    kept_names: dict[str, str] = {}
+    kept_exchanges: dict[str, str] = {}
+    num_collapsed = 0
+
+    for tickers in groups.values():
+        if len(tickers) == 1:
+            winner = tickers[0]
+        else:
+            no_dash = [t for t in tickers if "-" not in t]
+            candidates = no_dash if len(no_dash) == 1 else tickers
+            winner = min(candidates, key=lambda t: (-market_caps[t], t))
+            num_collapsed += len(tickers) - 1
+        kept_market_caps[winner] = market_caps[winner]
+        kept_names[winner] = names.get(winner, "")
+        kept_exchanges[winner] = exchanges.get(winner, "")
+
+    return kept_market_caps, kept_names, kept_exchanges, num_collapsed
 
 
 # --- Build the >= $50B universe from live data -------------------------------
@@ -466,37 +550,47 @@ def build_us_50b_universe(
     cache_path: str = DEFAULT_UNIVERSE_CACHE_PATH,
     max_candidates: int | None = None,
     progress: Callable[[str], None] | None = None,
+    allow_screener_only: bool = False,
 ) -> UniverseSnapshot:
-    """Build the >= `min_market_cap` US-equity universe via Yahoo's bulk
-    screener (see module docstring for why), cache the result, and return
-    it. `max_candidates` is a debug/safety cap on how many screener results
-    to consider -- leave it None (the default) for a real run; it exists
-    for fast, bounded dev/test runs, not production use. `progress`, if
-    given, receives a line of text at each meaningful step (candidate
-    count, per-page screener progress, running qualifying count, final
-    summary) -- cli.py passes `print`. Hard-fails via UniverseError if the
-    resulting universe is too small to backtest meaningfully -- see
-    MIN_US_50B_UNIVERSE_SIZE."""
+    """Build the >= `min_market_cap` US-equity universe: Yahoo's bulk
+    screener supplies candidate tickers + market caps (see module
+    docstring for why bulk, not per-ticker), and the Nasdaq Trader symbol
+    directories act as a required ELIGIBILITY GATE on those results -- a
+    screener ticker not present in the Nasdaq Trader candidate set is
+    excluded, since the screener alone can return non-US-listed/
+    non-tradable symbols (see module docstring). `max_candidates` is a
+    debug/safety cap on how many screener results to consider -- leave it
+    None (the default) for a real run. `progress`, if given, receives a
+    line of text at each meaningful step -- cli.py passes `print`.
+    `allow_screener_only`, if True, permits proceeding without the Nasdaq
+    Trader gate when its directories are unreachable (an explicit opt-in
+    debug escape hatch, NOT the default -- see module docstring). Hard-fails
+    via UniverseError if the resulting universe is too small to backtest
+    meaningfully -- see MIN_US_50B_UNIVERSE_SIZE."""
     progress = progress or (lambda msg: None)
 
-    # Nasdaq Trader directories supply supplementary name/exchange metadata
-    # ONLY -- the screener call below is what actually determines universe
-    # membership. A Nasdaq Trader outage is therefore not fatal on its own:
-    # fall back to empty candidate metadata (the screener's own quotes
-    # already carry a name/exchange for most results) rather than failing
-    # the whole build over a source that no longer drives ticker selection.
-    progress("Fetching Nasdaq Trader symbol directories (for company name/exchange metadata)...")
+    progress("Fetching Nasdaq Trader symbol directories (required to verify US-listed eligibility)...")
+    candidate_tickers: set[str] | None = None
     candidate_names: dict[str, str] = {}
     candidate_exchanges: dict[str, str] = {}
     try:
         nasdaq_text = fetch_nasdaq_listed_text()
         other_text = fetch_other_listed_text()
         candidates = build_candidate_universe(nasdaq_text, other_text)
+        candidate_tickers = set(candidates["yahoo_ticker"])
         candidate_names = dict(zip(candidates["yahoo_ticker"], candidates["name"]))
         candidate_exchanges = dict(zip(candidates["yahoo_ticker"], candidates["exchange"]))
-        progress(f"{len(candidates)} candidate US-listed common-stock tickers after Nasdaq Trader parsing/filtering.")
+        progress(f"{len(candidate_tickers)} candidate US-listed common-stock tickers after Nasdaq Trader parsing/filtering.")
     except UniverseError as e:
-        progress(f"Nasdaq Trader directories unavailable ({e}); continuing with screener-only metadata.")
+        if not allow_screener_only:
+            raise UniverseError(
+                f"Cannot verify US-listed common-stock eligibility: Nasdaq Trader symbol directories "
+                f"are required by default to gate screener results (Yahoo's market-cap screener alone "
+                f"can return non-US-listed or non-tradable symbols). Underlying error: {e}. Pass "
+                f"allow_screener_only=True (--universe-allow-screener-only from the CLI) to proceed "
+                f"without this eligibility gate if you explicitly accept the reduced guarantee."
+            ) from e
+        progress(f"Nasdaq Trader directories unavailable ({e}); continuing SCREENER-ONLY (allow_screener_only=True).")
 
     progress(f"Querying Yahoo Finance market-cap screener for US equities >= ${min_market_cap:,.0f}...")
     quotes = fetch_us_large_cap_quotes(min_market_cap, max_results=max_candidates, progress=progress)
@@ -506,6 +600,7 @@ def build_us_50b_universe(
     names: dict[str, str] = {}
     exchanges: dict[str, str] = {}
     num_unparseable = 0
+    num_excluded_not_listed = 0
     num_excluded_non_common = 0
 
     for quote in quotes:
@@ -523,6 +618,11 @@ def build_us_50b_universe(
             continue
 
         ticker = normalize_yahoo_ticker(str(symbol))
+
+        if candidate_tickers is not None and ticker not in candidate_tickers:
+            num_excluded_not_listed += 1
+            continue
+
         name = _extract_quote_field(quote, ("longName", "shortName", "displayName"))
         name = str(name) if name else candidate_names.get(ticker, "")
         if _name_is_non_common_stock(name):
@@ -543,9 +643,13 @@ def build_us_50b_universe(
             f"changed. The resulting >= ${min_market_cap:,.0f} universe below may be incomplete."
         )
 
+    market_caps, names, exchanges, num_collapsed = _dedupe_by_company(market_caps, names, exchanges)
+
     progress(
-        f"Done: {len(market_caps)} qualifying tickers, {num_excluded_non_common} excluded as "
-        f"non-common-stock by name, {num_unparseable} unparseable screener result(s)."
+        f"Done: {len(market_caps)} qualifying tickers, {num_excluded_not_listed} excluded as not in "
+        f"the Nasdaq Trader candidate set, {num_excluded_non_common} excluded as non-common-stock by "
+        f"name, {num_collapsed} duplicate-company ticker(s) collapsed, {num_unparseable} unparseable "
+        f"screener result(s)."
     )
 
     if len(market_caps) < MIN_US_50B_UNIVERSE_SIZE:
@@ -554,6 +658,7 @@ def build_us_50b_universe(
             f"(minimum required: {MIN_US_50B_UNIVERSE_SIZE}). Refusing to run a mean-reversion backtest "
             f"on a degenerate universe rather than silently produce a near-empty backtest. Screener "
             f"returned {total_quotes} total result(s): {num_unparseable} unparseable, "
+            f"{num_excluded_not_listed} not in the Nasdaq Trader candidate set, "
             f"{num_excluded_non_common} excluded as non-common-stock by name."
         )
 
@@ -564,6 +669,9 @@ def build_us_50b_universe(
         exchanges=exchanges,
         num_candidates=total_quotes,
         num_dropped_lookup_failed=num_unparseable,
+        num_excluded_not_listed=num_excluded_not_listed,
+        num_excluded_non_common=num_excluded_non_common,
+        num_duplicate_companies_collapsed=num_collapsed,
         snapshot_date=datetime.now(timezone.utc).isoformat(),
         cache_file=cache_path,
     )
@@ -580,6 +688,9 @@ def _snapshot_to_info(snapshot: UniverseSnapshot, mode: str) -> dict:
         "num_selected": len(snapshot.tickers),
         "num_candidates": snapshot.num_candidates,
         "num_dropped_lookup_failed": snapshot.num_dropped_lookup_failed,
+        "num_excluded_not_listed": snapshot.num_excluded_not_listed,
+        "num_excluded_non_common": snapshot.num_excluded_non_common,
+        "num_duplicate_companies_collapsed": snapshot.num_duplicate_companies_collapsed,
         "min_market_cap": snapshot.min_market_cap,
         "max_market_cap": snapshot.max_market_cap,
         "cache_file": snapshot.cache_file,
@@ -595,6 +706,7 @@ def resolve_mean_reversion_universe(
     min_market_cap: float = DEFAULT_MIN_MARKET_CAP,
     max_candidates: int | None = None,
     progress: Callable[[str], None] | None = None,
+    allow_screener_only: bool = False,
 ) -> UniverseResolution:
     """Single entry point cli.py uses to decide which ticker list
     mean_reversion should run with. `csv_path` (if given) always wins,
@@ -605,9 +717,10 @@ def resolve_mean_reversion_universe(
     - "us_50b": current US-listed common stock >= $50B market cap. Loaded
       from `cache_path` unless `refresh` is set or the cache doesn't exist
       yet, in which case it's rebuilt from live data via the bulk market-cap
-      screener (see build_us_50b_universe). `max_candidates`/`progress` are
-      passed straight through to that rebuild (ignored when loading from
-      cache, since there's nothing to page through or report progress on).
+      screener, gated against the Nasdaq Trader candidate set (see
+      build_us_50b_universe). `max_candidates`/`progress`/`allow_screener_only`
+      are passed straight through to that rebuild (ignored when loading
+      from cache, since there's nothing to page/gate/report progress on).
     - explicit csv_path: a user-supplied ticker list (own snapshot, or one
       previously cached by this module).
     """
@@ -623,6 +736,8 @@ def resolve_mean_reversion_universe(
             info={
                 "mode": "default", "num_selected": len(config.MEAN_REVERSION_UNIVERSE),
                 "num_candidates": None, "num_dropped_lookup_failed": None,
+                "num_excluded_not_listed": None, "num_excluded_non_common": None,
+                "num_duplicate_companies_collapsed": None,
                 "min_market_cap": None, "max_market_cap": None,
                 "cache_file": None, "snapshot_date": None,
             },
@@ -634,6 +749,7 @@ def resolve_mean_reversion_universe(
             snapshot = build_us_50b_universe(
                 min_market_cap=min_market_cap, cache_path=cache_path,
                 max_candidates=max_candidates, progress=progress,
+                allow_screener_only=allow_screener_only,
             )
         return UniverseResolution(tickers=snapshot.tickers, info=_snapshot_to_info(snapshot, "us_50b"))
 

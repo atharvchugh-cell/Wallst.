@@ -194,7 +194,9 @@ def test_universe_us_50b_threads_into_mean_reversion_sleeve(tmp_path, monkeypatc
         tickers=fake_tickers,
         info={
             "mode": "us_50b", "num_selected": len(fake_tickers), "num_candidates": 500,
-            "num_dropped_lookup_failed": 12, "min_market_cap": 50.5e9, "max_market_cap": 3.1e12,
+            "num_dropped_lookup_failed": 12, "num_excluded_not_listed": 3,
+            "num_excluded_non_common": 4, "num_duplicate_companies_collapsed": 2,
+            "min_market_cap": 50.5e9, "max_market_cap": 3.1e12,
             "cache_file": "data_cache/universe_us_50b.csv", "snapshot_date": "2026-07-08T00:00:00+00:00",
         },
     )
@@ -217,10 +219,14 @@ def test_universe_us_50b_threads_into_mean_reversion_sleeve(tmp_path, monkeypatc
     assert set(metrics["universe"]) == set(fake_tickers)
     assert metrics["universe_info"]["mode"] == "us_50b"
     assert metrics["universe_info"]["num_dropped_lookup_failed"] == 12
+    assert metrics["universe_info"]["num_excluded_not_listed"] == 3
+    assert metrics["universe_info"]["num_duplicate_companies_collapsed"] == 2
 
     txt = (run_dir / "report.txt").read_text()
     assert "Universe mode: us_50b" in txt
     assert "CURRENT SNAPSHOT" in txt
+    assert "Excluded (not in Nasdaq Trader candidate set): 3" in txt
+    assert "Duplicate-company tickers collapsed" in txt
 
 
 def test_universe_default_unchanged_when_no_universe_flag(tmp_path, monkeypatch):

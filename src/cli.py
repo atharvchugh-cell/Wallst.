@@ -84,6 +84,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "default -- omit this for a real run, which considers every qualifying result. Mainly "
         "useful for fast, bounded dev/test runs. Ignored unless --universe us_50b --refresh-universe.",
     )
+    parser.add_argument(
+        "--universe-allow-screener-only", action="store_true",
+        help="Debug escape hatch: if the Nasdaq Trader symbol directories can't be fetched during "
+        "a us_50b --refresh-universe build, proceed with screener-only results instead of hard-"
+        "failing. NOT the default -- Nasdaq Trader is normally a REQUIRED eligibility gate on "
+        "screener results, since the screener alone can return non-US-listed/non-tradable symbols.",
+    )
     return parser.parse_args(argv)
 
 
@@ -260,6 +267,7 @@ def resolve_mean_reversion_universe(args: argparse.Namespace) -> universe_module
     return universe_module.resolve_mean_reversion_universe(
         mode=args.universe, csv_path=args.universe_csv, refresh=args.refresh_universe,
         max_candidates=args.max_universe_candidates, progress=print,
+        allow_screener_only=args.universe_allow_screener_only,
     )
 
 

@@ -179,10 +179,23 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
         lines.append(f"Universe mode: {universe_info.get('mode')}")
         lines.append(f"Tickers selected: {universe_info.get('num_selected', len(result.universe))}")
         if universe_info.get("num_candidates") is not None:
-            lines.append(f"Candidate tickers considered: {universe_info['num_candidates']}")
+            lines.append(f"Screener results considered: {universe_info['num_candidates']}")
         if universe_info.get("num_dropped_lookup_failed") is not None:
             lines.append(
-                f"Tickers dropped (market-cap lookup failed): {universe_info['num_dropped_lookup_failed']}"
+                f"Unparseable screener results: {universe_info['num_dropped_lookup_failed']}"
+            )
+        if universe_info.get("num_excluded_not_listed") is not None:
+            lines.append(
+                f"Excluded (not in Nasdaq Trader candidate set): {universe_info['num_excluded_not_listed']}"
+            )
+        if universe_info.get("num_excluded_non_common") is not None:
+            lines.append(
+                f"Excluded (non-common-stock by name): {universe_info['num_excluded_non_common']}"
+            )
+        if universe_info.get("num_duplicate_companies_collapsed") is not None:
+            lines.append(
+                f"Duplicate-company tickers collapsed (e.g. multiple share classes): "
+                f"{universe_info['num_duplicate_companies_collapsed']}"
             )
         if universe_info.get("min_market_cap") is not None and universe_info.get("max_market_cap") is not None:
             lines.append(
