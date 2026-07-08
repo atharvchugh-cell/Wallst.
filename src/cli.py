@@ -11,6 +11,7 @@ import pandas as pd
 import yfinance as yf
 
 from . import config, data
+from . import universe as universe_module
 from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
 from .reporting import (
@@ -54,6 +55,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         "'2019-01-01:2021-12-31,2020-01-01:2022-12-31' (default: the 5 standard windows "
         "2019-2021/2020-2022/2021-2023/2022-2024/2019-2024). Ignored for other --strategy values.",
     )
+    parser.add_argument(
+        "--universe",
+        choices=["default", "us_50b"],
+        default="default",
+        help="Mean-reversion universe to use. 'default' (default) is the existing hardcoded "
+        "~25-stock universe -- old results stay reproducible. 'us_50b' is a current-snapshot "
+        "universe of US-listed common stock with market cap >= $50B, built from Nasdaq Trader "
+        "symbol directories + live yfinance market caps (see src/universe.py; still "
+        "survivorship-biased and NOT a point-in-time historical constituent list). Ignored by "
+        "sector_rotation (always the 11 fixed sector ETFs).",
+    )
+    parser.add_argument(
+        "--universe-csv", default=None,
+        help="Path to a CSV with a 'ticker' column (optionally also name/market_cap/exchange/"
+        "snapshot_date, the same schema data_cache/universe_us_50b.csv uses) to use as the "
+        "mean-reversion universe. Overrides --universe when given.",
+    )
+    parser.add_argument(
+        "--refresh-universe", action="store_true",
+        help="Rebuild the 'us_50b' universe from live Nasdaq Trader + yfinance data instead of "
+        "using the cached data_cache/universe_us_50b.csv snapshot, if present. Ignored unless "
+        "--universe us_50b is also set.",
+    )
     return parser.parse_args(argv)
 
 
@@ -68,9 +92,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--cost-bps must be >= 0, got {args.cost_bps}")
 
 
-def run_mean_reversion_sleeve(start, end, capital, cost_bps, fractional_shares, refresh_cache, output_dir):
+def run_mean_reversion_sleeve(
+    start, end, capital, cost_bps, fractional_shares, refresh_cache, output_dir,
+    universe=None, universe_info=None,
+):
     warnings: list[str] = []
-    strat = MeanReversionStrategy()
+    strat = MeanReversionStrategy(universe=universe)
     original_universe_size = len(strat.universe)
 
     with warnings_module.catch_warnings(record=True) as caught:
@@ -134,6 +161,8 @@ def run_mean_reversion_sleeve(start, end, capital, cost_bps, fractional_shares, 
         "warnings": warnings,
         "cache_summary": f"{len(clean_price_data)} tickers used, {len(pre_drops)} dropped",
     }
+    if universe_info is not None:
+        run_config["universe_info"] = universe_info
     run_dir = write_run_artifacts(result, metrics, run_config, output_dir=output_dir)
     return result, metrics, run_config, run_dir
 
@@ -213,6 +242,18 @@ def _parse_robustness_windows(spec: str | None) -> list[tuple[str, str, str]]:
     return windows
 
 
+def resolve_mean_reversion_universe(args: argparse.Namespace) -> universe_module.UniverseResolution:
+    """Resolve the mean-reversion universe ONCE per run (not once per
+    window/sleeve-call) -- a `us_50b` universe is a current snapshot, not a
+    per-window computation, so every sleeve call in this run (mean_reversion,
+    both, compare, or every window of robustness) shares the exact same
+    ticker list. Sector rotation never calls this -- it always uses the 11
+    fixed sector ETFs regardless of --universe."""
+    return universe_module.resolve_mean_reversion_universe(
+        mode=args.universe, csv_path=args.universe_csv, refresh=args.refresh_universe,
+    )
+
+
 def run_robustness(args: argparse.Namespace) -> int:
     """Diagnostics only: runs mean_reversion and sector_rotation ONCE per
     window (reusing run_mean_reversion_sleeve/run_sector_rotation_sleeve
@@ -225,6 +266,12 @@ def run_robustness(args: argparse.Namespace) -> int:
     fractional_shares = not args.no_fractional_shares
     windows = _parse_robustness_windows(args.robustness_windows)
 
+    try:
+        mr_universe = resolve_mean_reversion_universe(args)
+    except (universe_module.UniverseError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
     all_window_metrics: dict[str, dict[str, dict]] = {}
     window_ranges: dict[str, str] = {}
 
@@ -234,6 +281,7 @@ def run_robustness(args: argparse.Namespace) -> int:
             mr_result, mr_metrics, _mr_config, _mr_dir = run_mean_reversion_sleeve(
                 w_start, w_end, args.capital, args.cost_bps, fractional_shares,
                 args.refresh_cache, args.output_dir,
+                universe=mr_universe.tickers, universe_info=mr_universe.info,
             )
             sr_result, sr_metrics, _sr_config, _sr_dir = run_sector_rotation_sleeve(
                 w_start, w_end, args.capital, args.cost_bps, fractional_shares,
@@ -302,10 +350,12 @@ def main(argv=None) -> int:
 
     try:
         if args.strategy in ("mean_reversion", "both", "compare"):
+            mr_universe = resolve_mean_reversion_universe(args)
             capital = args.capital / 2.0 if args.strategy in ("both", "compare") else args.capital
             mr_result, mr_metrics, mr_config, mr_dir = run_mean_reversion_sleeve(
                 args.start, args.end, capital, args.cost_bps, fractional_shares,
                 args.refresh_cache, args.output_dir,
+                universe=mr_universe.tickers, universe_info=mr_universe.info,
             )
             _print_summary("mean_reversion", mr_metrics, mr_dir)
 
@@ -382,7 +432,7 @@ def main(argv=None) -> int:
             )
             print(f"\n[compare] artifacts written to: {comparison_dir}")
 
-    except (data.FetchError, ValueError) as e:
+    except (data.FetchError, ValueError, universe_module.UniverseError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

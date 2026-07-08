@@ -163,3 +163,87 @@ def test_robustness_strategy_cli_produces_expected_artifacts(tmp_path, monkeypat
     # rather than duplicating their strategy-running logic.
     assert len(list(tmp_path.glob("*_mean_reversion_*"))) == 2
     assert len(list(tmp_path.glob("*_sector_rotation_*"))) == 2
+
+
+def _shared_price_fakes(seed=1):
+    full_dates = pd.bdate_range("1990-01-01", "2024-12-31")
+    rng = np.random.default_rng(seed)
+    base = 100.0 + np.cumsum(rng.normal(0.01, 0.5, size=len(full_dates)))
+    base = np.clip(base, 10.0, None)
+    shared_df = pd.DataFrame(
+        {"Open": base, "High": base, "Low": base, "Close": base, "Volume": 1000}, index=full_dates
+    )
+
+    def fake_get_price_data(tickers, start, end, warmup_calendar_days, hard_fail_on_missing, **kwargs):
+        return {t: shared_df.copy() for t in tickers}, []
+
+    def fake_get_benchmark_data(start, end, **kwargs):
+        return shared_df.copy()
+
+    return fake_get_price_data, fake_get_benchmark_data
+
+
+def test_universe_us_50b_threads_into_mean_reversion_sleeve(tmp_path, monkeypatch):
+    # resolve_mean_reversion_universe is mocked so this test doesn't hit
+    # Nasdaq Trader / yfinance for a live us_50b build -- the point here is
+    # only to verify cli.py actually THREADS whatever it resolves through
+    # into the mean-reversion sleeve, not to re-test src/universe.py's own
+    # fetch/filter logic (covered in tests/test_universe.py).
+    fake_tickers = ["ZZZ1", "ZZZ2", "ZZZ3", "ZZZ4", "ZZZ5"]
+    fake_resolution = cli.universe_module.UniverseResolution(
+        tickers=fake_tickers,
+        info={
+            "mode": "us_50b", "num_selected": len(fake_tickers), "num_candidates": 500,
+            "num_dropped_lookup_failed": 12, "min_market_cap": 50.5e9, "max_market_cap": 3.1e12,
+            "cache_file": "data_cache/universe_us_50b.csv", "snapshot_date": "2026-07-08T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(cli.universe_module, "resolve_mean_reversion_universe", lambda **kwargs: fake_resolution)
+
+    fake_get_price_data, fake_get_benchmark_data = _shared_price_fakes()
+    monkeypatch.setattr(cli.data, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(cli.data, "get_benchmark_data", fake_get_benchmark_data)
+
+    exit_code = cli.main([
+        "--strategy", "mean_reversion", "--universe", "us_50b", "--start", "2022-01-01",
+        "--end", "2023-12-31", "--capital", "2000", "--output-dir", str(tmp_path),
+    ])
+    assert exit_code == 0
+
+    run_dir = list(tmp_path.glob("*_mean_reversion_*"))[0]
+    import json
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    # The sleeve ran with the mocked us_50b ticker list, NOT the config default.
+    assert set(metrics["universe"]) == set(fake_tickers)
+    assert metrics["universe_info"]["mode"] == "us_50b"
+    assert metrics["universe_info"]["num_dropped_lookup_failed"] == 12
+
+    txt = (run_dir / "report.txt").read_text()
+    assert "Universe mode: us_50b" in txt
+    assert "CURRENT SNAPSHOT" in txt
+
+
+def test_universe_default_unchanged_when_no_universe_flag(tmp_path, monkeypatch):
+    # Without --universe, mean_reversion must use exactly config.MEAN_REVERSION_UNIVERSE,
+    # byte-for-byte -- this is the reproducibility guarantee the feature promises.
+    fake_get_price_data, fake_get_benchmark_data = _shared_price_fakes(seed=2)
+    monkeypatch.setattr(cli.data, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(cli.data, "get_benchmark_data", fake_get_benchmark_data)
+
+    exit_code = cli.main([
+        "--strategy", "mean_reversion", "--start", "2022-01-01", "--end", "2023-12-31",
+        "--capital", "2000", "--output-dir", str(tmp_path),
+    ])
+    assert exit_code == 0
+
+    run_dir = list(tmp_path.glob("*_mean_reversion_*"))[0]
+    import json
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert set(metrics["universe"]) == set(config.MEAN_REVERSION_UNIVERSE)
+    assert metrics["universe_info"]["mode"] == "default"
+    assert metrics["universe_info"]["cache_file"] is None
+
+    txt = (run_dir / "report.txt").read_text()
+    assert "Universe mode: default" in txt
+    # The current-snapshot caveat is specific to non-default universes.
+    assert "CURRENT SNAPSHOT" not in txt

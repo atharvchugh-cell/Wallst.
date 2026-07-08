@@ -33,7 +33,7 @@ python backtest.py --strategy both \
   --output-dir output --refresh-cache
 ```
 
-Flags: `--strategy {mean_reversion,sector_rotation,both,compare,robustness}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares), `--compare-years` (comma-separated years for `--strategy compare`'s annual-returns table, e.g. `2022,2023,2024`; default: every calendar year spanned by `--start`/`--end`; ignored for other `--strategy` values), `--robustness-windows` (comma-separated `start:end` windows for `--strategy robustness`, e.g. `2019-01-01:2021-12-31,2020-01-01:2022-12-31`; default: the 5 standard windows below; ignored for other `--strategy` values).
+Flags: `--strategy {mean_reversion,sector_rotation,both,compare,robustness}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares), `--compare-years` (comma-separated years for `--strategy compare`'s annual-returns table, e.g. `2022,2023,2024`; default: every calendar year spanned by `--start`/`--end`; ignored for other `--strategy` values), `--robustness-windows` (comma-separated `start:end` windows for `--strategy robustness`, e.g. `2019-01-01:2021-12-31,2020-01-01:2022-12-31`; default: the 5 standard windows below; ignored for other `--strategy` values), `--universe {default,us_50b}` (mean-reversion universe; default `default` — see below; ignored by `sector_rotation`), `--universe-csv PATH` (use a custom ticker CSV instead, overrides `--universe`), `--refresh-universe` (rebuild the `us_50b` universe from live data instead of using its cache).
 
 Each run writes a timestamped directory under `output/` (e.g. `output/20250101T120000_mean_reversion_2018-01-01_to_2025-01-01/`) containing:
 
@@ -97,10 +97,38 @@ Writes `output/{ts}_robustness_{start}_to_{end}/`:
 
 Since each window reuses the individual-sleeve functions unmodified, every window also writes its own normal `mean_reversion`/`sector_rotation` report directories as a side effect (10 extra directories for the 5 default windows) — useful for auditing any one window's underlying trades, not something you need to look at to read the robustness report itself.
 
+### `--universe`: default vs. a larger current-snapshot universe
+
+Mean reversion's universe is pluggable. This does not change any strategy threshold (RSI/SMA/holding-days/stop-loss/position-count) — only which tickers the same rules run against. Sector rotation is unaffected either way; it always trades the 11 fixed sector ETFs.
+
+```bash
+# Default: unchanged, reproducible ~25-stock universe (nothing new to opt into).
+python backtest.py --strategy mean_reversion
+
+# A much larger universe: every US-listed common stock currently >= $50B market cap.
+python backtest.py --strategy mean_reversion --universe us_50b --refresh-universe
+
+# Your own ticker list (CSV needs at minimum a `ticker` column).
+python backtest.py --strategy mean_reversion --universe-csv my_tickers.csv
+```
+
+- **`--universe default`** (the default) is the existing hardcoded `config.MEAN_REVERSION_UNIVERSE` list — old results stay exactly reproducible; nothing about this mode's behavior changed.
+- **`--universe us_50b`** builds (or reuses a cached build of) a universe of US-listed common stock with a *current* market cap >= $50B:
+  1. Downloads Nasdaq Trader's public symbol directories (`nasdaqlisted.txt`, `otherlisted.txt`), which cover NASDAQ- and NYSE/NYSE American/NYSE Arca/Cboe-listed securities.
+  2. Excludes test issues, ETFs, and (by name pattern) warrants, rights, units, preferred shares, notes, and funds/trusts — the goal is plain common stock.
+  3. Normalizes tickers to Yahoo Finance's convention (`BRK.B` → `BRK-B`).
+  4. Looks up each candidate's current market cap via `yfinance`, with batching and automatic retries for transient failures. If more than half of all candidates fail lookup, a warning is printed (and recorded in the report) since the resulting universe may be missing real qualifying names purely due to fetch trouble.
+  5. Keeps tickers with market cap >= $50B (hard-fails rather than running on a near-empty universe if fewer than 5 qualify).
+  6. Caches the result to `data_cache/universe_us_50b.csv` (ticker, name, market cap, exchange, snapshot timestamp). Subsequent runs reuse this cache; pass `--refresh-universe` to rebuild it from live data.
+- **`--universe-csv PATH`** uses your own CSV instead (a `ticker` column is required; `name`/`market_cap`/`exchange`/`snapshot_date` columns are used if present, same schema as the `us_50b` cache file). This always overrides `--universe`.
+- Every report (`report.txt`, `metrics.json`) for a non-default universe records: universe mode, tickers selected, tickers dropped due to failed market-cap lookup, the min/max market cap actually in the universe, the cache file used, and the universe snapshot's timestamp.
+
+**Why this is still survivorship-biased, and NOT point-in-time historical membership:** `us_50b` membership is decided once, using *today's* market cap, then applied uniformly across every historical date a backtest touches. A ticker in this universe was not necessarily >= $50B (or even public) for the entire window you're backtesting — a company that IPO'd in 2023 and is >= $50B today appears in a 2019-2024 backtest as if it had been tradeable the whole time; a company that WAS >= $50B in 2019 but has since shrunk or been delisted does not appear at all. Market caps also drift with the market, so re-running `--refresh-universe` on a different day can change which tickers qualify — this is a live/current value, not a fixed historical fact. Treat `us_50b` results exactly like the default universe's results: they validate strategy mechanics on a large, liquid, currently-large-cap set of names, not a general historical edge.
+
 ## Strategy rules
 
 ### Mean reversion ($7,500 sleeve)
-- Universe: ~25 liquid, sector-diverse large caps (`src/config.py: MEAN_REVERSION_UNIVERSE`).
+- Universe: ~25 liquid, sector-diverse large caps by default (`src/config.py: MEAN_REVERSION_UNIVERSE`), or a larger current US-listed >= $50B universe via `--universe us_50b` (see "`--universe`" above) — either way, the entry/exit rules below are unchanged.
 - **Entry**: RSI(14) drops below `RSI_ENTRY_THRESHOLD` (`src/config.py`, default **35**), if a slot is free (`MAX_CONCURRENT_POSITIONS`, default 5, sized at 1/5 of the sleeve each). If more candidates than free slots signal the same day, the lowest RSI (most oversold) wins.
 - **Exit** (priority order — first match wins): (1) delayed exit rule ("stop-loss"), close ≤ 92% of the entry fill price; (2) timeout, `MAX_HOLDING_DAYS` trading days held (default **10**); (3) close crosses back above `SMA_PERIOD` (default **30**); (4) RSI rises back to `RSI_EXIT_THRESHOLD` (default 50). See "Design decisions" for why (1) is not a real intraday stop.
 - All signals fill at the **next** trading day's close, never the signal day's close (see "Execution timing" below).
@@ -135,7 +163,7 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 
 ## Known limitations
 
-- **Survivorship bias**: the mean-reversion universe is today's surviving large caps, not a point-in-time constituent list from whenever the backtest starts. A stock that existed in 2018 but has since been delisted, acquired, or gone bankrupt is not in this universe, which tends to overstate historical performance. Every mean-reversion report prints an explicit warning about this. Treat mean-reversion results as validation of the strategy's *mechanics*, not proof of a durable historical edge.
+- **Survivorship bias**: the mean-reversion universe — whether the default ~25-stock list or the larger `--universe us_50b` current-snapshot universe (see "`--universe`" above) — is today's surviving large caps, not a point-in-time constituent list from whenever the backtest starts. A stock that existed in 2018 but has since been delisted, acquired, or gone bankrupt is not in either universe, which tends to overstate historical performance. Every mean-reversion report prints an explicit warning about this. Treat mean-reversion results as validation of the strategy's *mechanics*, not proof of a durable historical edge.
 - No intraday price simulation — everything executes at a daily close.
 - No bid/ask spread or market-impact modeling; only a flat per-trade cost assumption (`--cost-bps`, default 5 bps).
 - No dividend/borrow cost modeling beyond what's already baked into `auto_adjust=True` adjusted closes.
@@ -150,4 +178,4 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 pytest tests/
 ```
 
-111 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), and the `--strategy robustness` allocation-blending math (raw-equity-curve blending that preserves first-day cost drag rather than normalizing it away, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run). CI runs this suite on every push via GitHub Actions.
+129 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), the `--strategy robustness` allocation-blending math (raw-equity-curve blending that preserves first-day cost drag rather than normalizing it away, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run), and the `--universe us_50b` universe builder (symbol-directory parsing/filtering, ticker normalization, market-cap threshold filtering, cache read/write, and confirmation that omitting `--universe` leaves the default universe byte-for-byte unchanged). CI runs this suite on every push via GitHub Actions.

@@ -53,6 +53,15 @@ SURVIVORSHIP_WARNING = (
     "list. Results here validate the mechanics of the strategy, not a "
     "general edge -- see README."
 )
+UNIVERSE_SNAPSHOT_WARNING = (
+    "WARNING: this universe is a CURRENT SNAPSHOT (today's market caps / "
+    "listing status), not a point-in-time historical constituent list. A "
+    "ticker's presence here does not mean it met the market-cap threshold "
+    "at every historical date tested -- market caps drift over time, and "
+    "re-running --refresh-universe on a different day can change which "
+    "tickers qualify. Like the default universe, this is still "
+    "survivorship-biased research, not a point-in-time historical validation."
+)
 
 TARGET_EVENT_COLUMNS = [
     "strategy", "ticker", "signal_date", "fill_date", "target_weight",
@@ -163,6 +172,29 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
     lines.append("")
     lines.append(f"Starting capital: ${run_config.get('capital', result.capital):,.2f}")
     lines.append(f"Universe ({len(result.universe)}): {', '.join(result.universe)}")
+    universe_info = run_config.get("universe_info")
+    if universe_info:
+        lines.append("")
+        lines.append("--- Universe selection ---")
+        lines.append(f"Universe mode: {universe_info.get('mode')}")
+        lines.append(f"Tickers selected: {universe_info.get('num_selected', len(result.universe))}")
+        if universe_info.get("num_candidates") is not None:
+            lines.append(f"Candidate tickers considered: {universe_info['num_candidates']}")
+        if universe_info.get("num_dropped_lookup_failed") is not None:
+            lines.append(
+                f"Tickers dropped (market-cap lookup failed): {universe_info['num_dropped_lookup_failed']}"
+            )
+        if universe_info.get("min_market_cap") is not None and universe_info.get("max_market_cap") is not None:
+            lines.append(
+                f"Market cap range in universe: ${universe_info['min_market_cap']:,.0f} - "
+                f"${universe_info['max_market_cap']:,.0f}"
+            )
+        if universe_info.get("cache_file"):
+            lines.append(f"Universe cache file: {universe_info['cache_file']}")
+        if universe_info.get("snapshot_date"):
+            lines.append(f"Universe snapshot timestamp: {universe_info['snapshot_date']}")
+        if universe_info.get("mode") != "default":
+            lines.append(UNIVERSE_SNAPSHOT_WARNING)
     if result.dropped_tickers:
         lines.append("Dropped tickers:")
         for t, reason in result.dropped_tickers:
