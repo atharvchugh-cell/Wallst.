@@ -114,3 +114,52 @@ def test_compare_strategy_respects_explicit_compare_years(tmp_path, monkeypatch)
     run_dir = list(tmp_path.glob("*_comparison_*"))[0]
     annual_df = pd.read_csv(run_dir / "annual_returns.csv")
     assert list(annual_df["year"]) == [2023]
+
+
+def test_robustness_strategy_cli_produces_expected_artifacts(tmp_path, monkeypatch):
+    full_dates = pd.bdate_range("1990-01-01", "2024-12-31")
+    rng = np.random.default_rng(11)
+    base = 100.0 + np.cumsum(rng.normal(0.01, 0.5, size=len(full_dates)))
+    base = np.clip(base, 10.0, None)
+    shared_df = pd.DataFrame(
+        {"Open": base, "High": base, "Low": base, "Close": base, "Volume": 1000}, index=full_dates
+    )
+
+    def fake_get_price_data(tickers, start, end, warmup_calendar_days, hard_fail_on_missing, **kwargs):
+        return {t: shared_df.copy() for t in tickers}, []
+
+    def fake_get_benchmark_data(start, end, **kwargs):
+        return shared_df.copy()
+
+    monkeypatch.setattr(cli.data, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(cli.data, "get_benchmark_data", fake_get_benchmark_data)
+
+    # Two small windows via --robustness-windows (not the 5 full default
+    # windows) to keep this test fast -- the default-window LIST itself is
+    # covered separately in tests/test_robustness.py.
+    exit_code = cli.main([
+        "--strategy", "robustness", "--start", "2022-01-01", "--end", "2023-12-31",
+        "--capital", "2000", "--output-dir", str(tmp_path),
+        "--robustness-windows", "2022-01-01:2022-12-31,2023-01-01:2023-12-31",
+    ])
+    assert exit_code == 0
+
+    robustness_dirs = list(tmp_path.glob("*_robustness_*"))
+    assert len(robustness_dirs) == 1
+    run_dir = robustness_dirs[0]
+    assert (run_dir / "robustness_summary.csv").exists()
+    assert (run_dir / "robustness_summary.txt").exists()
+    assert (run_dir / "robustness_rankings.csv").exists()
+    assert (run_dir / "robustness_heatmap_data.csv").exists()
+    assert (run_dir / "robustness_summary.json").exists()
+
+    summary_df = pd.read_csv(run_dir / "robustness_summary.csv")
+    assert set(summary_df["window"]) == {"2022-2022", "2023-2023"}
+    assert set(summary_df["allocation"]) == {label for label, _, _ in cli.ALLOCATION_MIXES} | {"SPY"}
+
+    # Individual sleeve reports are still written per window (2 windows x
+    # {mean_reversion, sector_rotation} = 4 dirs), since robustness mode
+    # reuses run_mean_reversion_sleeve/run_sector_rotation_sleeve unmodified
+    # rather than duplicating their strategy-running logic.
+    assert len(list(tmp_path.glob("*_mean_reversion_*"))) == 2
+    assert len(list(tmp_path.glob("*_sector_rotation_*"))) == 2

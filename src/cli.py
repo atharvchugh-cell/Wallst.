@@ -13,7 +13,10 @@ import yfinance as yf
 from . import config, data
 from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
-from .reporting import write_run_artifacts, write_comparison_report, compute_sleeve_contribution
+from .reporting import (
+    write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
+)
+from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
 from .strategies.sector_rotation import SectorRotationStrategy
 
@@ -26,7 +29,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         "Research/educational tool only -- does not place live trades."
     )
     parser.add_argument(
-        "--strategy", choices=["mean_reversion", "sector_rotation", "both", "compare"], required=True
+        "--strategy",
+        choices=["mean_reversion", "sector_rotation", "both", "compare", "robustness"],
+        required=True,
     )
     today = pd.Timestamp.now().normalize()
     default_start = (today - pd.DateOffset(years=config.DEFAULT_START_YEARS_BACK)).date().isoformat()
@@ -42,6 +47,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Comma-separated calendar years for --strategy compare's annual-returns table, "
         "e.g. 2022,2023,2024 (default: every calendar year spanned by --start/--end). "
         "Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--robustness-windows", default=None,
+        help="Comma-separated start:end windows for --strategy robustness, e.g. "
+        "'2019-01-01:2021-12-31,2020-01-01:2022-12-31' (default: the 5 standard windows "
+        "2019-2021/2020-2022/2021-2023/2022-2024/2019-2024). Ignored for other --strategy values.",
     )
     return parser.parse_args(argv)
 
@@ -190,6 +201,84 @@ def run_sector_rotation_sleeve(start, end, capital, cost_bps, fractional_shares,
     return result, metrics, run_config, run_dir
 
 
+def _parse_robustness_windows(spec: str | None) -> list[tuple[str, str, str]]:
+    if not spec:
+        return list(DEFAULT_ROBUSTNESS_WINDOWS)
+    windows = []
+    for chunk in spec.split(","):
+        start_str, end_str = chunk.strip().split(":")
+        start_str, end_str = start_str.strip(), end_str.strip()
+        label = f"{pd.Timestamp(start_str).year}-{pd.Timestamp(end_str).year}"
+        windows.append((label, start_str, end_str))
+    return windows
+
+
+def run_robustness(args: argparse.Namespace) -> int:
+    """Diagnostics only: runs mean_reversion and sector_rotation ONCE per
+    window (reusing run_mean_reversion_sleeve/run_sector_rotation_sleeve
+    unmodified -- same strategy logic, same config.py defaults, same
+    per-sleeve artifact writing as every other --strategy mode), then
+    blends those two already-computed results into each of the 5 fixed
+    allocation mixes plus a SPY row via `src/robustness.py` -- see that
+    module's docstring for why blending is used instead of re-running the
+    engine once per allocation."""
+    fractional_shares = not args.no_fractional_shares
+    windows = _parse_robustness_windows(args.robustness_windows)
+
+    all_window_metrics: dict[str, dict[str, dict]] = {}
+    window_ranges: dict[str, str] = {}
+
+    for window_label, w_start, w_end in windows:
+        print(f"\n=== Robustness window {window_label}: {w_start} to {w_end} ===")
+        try:
+            mr_result, mr_metrics, _mr_config, _mr_dir = run_mean_reversion_sleeve(
+                w_start, w_end, args.capital, args.cost_bps, fractional_shares,
+                args.refresh_cache, args.output_dir,
+            )
+            sr_result, sr_metrics, _sr_config, _sr_dir = run_sector_rotation_sleeve(
+                w_start, w_end, args.capital, args.cost_bps, fractional_shares,
+                args.refresh_cache, args.output_dir,
+            )
+        except (data.FetchError, ValueError) as e:
+            print(f"Error in window {window_label}: {e}", file=sys.stderr)
+            continue
+
+        common_index = sr_result.equity_curve.index.intersection(mr_result.equity_curve.index)
+        if len(common_index) == 0:
+            print(f"Error: no overlapping dates for window {window_label}; skipping.", file=sys.stderr)
+            continue
+
+        spy_df = data.get_benchmark_data(common_index[0], common_index[-1], force_refresh=args.refresh_cache)
+        spy_close = spy_df["Close"]
+
+        alloc_metrics: dict[str, dict] = {}
+        for label, w_sr, w_mr in ALLOCATION_MIXES:
+            alloc_metrics[label] = blend_metrics(
+                sr_result, sr_metrics, mr_result, mr_metrics, w_sr, w_mr, args.capital, benchmark_close=spy_close,
+            )
+        alloc_metrics["SPY"] = spy_standalone_metrics(spy_close)
+
+        all_window_metrics[window_label] = alloc_metrics
+        window_ranges[window_label] = f"{common_index[0].date()} to {common_index[-1].date()}"
+        print(f"[{window_label}] done")
+
+    if not all_window_metrics:
+        print("Error: robustness run produced no usable windows.", file=sys.stderr)
+        return 1
+
+    run_config = {
+        "requested_start": str(pd.Timestamp(args.start).date()),
+        "requested_end": str(pd.Timestamp(args.end).date()),
+        "capital": args.capital,
+        "cost_bps": args.cost_bps,
+        "fractional_shares": fractional_shares,
+        "windows": [label for label, _s, _e in windows],
+    }
+    run_dir = write_robustness_report(all_window_metrics, window_ranges, run_config, output_dir=args.output_dir)
+    print(f"\n[robustness] artifacts written to: {run_dir}")
+    return 0
+
+
 def _print_summary(label: str, metrics: dict, run_dir) -> None:
     print(f"\n[{label}] total_return={metrics.get('total_return'):.2%}  "
           f"cagr={metrics.get('cagr'):.2%}  max_drawdown={metrics.get('max_drawdown'):.2%}  "
@@ -204,6 +293,9 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    if args.strategy == "robustness":
+        return run_robustness(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None

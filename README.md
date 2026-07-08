@@ -33,7 +33,7 @@ python backtest.py --strategy both \
   --output-dir output --refresh-cache
 ```
 
-Flags: `--strategy {mean_reversion,sector_rotation,both,compare}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares), `--compare-years` (comma-separated years for `--strategy compare`'s annual-returns table, e.g. `2022,2023,2024`; default: every calendar year spanned by `--start`/`--end`; ignored for other `--strategy` values).
+Flags: `--strategy {mean_reversion,sector_rotation,both,compare,robustness}` (required), `--start`, `--end` (default: last 7 years through today), `--capital` (default 15000), `--cost-bps` (default 5), `--output-dir` (default `output`), `--refresh-cache` (force a full re-download instead of using the local cache), `--no-fractional-shares` (round position sizes down to whole shares), `--compare-years` (comma-separated years for `--strategy compare`'s annual-returns table, e.g. `2022,2023,2024`; default: every calendar year spanned by `--start`/`--end`; ignored for other `--strategy` values), `--robustness-windows` (comma-separated `start:end` windows for `--strategy robustness`, e.g. `2019-01-01:2021-12-31,2020-01-01:2022-12-31`; default: the 5 standard windows below; ignored for other `--strategy` values).
 
 Each run writes a timestamped directory under `output/` (e.g. `output/20250101T120000_mean_reversion_2018-01-01_to_2025-01-01/`) containing:
 
@@ -67,6 +67,35 @@ Writes an extra `output/{ts}_comparison_{start}_to_{end}/` directory:
 `comparison.txt` also includes a **strategy contribution** section for the combined sleeve: each sleeve's starting/final equity over the combined (intersection) window, each sleeve's dollar contribution to the combined gain, and each sleeve's share of combined transaction costs — computed directly from each sleeve's own equity curve and transactions (not the naive concatenation `both` uses internally), so a sleeve that started trading before the intersection window began doesn't get misattributed gains/costs from before that window.
 
 Each row's underlying date range can differ (mean reversion needs indicator warmup; sector rotation clips to `latest ETF inception + lookback`; `both`/SPY use the intersection) — `comparison.txt` prints the effective range used per row so this isn't hidden.
+
+### `--strategy robustness`: does the allocation choice hold up across time and mix?
+
+```bash
+python backtest.py --strategy robustness --start 2019-01-01 --end 2024-12-31 --capital 15000 --refresh-cache
+```
+
+`--strategy compare` answers "how did mean reversion vs. sector rotation vs. 50/50 do in ONE window?" `--strategy robustness` asks the next question: does the current 50/50 split hold up across **different capital allocations** and **different historical windows**, or does it only look reasonable in the one window already examined? Still diagnostics only — no RSI/SMA/holding-day/top-K/stop-loss/universe/transaction-cost parameter is touched, and `--strategy both`'s allocation stays a fixed 50/50 exactly as before; this mode's allocation logic is isolated to itself.
+
+**Default windows** (5 overlapping 3-year-ish calendar-year windows, override with `--robustness-windows`):
+`2019-2021`, `2020-2022`, `2021-2023`, `2022-2024`, `2019-2024`.
+
+**Allocation mixes tested in each window:**
+100% sector / 0% mean-reversion, 75/25, 50/50, 25/75, 0% sector / 100% mean-reversion, plus a SPY row.
+
+**How allocation mixes are computed:** mean_reversion and sector_rotation are each run **once per window** (reusing `run_mean_reversion_sleeve`/`run_sector_rotation_sleeve` completely unmodified — the same strategy logic and config.py defaults as every other mode), not once per allocation. The 5 allocation mixes are then built by capital-weighting those two already-computed equity curves and transaction totals. This is mathematically equivalent to actually re-running each sleeve at its allocated capital, because every dollar decision the engine makes is sized as a pure fraction of that sleeve's own equity (`target_weight * sleeve_equity`) and `cost_bps` is a fixed rate — both scale linearly with capital. See `src/robustness.py`'s module docstring for the full reasoning (and its one caveat: fixed-dollar dust thresholds, which never bind at realistic position sizes). This turns 5 windows × 6 allocations × 2 sleeves (60 backtests) into 5 windows × 2 sleeves (10 backtests) plus arithmetic.
+
+Writes `output/{ts}_robustness_{start}_to_{end}/`:
+
+| File | Contents |
+|---|---|
+| `robustness_summary.csv` / `.txt` | One row per (window, allocation): the same 17 metrics as `--strategy compare`'s table |
+| `robustness_rankings.csv` | Per allocation: average rank across windows by total return/Sharpe/max drawdown/Calmar, and how often it beats SPY on return and on max drawdown |
+| `robustness_heatmap_data.csv` | Wide matrix (allocation × window) of total return, ready to feed into a heatmap |
+| `robustness_summary.json` | Same data, machine-readable |
+
+`robustness_summary.txt` directly answers: best allocation per window (by return/Sharpe/drawdown/Calmar), average rank across windows, how often each allocation beats SPY (on return, and on drawdown), and a "does mean reversion's drawdown protection justify its cost drag" section comparing every non-100%-sector allocation against the 100%-sector baseline (a simple heuristic — drawdown improved by more percentage points than cost drag increased — not a rigorous risk-adjusted verdict).
+
+Since each window reuses the individual-sleeve functions unmodified, every window also writes its own normal `mean_reversion`/`sector_rotation` report directories as a side effect (10 extra directories for the 5 default windows) — useful for auditing any one window's underlying trades, not something you need to look at to read the robustness report itself.
 
 ## Strategy rules
 
@@ -121,4 +150,4 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 pytest tests/
 ```
 
-90 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, and the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run). CI runs this suite on every push via GitHub Actions.
+108 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), and the `--strategy robustness` allocation-blending math (scale-invariance checks, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run). CI runs this suite on every push via GitHub Actions.

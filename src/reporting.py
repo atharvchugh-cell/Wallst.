@@ -19,6 +19,13 @@ import pandas as pd  # noqa: E402
 from . import config  # noqa: E402
 from .engine import BacktestResult  # noqa: E402
 from .metrics import annual_returns, monthly_returns  # noqa: E402
+from .robustness import (  # noqa: E402
+    ALLOCATION_MIXES,
+    average_ranks,
+    beats_spy_fraction,
+    mean_reversion_tradeoff,
+    rank_allocations,
+)
 
 EXECUTION_MODEL_LINE = (
     "Execution model: close-to-close, one-day signal-to-fill lag, "
@@ -474,5 +481,223 @@ def write_comparison_report(
     metrics_out["contribution"] = contribution
     with open(run_dir / "comparison.json", "w") as f:
         json.dump(metrics_out, f, indent=2, default=str)
+
+    return run_dir
+
+
+# --- Robustness report: allocation mixes x historical windows vs. SPY ---
+# Diagnostics only -- see src/robustness.py's module docstring for why
+# allocation mixes are capital-weighted blends rather than separately
+# re-run backtests.
+
+def _write_robustness_summary_csv(path: Path, all_window_metrics: dict[str, dict[str, dict]]) -> None:
+    rows = []
+    for window_label, alloc_dict in all_window_metrics.items():
+        for label, m in alloc_dict.items():
+            row = {"window": window_label, "allocation": label}
+            for key, _name, _fmt in COMPARISON_METRIC_FIELDS:
+                row[key] = m.get(key)
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _compute_robustness_rankings(
+    alloc_only_by_window: dict[str, dict[str, dict]], spy_metrics_by_window: dict[str, dict]
+) -> dict:
+    rank_fields = [
+        ("total_return", "avg_rank_total_return"),
+        ("sharpe_ratio", "avg_rank_sharpe"),
+        ("max_drawdown", "avg_rank_max_drawdown"),
+        ("calmar_ratio", "avg_rank_calmar"),
+    ]
+    avg_ranks_by_field = {out_key: average_ranks(alloc_only_by_window, key) for key, out_key in rank_fields}
+    return {
+        **avg_ranks_by_field,
+        "pct_windows_beats_spy_return": beats_spy_fraction(alloc_only_by_window, spy_metrics_by_window, "total_return"),
+        "pct_windows_lower_drawdown_than_spy": beats_spy_fraction(
+            alloc_only_by_window, spy_metrics_by_window, "max_drawdown"
+        ),
+        "best_by_window": {
+            key: {w: rank_allocations(wm, key) for w, wm in alloc_only_by_window.items()}
+            for key, _out_key in rank_fields
+        },
+    }
+
+
+def _write_robustness_rankings_csv(path: Path, rankings: dict) -> None:
+    rows = []
+    for label, _w_sr, _w_mr in ALLOCATION_MIXES:
+        rows.append({
+            "allocation": label,
+            "avg_rank_total_return": rankings["avg_rank_total_return"].get(label),
+            "avg_rank_sharpe": rankings["avg_rank_sharpe"].get(label),
+            "avg_rank_max_drawdown": rankings["avg_rank_max_drawdown"].get(label),
+            "avg_rank_calmar": rankings["avg_rank_calmar"].get(label),
+            "pct_windows_beats_spy_return": rankings["pct_windows_beats_spy_return"].get(label),
+            "pct_windows_lower_drawdown_than_spy": rankings["pct_windows_lower_drawdown_than_spy"].get(label),
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_robustness_heatmap_csv(path: Path, all_window_metrics: dict[str, dict[str, dict]]) -> None:
+    """Wide matrix (allocation x window) of TOTAL RETURN -- the headline
+    metric most useful to visualize as a heatmap. Other metrics are
+    available in the long-format robustness_summary.csv if a different
+    heatmap is needed."""
+    window_labels = list(all_window_metrics.keys())
+    row_labels: list[str] = []
+    for wm in all_window_metrics.values():
+        for label in wm:
+            if label not in row_labels:
+                row_labels.append(label)
+    rows = []
+    for label in row_labels:
+        row = {"allocation": label}
+        for w in window_labels:
+            row[w] = all_window_metrics[w].get(label, {}).get("total_return")
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_robustness_summary_txt(
+    path: Path,
+    all_window_metrics: dict[str, dict[str, dict]],
+    window_ranges: dict[str, str],
+    rankings: dict,
+    tradeoff_rows: list[dict],
+    run_config: dict,
+) -> None:
+    lines = []
+    lines.append("=== Robustness Testing Report ===")
+    lines.append("")
+    lines.append("** RESEARCH / EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. **")
+    lines.append(
+        "Diagnostics only -- no RSI/SMA/holding-day/top-K/stop-loss/universe/"
+        "transaction-cost parameter was tuned to produce this report."
+    )
+    lines.append(
+        "Allocation mixes are capital-weighted blends of independently-run "
+        "mean_reversion and sector_rotation sleeves (each run ONCE per window "
+        "at full capital), not separately re-run backtests per allocation -- "
+        "see src/robustness.py's module docstring for why that's mathematically "
+        "equivalent to actually re-running each sleeve at its allocated capital."
+    )
+    lines.append("")
+    lines.append(f"Windows tested: {', '.join(window_ranges.keys())}")
+    for w, rng in window_ranges.items():
+        lines.append(f"  {w}: {rng}")
+
+    col_w = 15
+    name_w = 30
+    for window_label, alloc_dict in all_window_metrics.items():
+        labels = list(alloc_dict.keys())
+        lines.append("")
+        lines.append(f"--- Window {window_label} ({window_ranges.get(window_label, 'n/a')}) ---")
+        lines.append(f"{'Metric':<{name_w}}" + "".join(f"{lbl:>{col_w}}" for lbl in labels))
+        for key, label_name, fmt in COMPARISON_METRIC_FIELDS:
+            cells = "".join(f"{fmt(alloc_dict[lbl].get(key)):>{col_w}}" for lbl in labels)
+            lines.append(f"{label_name:<{name_w}}{cells}")
+
+    lines.append("")
+    lines.append("--- Best allocation per window ---")
+    for metric_key, metric_label in [
+        ("total_return", "Total return"), ("sharpe_ratio", "Sharpe"),
+        ("max_drawdown", "Max drawdown"), ("calmar_ratio", "Calmar"),
+    ]:
+        lines.append(f"By {metric_label}:")
+        for w, ranks in rankings["best_by_window"][metric_key].items():
+            best_label = next((lbl for lbl, r in ranks.items() if r == 1), "n/a")
+            lines.append(f"  {w}: {best_label}")
+
+    lines.append("")
+    lines.append("--- Average rank across windows (1 = best, excludes SPY) ---")
+    lines.append(
+        f"{'Allocation':<{name_w}}{'Return':>{col_w}}{'Sharpe':>{col_w}}{'MaxDD':>{col_w}}{'Calmar':>{col_w}}"
+    )
+    for label, _w_sr, _w_mr in ALLOCATION_MIXES:
+        lines.append(
+            f"{label:<{name_w}}"
+            f"{_fmt_ratio(rankings['avg_rank_total_return'].get(label)):>{col_w}}"
+            f"{_fmt_ratio(rankings['avg_rank_sharpe'].get(label)):>{col_w}}"
+            f"{_fmt_ratio(rankings['avg_rank_max_drawdown'].get(label)):>{col_w}}"
+            f"{_fmt_ratio(rankings['avg_rank_calmar'].get(label)):>{col_w}}"
+        )
+
+    lines.append("")
+    lines.append("--- How often each allocation beats SPY, across tested windows ---")
+    lines.append(f"{'Allocation':<{name_w}}{'Beats SPY return':>{col_w + 6}}{'Lower DD than SPY':>{col_w + 6}}")
+    for label, _w_sr, _w_mr in ALLOCATION_MIXES:
+        lines.append(
+            f"{label:<{name_w}}"
+            f"{_fmt_pct(rankings['pct_windows_beats_spy_return'].get(label)):>{col_w + 6}}"
+            f"{_fmt_pct(rankings['pct_windows_lower_drawdown_than_spy'].get(label)):>{col_w + 6}}"
+        )
+
+    lines.append("")
+    lines.append("--- Does mean reversion's drawdown protection justify its cost drag? ---")
+    lines.append(
+        "(vs. the 100%-sector-rotation baseline in the same window; a simple "
+        "heuristic -- drawdown improved AND by more percentage points than the "
+        "cost-drag increase -- not a rigorous risk-adjusted verdict.)"
+    )
+    for row in tradeoff_rows:
+        verdict = "YES" if row["worth_it"] else "no"
+        lines.append(
+            f"  {row['window']:<12}{row['allocation']:<32}"
+            f"drawdown {_fmt_pct(row['drawdown_improvement_pts'])} better, "
+            f"cost drag {_fmt_pct(row['cost_drag_increase_pts'])} higher -> {verdict}"
+        )
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_robustness_report(
+    all_window_metrics: dict[str, dict[str, dict]],
+    window_ranges: dict[str, str],
+    run_config: dict,
+    output_dir: str = config.OUTPUT_DIR,
+) -> Path:
+    """Writes the full robustness-testing artifact set: `all_window_metrics`
+    is `{window_label: {allocation_label_or_"SPY": metrics_dict}}` for every
+    tested window, already computed by the caller (see cli.py's `robustness`
+    mode and src/robustness.py's blending functions)."""
+    spy_metrics_by_window = {w: m.get("SPY", {}) for w, m in all_window_metrics.items()}
+    alloc_only_by_window = {
+        w: {label: m for label, m in wm.items() if label != "SPY"} for w, wm in all_window_metrics.items()
+    }
+    rankings = _compute_robustness_rankings(alloc_only_by_window, spy_metrics_by_window)
+    tradeoff_rows = mean_reversion_tradeoff(alloc_only_by_window)
+
+    ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    dirname = f"{ts}_robustness_{run_config.get('requested_start', 'na')}_to_{run_config.get('requested_end', 'na')}"
+    run_dir = Path(output_dir) / dirname
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_robustness_summary_csv(run_dir / "robustness_summary.csv", all_window_metrics)
+    _write_robustness_rankings_csv(run_dir / "robustness_rankings.csv", rankings)
+    _write_robustness_heatmap_csv(run_dir / "robustness_heatmap_data.csv", all_window_metrics)
+    _write_robustness_summary_txt(
+        run_dir / "robustness_summary.txt", all_window_metrics, window_ranges, rankings, tradeoff_rows, run_config
+    )
+
+    # "equity_curve" (a raw pd.Series, put there for the blending math's own
+    # use) doesn't belong in a JSON summary -- everything a reader needs is
+    # already in the scalar metric fields.
+    json_safe_results = {
+        w: {label: {k: v for k, v in m.items() if k != "equity_curve"} for label, m in alloc_dict.items()}
+        for w, alloc_dict in all_window_metrics.items()
+    }
+    with open(run_dir / "robustness_summary.json", "w") as f:
+        json.dump(
+            {
+                "run_config": run_config,
+                "windows": window_ranges,
+                "results": json_safe_results,
+                "rankings": rankings,
+                "mean_reversion_tradeoff": tradeoff_rows,
+            },
+            f, indent=2, default=str,
+        )
 
     return run_dir
