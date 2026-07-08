@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 import requests
 
-from src import universe
+from src import config, universe
 
 NASDAQ_LISTED_SAMPLE = """Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares
 AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N
@@ -415,6 +415,171 @@ def test_build_us_50b_universe_excludes_ticker_with_no_recent_price_data(tmp_pat
     assert "MSFT" not in loaded.tickers
 
 
+def test_build_us_50b_universe_no_validated_window_recorded_without_backtest_window(tmp_path, monkeypatch):
+    # Without a specific backtest window, the price-data check falls back
+    # to a fixed recent lookback, and no validated window is recorded --
+    # there's nothing window-specific to trust or distrust later.
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+    quotes = [make_quote("AAPL", 3_000_000_000_000.0)]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.price_data_validated_start is None
+    assert snapshot.price_data_validated_end is None
+
+
+def test_build_us_50b_universe_validates_price_data_against_requested_backtest_window(tmp_path, monkeypatch):
+    # The real SPCX-shaped bug: a ticker can have a perfectly fine RECENT
+    # quote (so a fixed recent-lookback price check would pass it) while
+    # having no price history at all over the historical window a backtest
+    # actually needs. When a specific backtest window is known,
+    # build_us_50b_universe must validate against THAT window, not just
+    # "recent" -- and it must not be filtered out earlier by the identity
+    # or non-common-stock checks, so this reaches the price-data step at all.
+    extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
+        "File Creation Time",
+        "SPCX|Spectral Capital Corp - Common Stock|Q|N|N|100|N|N\nFile Creation Time",
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: extended_nasdaq)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("SPCX", 1_970_000_000_000.0, name="Spectral Capital Corp."),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    calls = []
+
+    def fake_price_check(ticker, start=None, end=None):
+        calls.append((ticker, start, end))
+        return ticker != "SPCX"  # SPCX has no data for the requested historical window
+
+    monkeypatch.setattr(universe, "_default_price_data_available", fake_price_check)
+
+    snapshot = universe.build_us_50b_universe(
+        min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"),
+        price_data_start="2022-01-01", price_data_end="2024-12-31",
+    )
+    assert snapshot.tickers == ["AAPL"]
+    assert "SPCX" not in snapshot.tickers
+    assert snapshot.num_excluded_no_price_data == 1
+    assert snapshot.num_excluded_identity_mismatch == 0  # reached the price-data step, not filtered earlier
+
+    # The checker was called with the warmup-adjusted requested window, not
+    # a fixed recent lookback.
+    spcx_calls = [c for c in calls if c[0] == "SPCX"]
+    assert len(spcx_calls) == 1
+    _, start_arg, end_arg = spcx_calls[0]
+    expected_start = pd.Timestamp("2022-01-01") - pd.Timedelta(days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS)
+    assert start_arg == expected_start
+    assert end_arg == pd.Timestamp("2024-12-31")
+
+    # The validated window is recorded on the snapshot...
+    assert snapshot.price_data_validated_start == str(expected_start.date())
+    assert snapshot.price_data_validated_end == "2024-12-31"
+
+    # ...and excluded-for-no-price-data tickers must not leak into the cache.
+    loaded = universe.load_universe_cache(str(tmp_path / "u.csv"))
+    assert "SPCX" not in loaded.tickers
+
+
+def test_window_covers_true_when_cached_window_contains_requested_window():
+    assert universe._window_covers(
+        "2019-01-01", "2024-12-31", pd.Timestamp("2021-01-01"), pd.Timestamp("2023-01-01")
+    )
+
+
+def test_window_covers_false_when_no_recorded_window():
+    assert not universe._window_covers(None, None, pd.Timestamp("2021-01-01"), pd.Timestamp("2023-01-01"))
+
+
+def test_window_covers_false_when_requested_window_extends_beyond_recorded():
+    assert not universe._window_covers(
+        "2022-01-01", "2022-12-31", pd.Timestamp("2021-01-01"), pd.Timestamp("2023-01-01")
+    )
+
+
+def test_snapshot_to_info_includes_price_data_validated_window():
+    snapshot = universe.UniverseSnapshot(
+        tickers=["AAPL"], market_caps={"AAPL": 3e12},
+        price_data_validated_start="2020-01-01", price_data_validated_end="2024-12-31",
+    )
+    info = universe._snapshot_to_info(snapshot, "us_50b")
+    assert info["price_data_validated_start"] == "2020-01-01"
+    assert info["price_data_validated_end"] == "2024-12-31"
+
+
+def test_resolve_mean_reversion_universe_us_50b_revalidates_cache_for_uncovered_window(tmp_path, monkeypatch):
+    # Requirement: a us_50b cache validated for one historical window must
+    # not be silently reused as if it were valid for a materially
+    # different one -- this is the actual mechanism that fixes the "SPCX
+    # cached, then dropped by the backtest" bug for a run reusing an
+    # existing cache (not just a fresh --refresh-universe build).
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+    cache_path = tmp_path / "universe_us_50b.csv"
+    old_snapshot = universe.UniverseSnapshot(
+        tickers=["AAPL", "SPCX"],
+        market_caps={"AAPL": 3e12, "SPCX": 2e12},
+        names={"AAPL": "Apple Inc.", "SPCX": "Spectral Capital Corp."},
+        exchanges={"AAPL": "NMS", "SPCX": "NMS"},
+        num_excluded_no_price_data=0,
+        snapshot_date="2026-01-01T00:00:00+00:00",
+        cache_file=str(cache_path),
+        price_data_validated_start="2023-01-01",
+        price_data_validated_end="2023-12-31",
+    )
+    universe.save_universe_cache(old_snapshot, str(cache_path))
+
+    calls = []
+
+    def fake_price_checker(ticker):
+        calls.append(ticker)
+        return ticker != "SPCX"  # SPCX no longer has data for the newly requested window
+
+    resolution = universe.resolve_mean_reversion_universe(
+        mode="us_50b", refresh=False, cache_path=str(cache_path),
+        price_data_checker=fake_price_checker,
+        backtest_start="2021-01-01", backtest_end="2024-12-31",
+    )
+    assert resolution.tickers == ["AAPL"]
+    assert "SPCX" not in resolution.tickers
+    assert "SPCX" in calls  # actually re-validated, not blindly trusted
+    assert resolution.info["num_excluded_no_price_data"] == 1
+
+    # Cache re-saved with the excluded ticker dropped and the window recorded.
+    reloaded = universe.load_universe_cache(str(cache_path))
+    assert "SPCX" not in reloaded.tickers
+    assert reloaded.price_data_validated_start is not None
+
+
+def test_resolve_mean_reversion_universe_us_50b_skips_revalidation_when_window_covered(tmp_path):
+    # The inverse of the above: when the cache's recorded validated window
+    # already covers what this run needs, it must NOT re-check price data
+    # (avoiding needless network calls / cache rewrites on every run).
+    cache_path = tmp_path / "universe_us_50b.csv"
+    snapshot = universe.UniverseSnapshot(
+        tickers=["AAPL"], market_caps={"AAPL": 3e12}, names={"AAPL": "Apple Inc."},
+        exchanges={"AAPL": "NMS"}, snapshot_date="2026-01-01T00:00:00+00:00",
+        cache_file=str(cache_path),
+        price_data_validated_start="2019-01-01", price_data_validated_end="2024-12-31",
+    )
+    universe.save_universe_cache(snapshot, str(cache_path))
+
+    def fail_if_called(ticker):
+        raise AssertionError("price_data_checker must not be called when the cached window already covers the request")
+
+    resolution = universe.resolve_mean_reversion_universe(
+        mode="us_50b", refresh=False, cache_path=str(cache_path),
+        price_data_checker=fail_if_called,
+        backtest_start="2022-01-01", backtest_end="2023-12-31",
+    )
+    assert resolution.tickers == ["AAPL"]
+
+
 def test_build_us_50b_universe_report_metadata_includes_all_exclusion_counts(tmp_path, monkeypatch):
     extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
         "File Creation Time",
@@ -450,6 +615,18 @@ def test_company_key_strips_corporate_suffix_and_share_class_wording():
     assert universe._company_key("Apple Inc. - Common Stock") != universe._company_key("Microsoft Corporation")
 
 
+def test_company_key_strips_capital_stock_and_new_common_stock_wording():
+    # Real live Nasdaq Trader names for the same company's dual share
+    # classes don't always agree on which generic word follows the class
+    # letter -- "Capital Stock" vs "Common Stock", or a leading "New" --
+    # so both must be stripped, not just "Common Stock" alone, or these
+    # pairs fail to collapse into a single company key.
+    assert universe._company_key("Alphabet Inc. - Class A Common Stock") == \
+        universe._company_key("Alphabet Inc. - Class C Capital Stock")
+    assert universe._company_key("Berkshire Hathaway Inc. Common Stock") == \
+        universe._company_key("Berkshire Hathaway Inc. New Common Stock")
+
+
 def test_dedupe_by_company_collapses_dual_class_shares_keeps_higher_cap():
     market_caps = {"GOOGL": 2.0e12, "GOOG": 2.1e12, "AAPL": 3.0e12}
     names = {
@@ -478,6 +655,42 @@ def test_dedupe_by_company_no_duplicates_is_a_no_op():
     assert num_collapsed == 0
 
 
+def test_dedupe_by_company_collapses_live_shape_alphabet_names():
+    # Exact live-shape Nasdaq Trader names from the smoke-test bug report --
+    # GOOGL/GOOG must collapse to one ticker despite "Common Stock" vs.
+    # "Capital Stock".
+    market_caps = {"GOOGL": 2.0e12, "GOOG": 2.1e12}
+    names = {
+        "GOOGL": "Alphabet Inc. - Class A Common Stock",
+        "GOOG": "Alphabet Inc. - Class C Capital Stock",
+    }
+    exchanges = {"GOOGL": "NMS", "GOOG": "NMS"}
+
+    kept_caps, _kept_names, _kept_exchanges, num_collapsed = universe._dedupe_by_company(
+        market_caps, names, exchanges
+    )
+    assert set(kept_caps) == {"GOOG"}  # higher of the two market caps
+    assert num_collapsed == 1
+
+
+def test_dedupe_by_company_collapses_live_shape_berkshire_names():
+    # Exact live-shape Nasdaq Trader names from the smoke-test bug report --
+    # BRK-A/BRK-B must collapse to one ticker despite "Common Stock" vs.
+    # "New Common Stock".
+    market_caps = {"BRK-A": 900_000_000_000.0, "BRK-B": 850_000_000_000.0}
+    names = {
+        "BRK-A": "Berkshire Hathaway Inc. Common Stock",
+        "BRK-B": "Berkshire Hathaway Inc. New Common Stock",
+    }
+    exchanges = {"BRK-A": "N", "BRK-B": "N"}
+
+    kept_caps, _kept_names, _kept_exchanges, num_collapsed = universe._dedupe_by_company(
+        market_caps, names, exchanges
+    )
+    assert set(kept_caps) == {"BRK-A"}  # higher of the two market caps
+    assert num_collapsed == 1
+
+
 def test_build_us_50b_universe_dedupes_dual_class_shares_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
     monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
@@ -501,6 +714,63 @@ def test_build_us_50b_universe_dedupes_dual_class_shares_end_to_end(tmp_path, mo
 
     snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
     assert snapshot.tickers == ["BRK-A"]  # higher of the two market caps
+    assert snapshot.num_duplicate_companies_collapsed == 1
+
+
+def test_build_us_50b_universe_dedupes_live_shape_googl_goog_end_to_end(tmp_path, monkeypatch):
+    # Reproduces the exact live-shape smoke-test output: GOOGL and GOOG both
+    # surviving the >= $50B universe with real Nasdaq Trader security names
+    # ("Common Stock" vs. "Capital Stock") that the old _company_key
+    # pattern failed to collapse.
+    extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
+        "File Creation Time",
+        "GOOGL|Alphabet Inc. - Class A Common Stock|Q|N|N|100|N|N\n"
+        "GOOG|Alphabet Inc. - Class C Capital Stock|Q|N|N|100|N|N\n"
+        "File Creation Time",
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: extended_nasdaq)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("GOOGL", 2_000_000_000_000.0, name="Alphabet Inc."),
+        make_quote("GOOG", 2_100_000_000_000.0, name="Alphabet Inc."),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["GOOG"]  # higher of the two market caps
+    assert "GOOGL" not in snapshot.tickers
+    assert snapshot.num_duplicate_companies_collapsed == 1
+
+
+def test_build_us_50b_universe_dedupes_live_shape_brk_a_brk_b_end_to_end(tmp_path, monkeypatch):
+    # Reproduces the exact live-shape smoke-test output: BRK-A and BRK-B
+    # both surviving the >= $50B universe with real Nasdaq Trader security
+    # names ("Common Stock" vs. "New Common Stock") that the old
+    # _company_key pattern failed to collapse. Uses a standalone
+    # other-listed text (not OTHER_LISTED_SAMPLE, which already has its own
+    # BRK.B row under a different name) so there's no duplicate-symbol
+    # collision in _standardize_and_filter's drop_duplicates.
+    other_listed_with_berkshire = (
+        "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\n"
+        "BRK.A|Berkshire Hathaway Inc. Common Stock|N|BRK.A|N|100|N|BRK.A\n"
+        "BRK.B|Berkshire Hathaway Inc. New Common Stock|N|BRK.B|N|100|N|BRK.B\n"
+        "File Creation Time: 0708202600:00\n"
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: other_listed_with_berkshire)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("BRK-A", 900_000_000_000.0, name="Berkshire Hathaway Inc."),
+        make_quote("BRK-B", 850_000_000_000.0, name="Berkshire Hathaway Inc."),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["BRK-A"]  # higher of the two market caps
+    assert "BRK-B" not in snapshot.tickers
     assert snapshot.num_duplicate_companies_collapsed == 1
 
 
@@ -658,6 +928,7 @@ def test_resolve_mean_reversion_universe_us_50b_refresh_rebuilds(tmp_path, monke
     def fake_build(
         min_market_cap, cache_path, max_candidates=None, progress=None,
         allow_screener_only=False, price_data_checker=None,
+        price_data_start=None, price_data_end=None,
     ):
         calls.append((min_market_cap, cache_path))
         return rebuilt
@@ -678,6 +949,7 @@ def test_resolve_mean_reversion_universe_us_50b_threads_max_candidates_and_progr
     def fake_build(
         min_market_cap, cache_path, max_candidates=None, progress=None,
         allow_screener_only=False, price_data_checker=None,
+        price_data_start=None, price_data_end=None,
     ):
         received["max_candidates"] = max_candidates
         received["progress"] = progress

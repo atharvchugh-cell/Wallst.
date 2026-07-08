@@ -73,10 +73,37 @@ Three additional layers close this:
    `num_excluded_identity_mismatch` rather than trusted.
 4. **A lightweight price-data check** on the final, already-filtered/
    deduped ticker list (not the raw candidate pool) confirms each selected
-   ticker actually has recent daily price history before it's cached --
+   ticker actually has usable daily price history before it's cached --
    catching non-tradable/delisted symbols that slipped past every
    name-based check. Tickers that fail this are excluded and counted as
    `num_excluded_no_price_data`.
+
+## "Recent" price data isn't the same claim as data over the requested backtest window
+
+A second live smoke test found that #4 above wasn't enough either: SPCX had
+a perfectly fine RECENT quote (so a fixed recent-lookback price check
+passed it), was cached, and then the backtest itself dropped it because it
+had no price history at all between 2021-06-15 and 2024-12-31 -- the actual
+window that run needed. So whenever a specific backtest window is known
+(`build_us_50b_universe`'s `price_data_start`/`price_data_end`, threaded in
+by `resolve_mean_reversion_universe`'s `backtest_start`/`backtest_end`,
+which cli.py sets from `--start`/`--end`), the price-data check validates
+against THAT window (warmup-adjusted, same buffer
+`run_mean_reversion_sleeve` uses) instead of a fixed recent lookback.
+
+This also means a *cached* universe's price-data guarantee is
+window-specific, not permanent: each snapshot records the
+[`price_data_validated_start`, `price_data_validated_end`] window its
+tickers were actually checked against. When a later run requests a window
+that isn't fully covered by what's on record (or the cache predates this
+field entirely), the cached tickers are re-validated against the new
+window before being used -- dropping any that now fail and re-saving the
+cache -- rather than silently reusing a cache that was only ever proven
+valid for a different historical period (see
+`revalidate_cached_universe_for_window`). This re-check only re-runs the
+lightweight per-ticker price-data call against the small already-cached
+list; it does not re-fetch Nasdaq Trader or re-run the market-cap screener
+(that still requires `--refresh-universe`).
 
 SURVIVORSHIP BIAS / NOT POINT-IN-TIME (read before trusting any `us_50b`
 result): like the default hardcoded universe, this is a CURRENT SNAPSHOT of
@@ -221,6 +248,16 @@ class UniverseSnapshot:
     num_duplicate_companies_collapsed: int | None = None
     snapshot_date: str | None = None
     cache_file: str | None = None
+    # The [start, end] backtest date range (warmup-adjusted start, per
+    # config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS) the final price-data check
+    # actually validated tickers against, if any -- None means the check
+    # only used a fixed recent lookback (no specific backtest window was
+    # known at build time), not a historical window. See
+    # "Cached price-data validation is window-specific" below for why this
+    # is tracked and re-checked on cache load rather than assumed to still
+    # be valid for a different requested window.
+    price_data_validated_start: str | None = None
+    price_data_validated_end: str | None = None
 
     @property
     def min_market_cap(self) -> float | None:
@@ -487,6 +524,12 @@ def fetch_market_caps(
 
 # --- Cache read/write --------------------------------------------------------
 
+CACHE_COLUMNS = [
+    "ticker", "name", "market_cap", "exchange", "snapshot_date",
+    "price_data_validated_start", "price_data_validated_end",
+]
+
+
 def save_universe_cache(snapshot: UniverseSnapshot, cache_path: str) -> None:
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,12 +540,12 @@ def save_universe_cache(snapshot: UniverseSnapshot, cache_path: str) -> None:
             "market_cap": snapshot.market_caps.get(t),
             "exchange": snapshot.exchanges.get(t, ""),
             "snapshot_date": snapshot.snapshot_date,
+            "price_data_validated_start": snapshot.price_data_validated_start,
+            "price_data_validated_end": snapshot.price_data_validated_end,
         }
         for t in snapshot.tickers
     ]
-    pd.DataFrame(rows, columns=["ticker", "name", "market_cap", "exchange", "snapshot_date"]).to_csv(
-        path, index=False
-    )
+    pd.DataFrame(rows, columns=CACHE_COLUMNS).to_csv(path, index=False)
 
 
 def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
@@ -535,6 +578,12 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
         str(df["snapshot_date"].iloc[0]) if "snapshot_date" in df.columns and len(df) else "unknown"
     )
 
+    def _first_non_null_str(column: str) -> str | None:
+        if column not in df.columns or not len(df):
+            return None
+        val = df[column].iloc[0]
+        return str(val) if pd.notna(val) else None
+
     return UniverseSnapshot(
         tickers=tickers,
         market_caps=market_caps,
@@ -549,6 +598,8 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
         num_duplicate_companies_collapsed=None,
         snapshot_date=snapshot_date,
         cache_file=str(path),
+        price_data_validated_start=_first_non_null_str("price_data_validated_start"),
+        price_data_validated_end=_first_non_null_str("price_data_validated_end"),
     )
 
 
@@ -569,9 +620,19 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
 # most commonly quoted class) if there's exactly one such candidate,
 # otherwise the highest-market-cap ticker in the group (alphabetical
 # tie-break for determinism).
+#
+# Real live Nasdaq Trader names for the same company's share classes don't
+# always agree on which generic word follows the class letter -- e.g.
+# "Alphabet Inc. - Class A Common Stock" vs "Alphabet Inc. - Class C Capital
+# Stock", or "Berkshire Hathaway Inc. Common Stock" vs "Berkshire Hathaway
+# Inc. New Common Stock" -- so "capital stock"/"capital shares" and an
+# optional leading "new" are stripped alongside "common stock"/"common
+# shares", not just the latter. Punctuation around hyphens (e.g. the " - "
+# in "Inc. - Class A") doesn't need special handling -- _NON_ALNUM_PATTERN
+# below already strips all non-alphanumeric characters.
 _CORP_SUFFIX_PATTERN = re.compile(
     r"\b(incorporated|inc|corporation|corp|company|co|limited|ltd|plc|holdings?|group|"
-    r"class\s+[a-z]|common\s+stock|common\s+shares?|ordinary\s+shares?|the)\b",
+    r"class\s+[a-z]|(?:new\s+)?(?:common|capital)\s+(?:stock|shares?)|ordinary\s+shares?|the)\b",
     re.IGNORECASE,
 )
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -626,19 +687,122 @@ def _dedupe_by_company(
 # This check is intentionally the LAST step, applied only to the small final
 # selected/deduped list (not the full candidate pool), since it costs one
 # lightweight price-history request per ticker.
+#
+# A ticker having RECENT price data is not the same claim as it having data
+# over the historical window a backtest actually needs -- a live smoke test
+# found SPCX with a perfectly fine current quote but zero price history
+# between 2021-06-15 and 2024-12-31, so it passed a fixed recent-lookback
+# check and then got dropped by the backtest itself instead. Whenever a
+# specific backtest window is known (see build_us_50b_universe's
+# `price_data_start`/`price_data_end`), the check validates against THAT
+# window (warmup-adjusted, same buffer run_mean_reversion_sleeve fetches)
+# instead of a fixed recent lookback.
 
 PRICE_DATA_LOOKBACK = "90d"
 
 
-def _default_price_data_available(ticker: str) -> bool:
+def _default_price_data_available(
+    ticker: str, start: "pd.Timestamp | None" = None, end: "pd.Timestamp | None" = None
+) -> bool:
     """Real (network-hitting) price-data check used by build_us_50b_universe
     by default. Wrapped in its own function so tests can inject a fake
-    `price_data_checker` instead of hitting the network."""
+    `price_data_checker` instead of hitting the network. If `start` is
+    given, checks for any usable daily bar in [start, end] (the actual
+    requested backtest window); otherwise falls back to a fixed recent
+    lookback (used when no specific backtest window is known yet)."""
     try:
-        history = yf.Ticker(ticker).history(period=PRICE_DATA_LOOKBACK)
+        if start is not None:
+            history = yf.Ticker(ticker).history(start=start, end=end)
+        else:
+            history = yf.Ticker(ticker).history(period=PRICE_DATA_LOOKBACK)
     except Exception:
         return False
     return history is not None and not history.empty
+
+
+def _window_covers(
+    validated_start: str | None, validated_end: str | None,
+    needed_start: pd.Timestamp, needed_end: pd.Timestamp,
+) -> bool:
+    """True if a previously-recorded price-data-validated window fully
+    covers a newly requested window -- i.e. a cached universe can be
+    trusted as-is for this run without re-checking price data. False (not
+    covered) if there's no recorded validation window at all: either an
+    older cache predating this check, or one only ever checked against a
+    fixed recent lookback rather than a specific backtest window."""
+    if not validated_start or not validated_end:
+        return False
+    return pd.Timestamp(validated_start) <= needed_start and pd.Timestamp(validated_end) >= needed_end
+
+
+def revalidate_cached_universe_for_window(
+    snapshot: UniverseSnapshot,
+    cache_path: str,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    price_data_checker: Callable[[str], bool],
+    progress: Callable[[str], None],
+) -> UniverseSnapshot:
+    """A cached us_50b snapshot's price-data check (if any) may have been
+    validated against a different historical window than the one THIS run
+    needs -- a ticker with usable recent data can still have none at all
+    over an older requested backtest window (the SPCX case above). Re-runs
+    the lightweight price-data check for the NEW window against the small
+    already-cached ticker list (no re-fetch of Nasdaq Trader or the
+    market-cap screener needed), drops any newly-failing tickers, and
+    re-saves the cache with the expanded validated window -- so a cache is
+    never silently treated as valid for a materially different window than
+    what it was actually checked against."""
+    progress(
+        f"Cached universe's price-data validation doesn't cover the requested window "
+        f"({window_start.date()} to {window_end.date()}); re-validating "
+        f"{len(snapshot.tickers)} cached ticker(s)..."
+    )
+    market_caps = dict(snapshot.market_caps)
+    names = dict(snapshot.names)
+    exchanges = dict(snapshot.exchanges)
+    num_newly_excluded = 0
+    for ticker in list(snapshot.tickers):
+        if not price_data_checker(ticker):
+            num_newly_excluded += 1
+            progress(f"  excluding {ticker}: no price data for the requested window.")
+            market_caps.pop(ticker, None)
+            names.pop(ticker, None)
+            exchanges.pop(ticker, None)
+
+    if len(market_caps) < MIN_US_50B_UNIVERSE_SIZE:
+        raise UniverseError(
+            f"Only {len(market_caps)} ticker(s) remain after re-validating the cached us_50b "
+            f"universe ({cache_path}) against the requested backtest window "
+            f"({window_start.date()} to {window_end.date()}) (minimum required: "
+            f"{MIN_US_50B_UNIVERSE_SIZE}). Pass --refresh-universe to rebuild from live data "
+            f"instead of reusing this cache."
+        )
+
+    updated = UniverseSnapshot(
+        tickers=sorted(market_caps, key=lambda t: market_caps[t], reverse=True),
+        market_caps=market_caps,
+        names=names,
+        exchanges=exchanges,
+        num_candidates=snapshot.num_candidates,
+        num_dropped_lookup_failed=snapshot.num_dropped_lookup_failed,
+        num_excluded_not_listed=snapshot.num_excluded_not_listed,
+        num_excluded_non_common=snapshot.num_excluded_non_common,
+        num_excluded_identity_mismatch=snapshot.num_excluded_identity_mismatch,
+        num_excluded_no_price_data=(snapshot.num_excluded_no_price_data or 0) + num_newly_excluded,
+        num_duplicate_companies_collapsed=snapshot.num_duplicate_companies_collapsed,
+        snapshot_date=snapshot.snapshot_date,
+        cache_file=cache_path,
+        price_data_validated_start=str(window_start.date()),
+        price_data_validated_end=str(window_end.date()),
+    )
+    save_universe_cache(updated, cache_path)
+    if num_newly_excluded:
+        progress(
+            f"Re-saved universe cache after dropping {num_newly_excluded} ticker(s) with no "
+            f"price data for the requested window."
+        )
+    return updated
 
 
 # --- Build the >= $50B universe from live data -------------------------------
@@ -650,6 +814,8 @@ def build_us_50b_universe(
     progress: Callable[[str], None] | None = None,
     allow_screener_only: bool = False,
     price_data_checker: Callable[[str], bool] | None = None,
+    price_data_start: "str | pd.Timestamp | None" = None,
+    price_data_end: "str | pd.Timestamp | None" = None,
 ) -> UniverseSnapshot:
     """Build the >= `min_market_cap` US-equity universe: Yahoo's bulk
     screener supplies candidate tickers + market caps (see module
@@ -662,9 +828,10 @@ def build_us_50b_universe(
     filtering and saved metadata (not Yahoo's `longName`), an
     identity-mismatch guard excludes results whose Yahoo name and Nasdaq
     Trader name share no meaningful word in common, and a final lightweight
-    price-data check excludes any selected ticker with no recent daily
-    price history -- see the module docstring's "Symbol presence in Nasdaq
-    Trader isn't sufficient either" section for why each of these exists.
+    price-data check excludes any selected ticker with no usable price
+    history over the requested backtest window -- see the module
+    docstring's "Symbol presence in Nasdaq Trader isn't sufficient either"
+    section for why each of these exists.
     `max_candidates` is a debug/safety cap on how many screener results to
     consider -- leave it None (the default) for a real run. `progress`, if
     given, receives a line of text at each meaningful step -- cli.py passes
@@ -672,11 +839,32 @@ def build_us_50b_universe(
     Nasdaq Trader gate when its directories are unreachable (an explicit
     opt-in debug escape hatch, NOT the default -- see module docstring).
     `price_data_checker`, if given, replaces the real (network-hitting)
-    price-data validation -- tests inject a fake one. Hard-fails via
-    UniverseError if the resulting universe is too small to backtest
-    meaningfully -- see MIN_US_50B_UNIVERSE_SIZE."""
+    price-data validation -- tests inject a fake one. `price_data_start`/
+    `price_data_end`, if given, are the actual requested backtest date
+    range: the price-data check validates against that window
+    (warmup-adjusted the same way run_mean_reversion_sleeve fetches data),
+    since a ticker can have perfectly fine RECENT price data while having
+    none at all over an older historical window a backtest actually needs
+    (the real bug this fixes -- Yahoo returning a live quote for a ticker
+    with no price history over the requested window). Leave both None to
+    fall back to a fixed recent-lookback check (no specific backtest window
+    known, e.g. a bare `--refresh-universe` with no run attached). Hard-
+    fails via UniverseError if the resulting universe is too small to
+    backtest meaningfully -- see MIN_US_50B_UNIVERSE_SIZE."""
     progress = progress or (lambda msg: None)
-    price_data_checker = price_data_checker or _default_price_data_available
+    window_start = window_end = None
+    if price_data_start is not None:
+        window_start = pd.Timestamp(price_data_start) - pd.Timedelta(
+            days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS
+        )
+        window_end = pd.Timestamp(price_data_end) if price_data_end is not None else pd.Timestamp(price_data_start)
+    if price_data_checker is None:
+        if window_start is not None:
+            price_data_checker = lambda ticker, _s=window_start, _e=window_end: _default_price_data_available(
+                ticker, start=_s, end=_e
+            )
+        else:
+            price_data_checker = _default_price_data_available
 
     progress("Fetching Nasdaq Trader symbol directories (required to verify US-listed eligibility)...")
     candidate_tickers: set[str] | None = None
@@ -770,13 +958,20 @@ def build_us_50b_universe(
 
     market_caps, names, exchanges, num_collapsed = _dedupe_by_company(market_caps, names, exchanges)
 
-    progress(f"Validating recent price-data availability for {len(market_caps)} selected ticker(s)...")
+    if window_start is not None:
+        progress(
+            f"Validating price-data availability for {len(market_caps)} selected ticker(s) against "
+            f"the requested backtest window ({window_start.date()} to {window_end.date()}, "
+            f"warmup-adjusted)..."
+        )
+    else:
+        progress(f"Validating recent price-data availability for {len(market_caps)} selected ticker(s)...")
     num_excluded_no_price_data = 0
     validated_tickers = sorted(market_caps, key=lambda t: market_caps[t], reverse=True)
     for ticker in validated_tickers:
         if not price_data_checker(ticker):
             num_excluded_no_price_data += 1
-            progress(f"  excluding {ticker}: no recent price data found.")
+            progress(f"  excluding {ticker}: no usable price data found.")
             del market_caps[ticker]
             del names[ticker]
             del exchanges[ticker]
@@ -785,7 +980,7 @@ def build_us_50b_universe(
         f"Done: {len(market_caps)} qualifying tickers, {num_excluded_not_listed} excluded as not in "
         f"the Nasdaq Trader candidate set, {num_excluded_identity_mismatch} excluded for a screener/"
         f"Nasdaq Trader name mismatch, {num_excluded_non_common} excluded as non-common-stock by name, "
-        f"{num_excluded_no_price_data} excluded for missing recent price data, {num_collapsed} "
+        f"{num_excluded_no_price_data} excluded for missing price data, {num_collapsed} "
         f"duplicate-company ticker(s) collapsed, {num_unparseable} unparseable screener result(s)."
     )
 
@@ -798,7 +993,7 @@ def build_us_50b_universe(
             f"{num_excluded_not_listed} not in the Nasdaq Trader candidate set, "
             f"{num_excluded_identity_mismatch} excluded for a name mismatch, "
             f"{num_excluded_non_common} excluded as non-common-stock by name, "
-            f"{num_excluded_no_price_data} excluded for missing recent price data."
+            f"{num_excluded_no_price_data} excluded for missing price data."
         )
 
     snapshot = UniverseSnapshot(
@@ -815,6 +1010,8 @@ def build_us_50b_universe(
         num_duplicate_companies_collapsed=num_collapsed,
         snapshot_date=datetime.now(timezone.utc).isoformat(),
         cache_file=cache_path,
+        price_data_validated_start=str(window_start.date()) if window_start is not None else None,
+        price_data_validated_end=str(window_end.date()) if window_end is not None else None,
     )
     save_universe_cache(snapshot, cache_path)
     progress(f"Universe cached to {cache_path}.")
@@ -838,6 +1035,8 @@ def _snapshot_to_info(snapshot: UniverseSnapshot, mode: str) -> dict:
         "max_market_cap": snapshot.max_market_cap,
         "cache_file": snapshot.cache_file,
         "snapshot_date": snapshot.snapshot_date,
+        "price_data_validated_start": snapshot.price_data_validated_start,
+        "price_data_validated_end": snapshot.price_data_validated_end,
     }
 
 
@@ -851,6 +1050,8 @@ def resolve_mean_reversion_universe(
     progress: Callable[[str], None] | None = None,
     allow_screener_only: bool = False,
     price_data_checker: Callable[[str], bool] | None = None,
+    backtest_start: "str | pd.Timestamp | None" = None,
+    backtest_end: "str | pd.Timestamp | None" = None,
 ) -> UniverseResolution:
     """Single entry point cli.py uses to decide which ticker list
     mean_reversion should run with. `csv_path` (if given) always wins,
@@ -865,7 +1066,14 @@ def resolve_mean_reversion_universe(
       build_us_50b_universe). `max_candidates`/`progress`/`allow_screener_only`/
       `price_data_checker` are passed straight through to that rebuild
       (ignored when loading from cache, since there's nothing to page/gate/
-      report progress on/validate).
+      report progress on rebuild). `backtest_start`/`backtest_end` are the
+      actual requested backtest window: even when loading from cache, if
+      the cache's own recorded price-data-validated window (see
+      UniverseSnapshot.price_data_validated_start/end) doesn't cover this
+      window, the cached tickers are re-validated against it (dropping any
+      that fail and re-saving the cache) rather than assumed to still be
+      good for a window they were never actually checked against -- see
+      revalidate_cached_universe_for_window.
     - explicit csv_path: a user-supplied ticker list (own snapshot, or one
       previously cached by this module).
     """
@@ -886,17 +1094,32 @@ def resolve_mean_reversion_universe(
                 "num_duplicate_companies_collapsed": None,
                 "min_market_cap": None, "max_market_cap": None,
                 "cache_file": None, "snapshot_date": None,
+                "price_data_validated_start": None, "price_data_validated_end": None,
             },
         )
 
     if mode == "us_50b":
+        effective_progress = progress or (lambda msg: None)
         snapshot = None if refresh else load_universe_cache(cache_path)
+        if snapshot is not None and backtest_start is not None:
+            window_start = pd.Timestamp(backtest_start) - pd.Timedelta(
+                days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS
+            )
+            window_end = pd.Timestamp(backtest_end) if backtest_end is not None else pd.Timestamp(backtest_start)
+            if not _window_covers(
+                snapshot.price_data_validated_start, snapshot.price_data_validated_end, window_start, window_end
+            ):
+                checker = price_data_checker or _default_price_data_available
+                snapshot = revalidate_cached_universe_for_window(
+                    snapshot, cache_path, window_start, window_end, checker, effective_progress
+                )
         if snapshot is None:
             snapshot = build_us_50b_universe(
                 min_market_cap=min_market_cap, cache_path=cache_path,
                 max_candidates=max_candidates, progress=progress,
                 allow_screener_only=allow_screener_only,
                 price_data_checker=price_data_checker,
+                price_data_start=backtest_start, price_data_end=backtest_end,
             )
         return UniverseResolution(tickers=snapshot.tickers, info=_snapshot_to_info(snapshot, "us_50b"))
 

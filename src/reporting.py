@@ -199,7 +199,7 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
             )
         if universe_info.get("num_excluded_no_price_data") is not None:
             lines.append(
-                f"Excluded (no recent price data): {universe_info['num_excluded_no_price_data']}"
+                f"Excluded (no usable price data): {universe_info['num_excluded_no_price_data']}"
             )
         if universe_info.get("num_duplicate_companies_collapsed") is not None:
             lines.append(
@@ -215,6 +215,12 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
             lines.append(f"Universe cache file: {universe_info['cache_file']}")
         if universe_info.get("snapshot_date"):
             lines.append(f"Universe snapshot timestamp: {universe_info['snapshot_date']}")
+        if universe_info.get("price_data_validated_start") and universe_info.get("price_data_validated_end"):
+            lines.append(
+                f"Price data validated for window: {universe_info['price_data_validated_start']} to "
+                f"{universe_info['price_data_validated_end']} (warmup-adjusted; a later run requesting "
+                f"a window outside this range re-validates before reusing this cache)"
+            )
         if universe_info.get("mode") != "default":
             lines.append(UNIVERSE_SNAPSHOT_WARNING)
     if result.dropped_tickers:

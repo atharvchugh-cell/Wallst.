@@ -255,7 +255,9 @@ def _parse_robustness_windows(spec: str | None) -> list[tuple[str, str, str]]:
     return windows
 
 
-def resolve_mean_reversion_universe(args: argparse.Namespace) -> universe_module.UniverseResolution:
+def resolve_mean_reversion_universe(
+    args: argparse.Namespace, backtest_start=None, backtest_end=None,
+) -> universe_module.UniverseResolution:
     """Resolve the mean-reversion universe ONCE per run (not once per
     window/sleeve-call) -- a `us_50b` universe is a current snapshot, not a
     per-window computation, so every sleeve call in this run (mean_reversion,
@@ -263,11 +265,21 @@ def resolve_mean_reversion_universe(args: argparse.Namespace) -> universe_module
     ticker list. Sector rotation never calls this -- it always uses the 11
     fixed sector ETFs regardless of --universe. Passes `progress=print` so a
     live `--refresh-universe` build prints its candidate/screener-page/
-    qualifying-count progress to the console rather than running silently."""
+    qualifying-count progress to the console rather than running silently.
+    `backtest_start`/`backtest_end` are the actual price-data window a
+    `us_50b` universe's final tickers get validated (or, if loaded from a
+    cache whose recorded validated window doesn't cover this one,
+    re-validated) against -- see src/universe.py. They default to
+    `args.start`/`args.end`, but run_robustness passes the UNION of all its
+    window start/ends instead, since this function is called ONCE and its
+    result shared across every window in that run, not re-resolved per
+    window."""
     return universe_module.resolve_mean_reversion_universe(
         mode=args.universe, csv_path=args.universe_csv, refresh=args.refresh_universe,
         max_candidates=args.max_universe_candidates, progress=print,
         allow_screener_only=args.universe_allow_screener_only,
+        backtest_start=backtest_start if backtest_start is not None else args.start,
+        backtest_end=backtest_end if backtest_end is not None else args.end,
     )
 
 
@@ -284,7 +296,14 @@ def run_robustness(args: argparse.Namespace) -> int:
     windows = _parse_robustness_windows(args.robustness_windows)
 
     try:
-        mr_universe = resolve_mean_reversion_universe(args)
+        # Validate the shared universe's price data against the UNION of
+        # every robustness window (earliest start to latest end), not just
+        # args.start/args.end -- the universe is resolved once and reused
+        # across all windows below, so it must be checked against the full
+        # span any of them actually needs.
+        union_start = min(pd.Timestamp(w_start) for _label, w_start, _w_end in windows)
+        union_end = max(pd.Timestamp(w_end) for _label, _w_start, w_end in windows)
+        mr_universe = resolve_mean_reversion_universe(args, backtest_start=union_start, backtest_end=union_end)
     except (universe_module.UniverseError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
