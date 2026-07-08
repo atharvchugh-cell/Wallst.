@@ -1109,7 +1109,12 @@ def resolve_mean_reversion_universe(
             if not _window_covers(
                 snapshot.price_data_validated_start, snapshot.price_data_validated_end, window_start, window_end
             ):
-                checker = price_data_checker or _default_price_data_available
+                if price_data_checker is None:
+                    checker = lambda ticker, _s=window_start, _e=window_end: _default_price_data_available(
+                        ticker, start=_s, end=_e
+                    )
+                else:
+                    checker = price_data_checker
                 snapshot = revalidate_cached_universe_for_window(
                     snapshot, cache_path, window_start, window_end, checker, effective_progress
                 )

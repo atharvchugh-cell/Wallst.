@@ -774,6 +774,145 @@ def test_build_us_50b_universe_dedupes_live_shape_brk_a_brk_b_end_to_end(tmp_pat
     assert snapshot.num_duplicate_companies_collapsed == 1
 
 
+def test_resolve_mean_reversion_universe_revalidation_passes_window_to_default_checker(
+    tmp_path, monkeypatch
+):
+    # Regression test for the Cycle F bug: when no price_data_checker is
+    # injected, cache revalidation must wrap _default_price_data_available
+    # with the requested window (start/end), NOT call it with ticker-only
+    # (which silently falls back to a recent lookback and misses the
+    # SPCX-class problem for historical windows).
+    #
+    # Shape: cache has AAPL + SPCX, validated for 2023 only. New run
+    # requests 2021-06-15 to 2024-12-31 (not covered). Revalidation must
+    # call _default_price_data_available(ticker, start=..., end=...) --
+    # not _default_price_data_available(ticker) -- so SPCX is excluded for
+    # lacking data over the historical window, not passed on the basis of
+    # a recent-data check it would have survived.
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+    cache_path = tmp_path / "universe_us_50b.csv"
+    old_snapshot = universe.UniverseSnapshot(
+        tickers=["AAPL", "SPCX"],
+        market_caps={"AAPL": 3e12, "SPCX": 2e12},
+        names={"AAPL": "Apple Inc.", "SPCX": "Spectral Capital Corp."},
+        exchanges={"AAPL": "NMS", "SPCX": "NMS"},
+        num_excluded_no_price_data=0,
+        snapshot_date="2026-01-01T00:00:00+00:00",
+        cache_file=str(cache_path),
+        price_data_validated_start="2023-01-01",
+        price_data_validated_end="2023-12-31",
+    )
+    universe.save_universe_cache(old_snapshot, str(cache_path))
+
+    calls = []
+
+    def fake_default_checker(ticker, start=None, end=None):
+        calls.append((ticker, start, end))
+        # SPCX has no data for the old historical window (only recent data)
+        return ticker != "SPCX"
+
+    # Override the autouse stub with our recording version
+    monkeypatch.setattr(universe, "_default_price_data_available", fake_default_checker)
+
+    # No price_data_checker injected -- must create a window-aware wrapper internally
+    resolution = universe.resolve_mean_reversion_universe(
+        mode="us_50b", refresh=False, cache_path=str(cache_path),
+        backtest_start="2021-06-15", backtest_end="2024-12-31",
+    )
+    assert "SPCX" not in resolution.tickers
+    assert "AAPL" in resolution.tickers
+
+    # _default_price_data_available must have been called with the warmup-
+    # adjusted window -- not with start=None (which is the recent-lookback fallback).
+    assert len(calls) > 0, "_default_price_data_available was never called (revalidation skipped?)"
+    expected_start = pd.Timestamp("2021-06-15") - pd.Timedelta(
+        days=config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS
+    )
+    for ticker, start, end in calls:
+        assert start is not None, (
+            f"_default_price_data_available called for {ticker!r} with start=None -- "
+            f"fell back to recent-lookback instead of checking the requested backtest window"
+        )
+        assert start == expected_start, (
+            f"Expected warmup-adjusted start {expected_start.date()}, got {start}"
+        )
+        assert end == pd.Timestamp("2024-12-31"), (
+            f"Expected end 2024-12-31, got {end}"
+        )
+
+
+def test_neither_fresh_build_nor_revalidation_falls_back_to_recent_lookback_when_window_supplied(
+    tmp_path, monkeypatch
+):
+    # Regression-prevention test: both the fresh-build path (build_us_50b_universe
+    # with price_data_start/end) and the cache-revalidation path (resolve_
+    # mean_reversion_universe loading a cache with an uncovered window) must
+    # call _default_price_data_available with explicit start/end args when a
+    # backtest window is supplied -- never with start=None (recent-lookback fallback).
+
+    # --- Fresh build path ---
+    extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
+        "File Creation Time",
+        "SPCX|Spectral Capital Corp - Common Stock|Q|N|N|100|N|N\nFile Creation Time",
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: extended_nasdaq)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [make_quote("AAPL", 3e12), make_quote("SPCX", 2e12, name="Spectral Capital Corp.")]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    fresh_calls = []
+
+    def fresh_checker(ticker, start=None, end=None):
+        fresh_calls.append((ticker, start, end))
+        return ticker != "SPCX"
+
+    monkeypatch.setattr(universe, "_default_price_data_available", fresh_checker)
+
+    universe.build_us_50b_universe(
+        min_market_cap=50e9, cache_path=str(tmp_path / "fresh.csv"),
+        price_data_start="2021-06-15", price_data_end="2024-12-31",
+    )
+    for ticker, start, end in fresh_calls:
+        assert start is not None, (
+            f"Fresh build called _default_price_data_available for {ticker!r} with start=None"
+        )
+
+    # --- Cache revalidation path ---
+    cache_path = tmp_path / "cached.csv"
+    old_snapshot = universe.UniverseSnapshot(
+        tickers=["AAPL", "SPCX"],
+        market_caps={"AAPL": 3e12, "SPCX": 2e12},
+        names={"AAPL": "Apple Inc.", "SPCX": "Spectral Capital Corp."},
+        exchanges={"AAPL": "NMS", "SPCX": "NMS"},
+        num_excluded_no_price_data=0,
+        snapshot_date="2026-01-01T00:00:00+00:00",
+        cache_file=str(cache_path),
+        price_data_validated_start="2023-01-01",
+        price_data_validated_end="2023-12-31",
+    )
+    universe.save_universe_cache(old_snapshot, str(cache_path))
+
+    reval_calls = []
+
+    def reval_checker(ticker, start=None, end=None):
+        reval_calls.append((ticker, start, end))
+        return ticker != "SPCX"
+
+    monkeypatch.setattr(universe, "_default_price_data_available", reval_checker)
+
+    universe.resolve_mean_reversion_universe(
+        mode="us_50b", refresh=False, cache_path=str(cache_path),
+        backtest_start="2021-06-15", backtest_end="2024-12-31",
+    )
+    assert len(reval_calls) > 0, "Revalidation never called _default_price_data_available"
+    for ticker, start, end in reval_calls:
+        assert start is not None, (
+            f"Revalidation called _default_price_data_available for {ticker!r} with start=None"
+        )
+
+
 def test_build_us_50b_universe_counts_malformed_quote_as_unparseable_not_blocking(tmp_path, monkeypatch):
     # A quote missing a symbol or market cap must be counted as a failed/
     # unparseable result and skipped, without blocking the rest of the
