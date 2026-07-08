@@ -1,15 +1,17 @@
-# Wallst — Mean Reversion & Sector Rotation Backtester
+# Wallst — Strategy Backtesting & Tournament Research Platform
 
 **Research / educational tool only. Not financial advice. This does not place live trades against your Robinhood account or any brokerage — it is a historical backtester, nothing more.** Past performance in these reports does not indicate future results. Always do your own research and consider consulting a licensed financial advisor before risking real capital.
 
 ## What this is
 
-Two trading strategy ideas, each with its own $7,500 sleeve of a hypothetical $15,000 account, backtested against historical price data:
+A backtesting platform for a hypothetical $15,000 account, built around two original strategy ideas — each with its own $7,500 sleeve when run together:
 
 1. **Mean reversion** — buy oversold large-cap stocks, exit on a bounce, a stop-loss, or a timeout.
 2. **Sector rotation** — hold the strongest-momentum SPDR sector ETFs, rebalanced monthly.
 
-A shared backtesting engine simulates both against historical data pulled from `yfinance`, with less-biased execution timing than a naive same-close backtest (signals lag fills by one trading day), transaction costs, and a full audit trail of every decision and trade. This is a simplified, close-to-close simulation, not a claim of realistic live-market execution — see "Design decisions" and "Known limitations" below.
+— plus a **strategy tournament** (`--strategy tournament`) that pits those two against three newer strategy families (trend/momentum, filtered mean reversion, a regime-switch hybrid) under identical conditions, across multiple market-regime windows, with cost- and parameter-sensitivity probes and a disclosed robustness score. See "`--strategy tournament`" below and `docs/TOURNAMENT_DESIGN.md`; `docs/RED_TEAM.md` collects everything known to be wrong or biased about these backtests.
+
+A shared backtesting engine simulates every strategy against historical data pulled from `yfinance`, with less-biased execution timing than a naive same-close backtest (signals lag fills by one trading day), transaction costs, and a full audit trail of every decision and trade. This is a simplified, close-to-close simulation, not a claim of realistic live-market execution — see "Design decisions" and "Known limitations" below.
 
 ## Setup
 
@@ -134,6 +136,48 @@ python backtest.py --strategy mean_reversion --universe-csv my_tickers.csv
 
 **Why this is still survivorship-biased, and NOT point-in-time historical membership:** `us_50b` membership is decided once, using *today's* market cap, then applied uniformly across every historical date a backtest touches. A ticker in this universe was not necessarily >= $50B (or even public) for the entire window you're backtesting — a company that IPO'd in 2023 and is >= $50B today appears in a 2019-2024 backtest as if it had been tradeable the whole time; a company that WAS >= $50B in 2019 but has since shrunk or been delisted does not appear at all. Market caps also drift with the market, so re-running `--refresh-universe` on a different day can change which tickers qualify — this is a live/current value, not a fixed historical fact. Treat `us_50b` results exactly like the default universe's results: they validate strategy mechanics on a large, liquid, currently-large-cap set of names, not a general historical edge.
 
+### `--strategy tournament`: compare strategy families under identical conditions
+
+Runs every registered strategy — the two originals plus three newer ones — under the **same capital, cost assumption, requested windows, canonical-calendar construction, and benchmark**, and writes one side-by-side report. Each strategy runs at the FULL `--capital` (the tournament compares *alternatives* for one account; `--strategy both`/`compare` are what split capital into simultaneous sleeves). Nothing about the pre-existing modes or defaults changes; `tournament` is purely additive.
+
+```bash
+# One window, all five strategies:
+python backtest.py --strategy tournament --start 2019-01-01 --end 2024-12-31 --capital 15000
+
+# Across named bull/bear/choppy regime windows, with cross-window robustness scoring:
+python backtest.py --strategy tournament --start 2019-01-01 --end 2024-12-31 --tournament-windows regimes
+
+# Cost sensitivity (re-runs every strategy at each cost level) + parameter sensitivity:
+python backtest.py --strategy tournament --start 2019-01-01 --end 2024-12-31 \
+    --tournament-cost-bps-list 0,5,10,20 --tournament-param-sensitivity
+
+# A subset of strategies, custom windows:
+python backtest.py --strategy tournament --tournament-strategies momentum,sector_rotation \
+    --tournament-windows 2020-01-01:2020-12-31,2022-01-01:2022-12-31
+```
+
+The five registered strategies (see `docs/TOURNAMENT_DESIGN.md` for full specs and parameter provenance):
+
+- **`mean_reversion`** — the existing baseline, unchanged, run through its existing sleeve runner.
+- **`mean_reversion_filtered`** — the baseline plus exactly two **entry-only** filters (every inherited threshold unchanged, so differences isolate the filters): no new entries while SPY closes below its 200-day SMA (regime gate), and no entry into a name whose trailing 5-trading-day return is ≤ -15% (falling-knife guard; it rejects entries into an *established* crash — day 1 of a crash is indistinguishable from a dip without foresight and is then managed by the inherited stop). Exits are never gated.
+- **`momentum`** — monthly top-5 by trailing 126-trading-day (~6-month) return, eligible only if close > 200-day SMA AND that return is positive; equal 1/5 weights; if fewer than 5 qualify the remainder stays in **cash** (defensive by construction). 6-month momentum and the 200-day SMA are decades-old literature conventions chosen for canonical status, not tuned on this repo's data.
+- **`sector_rotation`** — the existing baseline, unchanged.
+- **`regime_switch`** — sector rotation's exact (inherited) ranking while SPY > its 200-day SMA; **100% cash otherwise** (cash earns 0%, conservative). No new tuned parameters.
+
+SPY is a *signal-only* ticker for the two regime-aware strategies: its data is required (they hard-fail without it) but it is structurally untradable — it is never in the tradable universe the strategies iterate.
+
+What the report (`tournament_report.txt` + `tournament_summary.csv` + `tournament.json`) contains:
+
+- Per-window table of every required metric: total return, CAGR, max drawdown (+duration), Sharpe, Sortino, Calmar, net win rate, trade/transaction counts, turnover and cost drag, **time in market** (days-with-any-position and average-capital-invested), best/worst month, best/worst calendar year, excess return and correlation vs SPY — plus a SPY buy-and-hold row over the strategies' common date range.
+- With multiple windows, a **cross-window robustness section**: fraction of windows beating SPY, fraction positive, worst-window drawdown, return dispersion, and a composite `robustness_score = mean(beats-SPY fraction, positive fraction)` — the formula is printed next to every use and its components are always shown alongside it.
+- With `--tournament-cost-bps-list`, a **cost-sensitivity table** (`cost_sensitivity.csv`), with an explicit warning when a strategy's excess return vs SPY flips sign as costs rise — such a strategy has no margin for real-world frictions and should be treated as NOT beating SPY.
+- With `--tournament-param-sensitivity`, a **small, disclosed variant sweep** (`param_sensitivity.csv`): a handful of fixed variants per strategy, each with a written rationale (see `PARAM_SENSITIVITY_VARIANTS` in `src/tournament.py`), **never auto-selected** — the report shows dispersion so fragility is visible, and warns explicitly when the beat-SPY conclusion flips across variants.
+- Every strategy's self-declared parameters and plain-language assumptions (via `Strategy.describe()`), and any runs that failed (listed, not hidden).
+
+To compare the default universe against `us_50b` for the stock strategies, run the tournament twice — once per `--universe` value — and compare the two reports; the resolved universe applies uniformly to every stock strategy within a run, so each run is internally fair.
+
+Fairness/consistency guarantees, tested: the incumbents' tournament rows are produced by the same sleeve-runner functions their standalone modes use, and the generic runner used for the newer strategies and sensitivity re-runs is regression-tested to reproduce those runners' equity curves exactly.
+
 ## Strategy rules
 
 ### Mean reversion ($7,500 sleeve)
@@ -187,4 +231,4 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 pytest tests/
 ```
 
-171 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), the `--strategy robustness` allocation-blending math (raw-equity-curve blending that preserves first-day cost drag rather than normalizing it away, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run), and the `--universe us_50b` universe builder (bulk screener pagination/progress/failure-handling, symbol-directory name-pattern filtering, ticker normalization, market-cap threshold filtering, the Nasdaq Trader eligibility gate excluding screener results not in the candidate set, the default hard-fail vs. `allow_screener_only` opt-in fallback when Nasdaq Trader is unreachable, the identity-mismatch guard excluding screener results whose name doesn't match their Nasdaq Trader listing, price-data validation against the actual requested backtest window (not just a fixed recent lookback) excluding non-tradable/out-of-range selected tickers, company-level deduplication of multiple share classes using real live-shape Nasdaq Trader names (`GOOGL`/`GOOG`, `BRK-A`/`BRK-B`), cache read/write, cache re-validation when a requested window isn't covered by what the cache was previously checked against (and skipping re-validation when it already is), robustness mode validating the shared universe against the union of all its windows, and confirmation that omitting `--universe` leaves the default universe byte-for-byte unchanged). CI runs this suite on every push via GitHub Actions.
+212 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), the `--strategy robustness` allocation-blending math (raw-equity-curve blending that preserves first-day cost drag rather than normalizing it away, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run), and the `--universe us_50b` universe builder (bulk screener pagination/progress/failure-handling, symbol-directory name-pattern filtering, ticker normalization, market-cap threshold filtering, the Nasdaq Trader eligibility gate excluding screener results not in the candidate set, the default hard-fail vs. `allow_screener_only` opt-in fallback when Nasdaq Trader is unreachable, the identity-mismatch guard excluding screener results whose name doesn't match their Nasdaq Trader listing, price-data validation against the actual requested backtest window (not just a fixed recent lookback) excluding non-tradable/out-of-range selected tickers, company-level deduplication of multiple share classes using real live-shape Nasdaq Trader names (`GOOGL`/`GOOG`, `BRK-A`/`BRK-B`), cache read/write, cache re-validation when a requested window isn't covered by what the cache was previously checked against (and skipping re-validation when it already is), robustness mode validating the shared universe against the union of all its windows, and confirmation that omitting `--universe` leaves the default universe byte-for-byte unchanged), plus the tournament layer (the three new strategies' decision logic with mutate-all-future-dates no-lookahead checks, filter semantics — established-crash knife guard, risk-off-to-cash, exits never gated by entry filters, a regression test that the baseline mean-reversion event stream is byte-identical after the entry-hook refactor, generic-runner equivalence with both incumbent sleeve runners, robustness-score math, tournament report content including the cost-sign-flip and parameter-fragility warnings, and CLI end-to-end tournament runs with flag validation and a guard that every pre-existing mode/default is unchanged). CI runs this suite on every push via GitHub Actions.
