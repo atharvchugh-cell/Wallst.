@@ -188,9 +188,18 @@ def _write_report_txt(result: BacktestResult, metrics: dict, run_config: dict, p
             lines.append(
                 f"Excluded (not in Nasdaq Trader candidate set): {universe_info['num_excluded_not_listed']}"
             )
+        if universe_info.get("num_excluded_identity_mismatch") is not None:
+            lines.append(
+                f"Excluded (screener/Nasdaq Trader name mismatch): "
+                f"{universe_info['num_excluded_identity_mismatch']}"
+            )
         if universe_info.get("num_excluded_non_common") is not None:
             lines.append(
                 f"Excluded (non-common-stock by name): {universe_info['num_excluded_non_common']}"
+            )
+        if universe_info.get("num_excluded_no_price_data") is not None:
+            lines.append(
+                f"Excluded (no recent price data): {universe_info['num_excluded_no_price_data']}"
             )
         if universe_info.get("num_duplicate_companies_collapsed") is not None:
             lines.append(

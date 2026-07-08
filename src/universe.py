@@ -47,6 +47,37 @@ guarantee fallback if the Nasdaq Trader endpoint is unavailable and you
 still want to proceed -- this is a deliberate opt-in debug escape hatch,
 not the default.
 
+## Symbol presence in Nasdaq Trader isn't sufficient either -- identity and tradability also checked
+
+A ticker being IN the Nasdaq Trader candidate set doesn't guarantee the
+screener's quote for that symbol actually refers to the same security: a
+live smoke test found Yahoo's screener returning "SPCX / Space Exploration
+Technologies Corp." at a ~$2T market cap even after the not-listed gate was
+added, because SPCX happened to be a real (but different, unrelated)
+Nasdaq Trader listing -- membership in the candidate set alone doesn't
+prove the screener's name/market-cap claim is about that same listing.
+Three additional layers close this:
+
+1. **Nasdaq Trader name is authoritative for eligibility filtering, not
+   Yahoo's `longName`.** Once a ticker clears the not-listed gate, its
+   Nasdaq Trader security name (not the screener's own name) is what gets
+   checked against `_NON_COMMON_STOCK_KEYWORDS` and saved as metadata --
+   the screener's name is still checked too (defense in depth, in case the
+   Nasdaq Trader name itself is uninformative), but it cannot override the
+   Nasdaq Trader name for filtering purposes.
+2. **Name-pattern exclusions also cover ETFs/ETNs by name**, not just the
+   ETF flag column, in case that flag is wrong or missing on either side.
+3. **An identity-mismatch guard** compares the screener's reported name
+   against the Nasdaq Trader name for the same ticker; if the two share no
+   meaningful words in common, the result is excluded and counted as
+   `num_excluded_identity_mismatch` rather than trusted.
+4. **A lightweight price-data check** on the final, already-filtered/
+   deduped ticker list (not the raw candidate pool) confirms each selected
+   ticker actually has recent daily price history before it's cached --
+   catching non-tradable/delisted symbols that slipped past every
+   name-based check. Tickers that fail this are excluded and counted as
+   `num_excluded_no_price_data`.
+
 SURVIVORSHIP BIAS / NOT POINT-IN-TIME (read before trusting any `us_50b`
 result): like the default hardcoded universe, this is a CURRENT SNAPSHOT of
 companies that are large *today*, not a point-in-time historical constituent
@@ -109,12 +140,15 @@ MIN_US_50B_UNIVERSE_SIZE = 5
 # Case-insensitive keywords in a security's listed name that mark it as NOT
 # a plain common stock -- warrants, rights, units, preferreds, notes, and
 # funds are excluded by name pattern even though they aren't flagged by the
-# ETF column. ETFs themselves are excluded via the ETF flag, not by name --
+# ETF column. ETFs are primarily excluded via the ETF flag, but "etf"/"etn"
+# name patterns are also checked here as a defense-in-depth backstop in case
+# that flag is wrong or missing on either the Nasdaq Trader or Yahoo side --
 # deliberately NOT excluding "trust" here, since legitimate common-stock
 # companies (REITs in particular) routinely have "Trust" in their listed
 # name, e.g. "Example Realty Trust Inc. Common Stock".
 _NON_COMMON_STOCK_KEYWORDS = (
     "warrant", "right", "units", " unit", "preferred", "notes", " note ", "fund",
+    "etf", "exchange traded fund", "etn", "exchange traded note",
 )
 
 
@@ -124,6 +158,42 @@ def _name_is_non_common_stock(name: str) -> bool:
     per-quote screener-result filter (`build_us_50b_universe`)."""
     name_lower = (name or "").lower()
     return any(keyword in name_lower for keyword in _NON_COMMON_STOCK_KEYWORDS)
+
+
+# Common corporate/share-class words carry no identifying information, so
+# they're excluded from the token-overlap comparison below -- otherwise two
+# completely unrelated "XYZ Inc. Common Stock" names would look related
+# just because they share "inc"/"common"/"stock".
+_NAME_COMPARISON_STOPWORDS = {
+    "inc", "incorporated", "corp", "corporation", "company", "co", "ltd", "limited",
+    "plc", "holdings", "holding", "group", "the", "common", "stock", "shares", "share",
+    "class", "a", "b", "c", "ordinary", "trust", "fund", "etf",
+}
+
+
+def _name_tokens(name: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", (name or "").lower())
+    return {w for w in words if w not in _NAME_COMPARISON_STOPWORDS and len(w) > 1}
+
+
+def _names_materially_inconsistent(name_a: str, name_b: str) -> bool:
+    """True if two listed-security names share no meaningful word in
+    common -- a lightweight, dependency-free stand-in for a real
+    company-identity match. Used to catch cases where a screener result's
+    ticker happens to be present in the Nasdaq Trader candidate set but the
+    screener's own name doesn't actually describe that same listing (the
+    real-world SPCX case: Yahoo's screener claimed a ~$2T "Space
+    Exploration Technologies Corp." for a ticker whose actual Nasdaq Trader
+    listing is an unrelated company). Returns False (not flagged) if either
+    name is empty/uninformative after stripping stopwords, since there's
+    nothing to compare -- this is a defense-in-depth backstop, not the
+    primary eligibility check, so it deliberately errs toward not blocking
+    a result it can't confidently evaluate."""
+    tokens_a = _name_tokens(name_a)
+    tokens_b = _name_tokens(name_b)
+    if not tokens_a or not tokens_b:
+        return False
+    return tokens_a.isdisjoint(tokens_b)
 
 
 class UniverseError(Exception):
@@ -146,6 +216,8 @@ class UniverseSnapshot:
     num_dropped_lookup_failed: int | None = None
     num_excluded_not_listed: int | None = None
     num_excluded_non_common: int | None = None
+    num_excluded_identity_mismatch: int | None = None
+    num_excluded_no_price_data: int | None = None
     num_duplicate_companies_collapsed: int | None = None
     snapshot_date: str | None = None
     cache_file: str | None = None
@@ -472,6 +544,8 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
         num_dropped_lookup_failed=0,
         num_excluded_not_listed=None,
         num_excluded_non_common=None,
+        num_excluded_identity_mismatch=None,
+        num_excluded_no_price_data=None,
         num_duplicate_companies_collapsed=None,
         snapshot_date=snapshot_date,
         cache_file=str(path),
@@ -543,6 +617,30 @@ def _dedupe_by_company(
     return kept_market_caps, kept_names, kept_exchanges, num_collapsed
 
 
+# --- Final price-data validation (last line of defense) ---------------------
+#
+# Even after the Nasdaq Trader eligibility gate, name-pattern filtering, and
+# identity-mismatch guard, a screener result could still turn out to be a
+# non-tradable/delisted symbol -- the actual backtest-time failure mode that
+# motivated all of this ("SPCX: possibly delisted; no price data found").
+# This check is intentionally the LAST step, applied only to the small final
+# selected/deduped list (not the full candidate pool), since it costs one
+# lightweight price-history request per ticker.
+
+PRICE_DATA_LOOKBACK = "90d"
+
+
+def _default_price_data_available(ticker: str) -> bool:
+    """Real (network-hitting) price-data check used by build_us_50b_universe
+    by default. Wrapped in its own function so tests can inject a fake
+    `price_data_checker` instead of hitting the network."""
+    try:
+        history = yf.Ticker(ticker).history(period=PRICE_DATA_LOOKBACK)
+    except Exception:
+        return False
+    return history is not None and not history.empty
+
+
 # --- Build the >= $50B universe from live data -------------------------------
 
 def build_us_50b_universe(
@@ -551,6 +649,7 @@ def build_us_50b_universe(
     max_candidates: int | None = None,
     progress: Callable[[str], None] | None = None,
     allow_screener_only: bool = False,
+    price_data_checker: Callable[[str], bool] | None = None,
 ) -> UniverseSnapshot:
     """Build the >= `min_market_cap` US-equity universe: Yahoo's bulk
     screener supplies candidate tickers + market caps (see module
@@ -558,16 +657,26 @@ def build_us_50b_universe(
     directories act as a required ELIGIBILITY GATE on those results -- a
     screener ticker not present in the Nasdaq Trader candidate set is
     excluded, since the screener alone can return non-US-listed/
-    non-tradable symbols (see module docstring). `max_candidates` is a
-    debug/safety cap on how many screener results to consider -- leave it
-    None (the default) for a real run. `progress`, if given, receives a
-    line of text at each meaningful step -- cli.py passes `print`.
-    `allow_screener_only`, if True, permits proceeding without the Nasdaq
-    Trader gate when its directories are unreachable (an explicit opt-in
-    debug escape hatch, NOT the default -- see module docstring). Hard-fails
-    via UniverseError if the resulting universe is too small to backtest
+    non-tradable symbols (see module docstring). Once a ticker clears that
+    gate, its Nasdaq Trader name is authoritative for non-common-stock
+    filtering and saved metadata (not Yahoo's `longName`), an
+    identity-mismatch guard excludes results whose Yahoo name and Nasdaq
+    Trader name share no meaningful word in common, and a final lightweight
+    price-data check excludes any selected ticker with no recent daily
+    price history -- see the module docstring's "Symbol presence in Nasdaq
+    Trader isn't sufficient either" section for why each of these exists.
+    `max_candidates` is a debug/safety cap on how many screener results to
+    consider -- leave it None (the default) for a real run. `progress`, if
+    given, receives a line of text at each meaningful step -- cli.py passes
+    `print`. `allow_screener_only`, if True, permits proceeding without the
+    Nasdaq Trader gate when its directories are unreachable (an explicit
+    opt-in debug escape hatch, NOT the default -- see module docstring).
+    `price_data_checker`, if given, replaces the real (network-hitting)
+    price-data validation -- tests inject a fake one. Hard-fails via
+    UniverseError if the resulting universe is too small to backtest
     meaningfully -- see MIN_US_50B_UNIVERSE_SIZE."""
     progress = progress or (lambda msg: None)
+    price_data_checker = price_data_checker or _default_price_data_available
 
     progress("Fetching Nasdaq Trader symbol directories (required to verify US-listed eligibility)...")
     candidate_tickers: set[str] | None = None
@@ -602,6 +711,7 @@ def build_us_50b_universe(
     num_unparseable = 0
     num_excluded_not_listed = 0
     num_excluded_non_common = 0
+    num_excluded_identity_mismatch = 0
 
     for quote in quotes:
         symbol = _extract_quote_field(quote, ("symbol",))
@@ -623,16 +733,31 @@ def build_us_50b_universe(
             num_excluded_not_listed += 1
             continue
 
-        name = _extract_quote_field(quote, ("longName", "shortName", "displayName"))
-        name = str(name) if name else candidate_names.get(ticker, "")
-        if _name_is_non_common_stock(name):
+        # Nasdaq Trader's own name for this ticker is authoritative once
+        # the ticker has cleared the eligibility gate above -- Yahoo's
+        # longName is still consulted (for the identity check and as a
+        # fallback when there's no Nasdaq Trader data at all), but it
+        # cannot override the Nasdaq Trader name for filtering/metadata.
+        nasdaq_name = candidate_names.get(ticker, "") if candidate_tickers is not None else ""
+        yahoo_name_raw = _extract_quote_field(quote, ("longName", "shortName", "displayName"))
+        yahoo_name = str(yahoo_name_raw) if yahoo_name_raw else ""
+
+        if nasdaq_name and yahoo_name and _names_materially_inconsistent(yahoo_name, nasdaq_name):
+            num_excluded_identity_mismatch += 1
+            continue
+
+        authoritative_name = nasdaq_name or yahoo_name
+        if _name_is_non_common_stock(nasdaq_name) or _name_is_non_common_stock(yahoo_name):
             num_excluded_non_common += 1
             continue
 
         market_caps[ticker] = cap
-        names[ticker] = name
-        exchange = _extract_quote_field(quote, ("exchange", "fullExchangeName", "exchDisp"))
-        exchanges[ticker] = str(exchange) if exchange else candidate_exchanges.get(ticker, "")
+        names[ticker] = authoritative_name
+        exchange = candidate_exchanges.get(ticker, "") if candidate_tickers is not None else ""
+        if not exchange:
+            exchange_raw = _extract_quote_field(quote, ("exchange", "fullExchangeName", "exchDisp"))
+            exchange = str(exchange_raw) if exchange_raw else ""
+        exchanges[ticker] = exchange
         progress(f"  qualifying so far: {len(market_caps)} (latest: {ticker} = ${cap:,.0f})")
 
     total_quotes = len(quotes)
@@ -645,11 +770,23 @@ def build_us_50b_universe(
 
     market_caps, names, exchanges, num_collapsed = _dedupe_by_company(market_caps, names, exchanges)
 
+    progress(f"Validating recent price-data availability for {len(market_caps)} selected ticker(s)...")
+    num_excluded_no_price_data = 0
+    validated_tickers = sorted(market_caps, key=lambda t: market_caps[t], reverse=True)
+    for ticker in validated_tickers:
+        if not price_data_checker(ticker):
+            num_excluded_no_price_data += 1
+            progress(f"  excluding {ticker}: no recent price data found.")
+            del market_caps[ticker]
+            del names[ticker]
+            del exchanges[ticker]
+
     progress(
         f"Done: {len(market_caps)} qualifying tickers, {num_excluded_not_listed} excluded as not in "
-        f"the Nasdaq Trader candidate set, {num_excluded_non_common} excluded as non-common-stock by "
-        f"name, {num_collapsed} duplicate-company ticker(s) collapsed, {num_unparseable} unparseable "
-        f"screener result(s)."
+        f"the Nasdaq Trader candidate set, {num_excluded_identity_mismatch} excluded for a screener/"
+        f"Nasdaq Trader name mismatch, {num_excluded_non_common} excluded as non-common-stock by name, "
+        f"{num_excluded_no_price_data} excluded for missing recent price data, {num_collapsed} "
+        f"duplicate-company ticker(s) collapsed, {num_unparseable} unparseable screener result(s)."
     )
 
     if len(market_caps) < MIN_US_50B_UNIVERSE_SIZE:
@@ -659,7 +796,9 @@ def build_us_50b_universe(
             f"on a degenerate universe rather than silently produce a near-empty backtest. Screener "
             f"returned {total_quotes} total result(s): {num_unparseable} unparseable, "
             f"{num_excluded_not_listed} not in the Nasdaq Trader candidate set, "
-            f"{num_excluded_non_common} excluded as non-common-stock by name."
+            f"{num_excluded_identity_mismatch} excluded for a name mismatch, "
+            f"{num_excluded_non_common} excluded as non-common-stock by name, "
+            f"{num_excluded_no_price_data} excluded for missing recent price data."
         )
 
     snapshot = UniverseSnapshot(
@@ -671,6 +810,8 @@ def build_us_50b_universe(
         num_dropped_lookup_failed=num_unparseable,
         num_excluded_not_listed=num_excluded_not_listed,
         num_excluded_non_common=num_excluded_non_common,
+        num_excluded_identity_mismatch=num_excluded_identity_mismatch,
+        num_excluded_no_price_data=num_excluded_no_price_data,
         num_duplicate_companies_collapsed=num_collapsed,
         snapshot_date=datetime.now(timezone.utc).isoformat(),
         cache_file=cache_path,
@@ -690,6 +831,8 @@ def _snapshot_to_info(snapshot: UniverseSnapshot, mode: str) -> dict:
         "num_dropped_lookup_failed": snapshot.num_dropped_lookup_failed,
         "num_excluded_not_listed": snapshot.num_excluded_not_listed,
         "num_excluded_non_common": snapshot.num_excluded_non_common,
+        "num_excluded_identity_mismatch": snapshot.num_excluded_identity_mismatch,
+        "num_excluded_no_price_data": snapshot.num_excluded_no_price_data,
         "num_duplicate_companies_collapsed": snapshot.num_duplicate_companies_collapsed,
         "min_market_cap": snapshot.min_market_cap,
         "max_market_cap": snapshot.max_market_cap,
@@ -707,6 +850,7 @@ def resolve_mean_reversion_universe(
     max_candidates: int | None = None,
     progress: Callable[[str], None] | None = None,
     allow_screener_only: bool = False,
+    price_data_checker: Callable[[str], bool] | None = None,
 ) -> UniverseResolution:
     """Single entry point cli.py uses to decide which ticker list
     mean_reversion should run with. `csv_path` (if given) always wins,
@@ -718,9 +862,10 @@ def resolve_mean_reversion_universe(
       from `cache_path` unless `refresh` is set or the cache doesn't exist
       yet, in which case it's rebuilt from live data via the bulk market-cap
       screener, gated against the Nasdaq Trader candidate set (see
-      build_us_50b_universe). `max_candidates`/`progress`/`allow_screener_only`
-      are passed straight through to that rebuild (ignored when loading
-      from cache, since there's nothing to page/gate/report progress on).
+      build_us_50b_universe). `max_candidates`/`progress`/`allow_screener_only`/
+      `price_data_checker` are passed straight through to that rebuild
+      (ignored when loading from cache, since there's nothing to page/gate/
+      report progress on/validate).
     - explicit csv_path: a user-supplied ticker list (own snapshot, or one
       previously cached by this module).
     """
@@ -737,6 +882,7 @@ def resolve_mean_reversion_universe(
                 "mode": "default", "num_selected": len(config.MEAN_REVERSION_UNIVERSE),
                 "num_candidates": None, "num_dropped_lookup_failed": None,
                 "num_excluded_not_listed": None, "num_excluded_non_common": None,
+                "num_excluded_identity_mismatch": None, "num_excluded_no_price_data": None,
                 "num_duplicate_companies_collapsed": None,
                 "min_market_cap": None, "max_market_cap": None,
                 "cache_file": None, "snapshot_date": None,
@@ -750,6 +896,7 @@ def resolve_mean_reversion_universe(
                 min_market_cap=min_market_cap, cache_path=cache_path,
                 max_candidates=max_candidates, progress=progress,
                 allow_screener_only=allow_screener_only,
+                price_data_checker=price_data_checker,
             )
         return UniverseResolution(tickers=snapshot.tickers, info=_snapshot_to_info(snapshot, "us_50b"))
 

@@ -15,6 +15,18 @@ XPRF|Example Corp Class X Stock|Q|N|N|100|N|N
 File Creation Time: 0708202600:00
 """
 
+
+@pytest.fixture(autouse=True)
+def _stub_price_data_available(monkeypatch):
+    # build_us_50b_universe's final price-data validation step hits the
+    # network by default (yfinance history lookups). Every test in this
+    # module that doesn't care about that step should be able to assume
+    # price data is available for whatever tickers it's using -- tests
+    # that specifically want a ticker to fail this check pass their own
+    # `price_data_checker` argument to build_us_50b_universe, which
+    # overrides this stub entirely.
+    monkeypatch.setattr(universe, "_default_price_data_available", lambda ticker: True)
+
 OTHER_LISTED_SAMPLE = """ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
 BRK.B|Berkshire Hathaway Inc. Class B Common Stock|N|BRK.B|N|100|N|BRK.B
 JPM|JPMorgan Chase & Co. Common Stock|N|JPM|N|100|N|JPM
@@ -103,10 +115,22 @@ def test_fetch_market_caps_filters_failures_and_retries(monkeypatch):
     assert call_counts["MSFT"] == 1
 
 
+# Realistic default longNames for tickers used across build_us_50b_universe
+# tests without an explicit `name=` -- these need to share a meaningful word
+# with the corresponding Nasdaq Trader sample name above, or the
+# identity-mismatch guard added in build_us_50b_universe would spuriously
+# flag them (a placeholder like "AAPL Inc. Common Stock" shares nothing in
+# common with the Nasdaq Trader name "Apple Inc. - Common Stock").
+_DEFAULT_QUOTE_NAMES = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+}
+
+
 def make_quote(symbol, market_cap, name=None, exchange="NMS"):
     return {
         "symbol": symbol,
-        "longName": name or f"{symbol} Inc. Common Stock",
+        "longName": name or _DEFAULT_QUOTE_NAMES.get(symbol, f"{symbol} Inc. Common Stock"),
         "intradaymarketcap": market_cap,
         "exchange": exchange,
     }
@@ -294,6 +318,129 @@ def test_build_us_50b_universe_keeps_screener_result_present_in_candidate_set(tm
     snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
     assert snapshot.tickers == ["AAPL"]
     assert snapshot.num_excluded_not_listed == 0
+
+
+def test_names_materially_inconsistent_flags_disjoint_names():
+    assert universe._names_materially_inconsistent(
+        "Space Exploration Technologies Corp.", "Spectral Capital Corp - Common Stock"
+    )
+
+
+def test_names_materially_inconsistent_allows_shared_company_name():
+    assert not universe._names_materially_inconsistent("Apple Inc.", "Apple Inc. - Common Stock")
+    assert not universe._names_materially_inconsistent(
+        "Microsoft Corporation", "Microsoft Corporation - Common Stock"
+    )
+
+
+def test_names_materially_inconsistent_does_not_flag_when_either_name_empty():
+    # Nothing to compare against -- this is a defense-in-depth backstop,
+    # not the primary eligibility check, so it must not block a result it
+    # can't confidently evaluate.
+    assert not universe._names_materially_inconsistent("", "Apple Inc. - Common Stock")
+    assert not universe._names_materially_inconsistent("Apple Inc.", "")
+
+
+def test_build_us_50b_universe_excludes_screener_result_with_identity_mismatch(tmp_path, monkeypatch):
+    # SPCX IS present in the Nasdaq Trader candidate set this time (unlike
+    # test_build_us_50b_universe_excludes_screener_result_not_in_nasdaq_trader_candidate_set
+    # above, which covers the "not present at all" case) -- but its Nasdaq
+    # Trader security name describes a completely different, unrelated
+    # company than the screener's own claimed name. Presence in the
+    # candidate set alone isn't proof the screener's quote is actually
+    # about that same listing; the identity-mismatch guard must catch this.
+    extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
+        "File Creation Time",
+        "SPCX|Spectral Capital Corp - Common Stock|Q|N|N|100|N|N\nFile Creation Time",
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: extended_nasdaq)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("SPCX", 1_970_000_000_000.0, name="Space Exploration Technologies Corp."),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert "SPCX" not in snapshot.tickers
+    assert snapshot.num_excluded_identity_mismatch == 1
+    assert snapshot.num_excluded_not_listed == 0  # it WAS in the candidate set
+
+
+def test_build_us_50b_universe_keeps_screener_result_with_consistent_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [make_quote("AAPL", 3_000_000_000_000.0, name="Apple Inc.")]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert snapshot.num_excluded_identity_mismatch == 0
+    # Nasdaq Trader's own name is authoritative -- not the screener's longName.
+    assert snapshot.names["AAPL"] == "Apple Inc. - Common Stock"
+
+
+def test_build_us_50b_universe_excludes_ticker_with_no_recent_price_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("MSFT", 2_500_000_000_000.0),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    # MSFT looks fine by every name/eligibility check but has no usable
+    # recent price history -- the last-line-of-defense check this test
+    # covers (the actual backtest-time failure mode: "possibly delisted;
+    # no price data found").
+    def fake_price_checker(ticker):
+        return ticker != "MSFT"
+
+    snapshot = universe.build_us_50b_universe(
+        min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"), price_data_checker=fake_price_checker,
+    )
+    assert snapshot.tickers == ["AAPL"]
+    assert "MSFT" not in snapshot.tickers
+    assert snapshot.num_excluded_no_price_data == 1
+
+    # Excluded-for-no-price-data tickers must not leak into the cached CSV.
+    loaded = universe.load_universe_cache(str(tmp_path / "u.csv"))
+    assert "MSFT" not in loaded.tickers
+
+
+def test_build_us_50b_universe_report_metadata_includes_all_exclusion_counts(tmp_path, monkeypatch):
+    extended_nasdaq = NASDAQ_LISTED_SAMPLE.replace(
+        "File Creation Time",
+        "SPCX|Spectral Capital Corp - Common Stock|Q|N|N|100|N|N\nFile Creation Time",
+    )
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: extended_nasdaq)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("SPCX", 1_970_000_000_000.0, name="Space Exploration Technologies Corp."),
+        make_quote("XPRF", 60_000_000_000.0, name="Example Corp Preferred Series A"),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert snapshot.num_excluded_identity_mismatch == 1  # SPCX
+    assert snapshot.num_excluded_non_common == 1  # XPRF
+    assert snapshot.num_excluded_no_price_data == 0
+    assert snapshot.num_duplicate_companies_collapsed == 0
+
+    info = universe._snapshot_to_info(snapshot, "us_50b")
+    assert info["num_excluded_identity_mismatch"] == 1
+    assert info["num_excluded_no_price_data"] == 0
 
 
 def test_company_key_strips_corporate_suffix_and_share_class_wording():
@@ -508,7 +655,10 @@ def test_resolve_mean_reversion_universe_us_50b_refresh_rebuilds(tmp_path, monke
     )
     calls = []
 
-    def fake_build(min_market_cap, cache_path, max_candidates=None, progress=None, allow_screener_only=False):
+    def fake_build(
+        min_market_cap, cache_path, max_candidates=None, progress=None,
+        allow_screener_only=False, price_data_checker=None,
+    ):
         calls.append((min_market_cap, cache_path))
         return rebuilt
 
@@ -525,7 +675,10 @@ def test_resolve_mean_reversion_universe_us_50b_threads_max_candidates_and_progr
     cache_path = tmp_path / "universe_us_50b.csv"
     received = {}
 
-    def fake_build(min_market_cap, cache_path, max_candidates=None, progress=None, allow_screener_only=False):
+    def fake_build(
+        min_market_cap, cache_path, max_candidates=None, progress=None,
+        allow_screener_only=False, price_data_checker=None,
+    ):
         received["max_candidates"] = max_candidates
         received["progress"] = progress
         return universe.UniverseSnapshot(tickers=["NEW"], cache_file=str(cache_path))
