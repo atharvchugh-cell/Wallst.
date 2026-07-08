@@ -60,9 +60,13 @@ MIN_US_50B_UNIVERSE_SIZE = 5
 
 # Case-insensitive keywords in a security's listed name that mark it as NOT
 # a plain common stock -- warrants, rights, units, preferreds, notes, and
-# funds/trusts are excluded even though they aren't flagged by the ETF column.
+# funds are excluded by name pattern even though they aren't flagged by the
+# ETF column. ETFs themselves are excluded via the ETF flag, not by name --
+# deliberately NOT excluding "trust" here, since legitimate common-stock
+# companies (REITs in particular) routinely have "Trust" in their listed
+# name, e.g. "Example Realty Trust Inc. Common Stock".
 _NON_COMMON_STOCK_KEYWORDS = (
-    "warrant", "right", "units", " unit", "preferred", "notes", " note ", "fund", "trust",
+    "warrant", "right", "units", " unit", "preferred", "notes", " note ", "fund",
 )
 
 

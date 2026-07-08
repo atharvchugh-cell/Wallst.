@@ -10,6 +10,7 @@ MSFT|Microsoft Corporation - Common Stock|Q|N|N|100|N|N
 ZZZZ|Test Company - Common Stock|Q|Y|N|100|N|N
 QQQ|Invesco QQQ Trust|Q|N|N|100|Y|N
 AAWW|Atlas Air Worldwide Holdings Warrant|Q|N|N|100|N|N
+EXRT|Example Realty Trust Inc. Common Stock|Q|N|N|100|N|N
 File Creation Time: 0708202600:00
 """
 
@@ -19,6 +20,7 @@ JPM|JPMorgan Chase & Co. Common Stock|N|JPM|N|100|N|JPM
 SPY|SPDR S&P 500 ETF Trust|P|SPY|Y|100|N|SPY
 PSA.PRA|Public Storage Depositary Shares Preferred Series A|N|PSA.PRA|N|100|N|PSA.PRA
 UNITX|Some Company Units|N|UNITX|N|100|N|UNITX
+XYZN|Example Corp 4.5% Senior Notes due 2030|N|XYZN|N|100|N|XYZN
 File Creation Time: 0708202600:00
 """
 
@@ -26,7 +28,7 @@ File Creation Time: 0708202600:00
 def test_parse_nasdaq_listed_excludes_test_issue_etf_and_warrant():
     df = universe.parse_nasdaq_listed(NASDAQ_LISTED_SAMPLE)
     symbols = set(df["yahoo_ticker"])
-    assert symbols == {"AAPL", "MSFT"}
+    assert symbols == {"AAPL", "MSFT", "EXRT"}
     assert (df["exchange"] == "NASDAQ").all()
 
 
@@ -34,6 +36,22 @@ def test_parse_other_listed_excludes_etf_and_preferred_and_units():
     df = universe.parse_other_listed(OTHER_LISTED_SAMPLE)
     symbols = set(df["yahoo_ticker"])
     assert symbols == {"BRK-B", "JPM"}
+
+
+def test_parse_nasdaq_listed_keeps_common_stock_with_trust_in_name():
+    # "Trust" alone must NOT exclude a security -- REITs and other
+    # legitimate common-stock companies routinely have "Trust" in their
+    # listed name. ETFs (like QQQ, also in this sample) are excluded via
+    # the ETF flag, not by name pattern.
+    df = universe.parse_nasdaq_listed(NASDAQ_LISTED_SAMPLE)
+    symbols = set(df["yahoo_ticker"])
+    assert "EXRT" in symbols
+    assert "QQQ" not in symbols  # excluded via ETF=Y, not because its name says "Trust"
+
+
+def test_parse_other_listed_excludes_notes():
+    df = universe.parse_other_listed(OTHER_LISTED_SAMPLE)
+    assert "XYZN" not in set(df["yahoo_ticker"])
 
 
 def test_normalize_yahoo_ticker_dot_to_dash():
@@ -57,7 +75,7 @@ def test_fetch_text_wraps_network_failure_in_universe_error(monkeypatch):
 
 def test_build_candidate_universe_combines_and_dedupes():
     combined = universe.build_candidate_universe(NASDAQ_LISTED_SAMPLE, OTHER_LISTED_SAMPLE)
-    assert set(combined["yahoo_ticker"]) == {"AAPL", "MSFT", "BRK-B", "JPM"}
+    assert set(combined["yahoo_ticker"]) == {"AAPL", "MSFT", "EXRT", "BRK-B", "JPM"}
     assert len(combined) == len(combined["yahoo_ticker"].unique())
 
 
@@ -94,6 +112,7 @@ def test_build_us_50b_universe_filters_by_threshold_and_writes_cache(tmp_path, m
         "MSFT": 2_500_000_000_000.0,   # qualifies
         "BRK-B": 800_000_000_000.0,    # qualifies
         "JPM": 10_000_000_000.0,       # below $50B -- excluded
+        "EXRT": 5_000_000_000.0,       # below $50B -- excluded (also proves "Trust" in name wasn't dropped upstream)
     }
 
     def fake_get_market_cap(ticker):
