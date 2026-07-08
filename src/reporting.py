@@ -578,9 +578,11 @@ def _write_robustness_summary_txt(
     lines.append(
         "Allocation mixes are capital-weighted blends of independently-run "
         "mean_reversion and sector_rotation sleeves (each run ONCE per window "
-        "at full capital), not separately re-run backtests per allocation -- "
-        "see src/robustness.py's module docstring for why that's mathematically "
-        "equivalent to actually re-running each sleeve at its allocated capital."
+        "at full capital), not separately re-run backtests per allocation. The "
+        "blend preserves each sleeve's raw equity curve (including first-day "
+        "fill/transaction-cost drag) and scales it by allocation weight -- see "
+        "src/robustness.py's module docstring for the exact formula and its "
+        "edge cases."
     )
     lines.append("")
     lines.append(f"Windows tested: {', '.join(window_ranges.keys())}")

@@ -9,28 +9,42 @@ limits, stop rules, sector top-K, universes, or transaction-cost
 assumptions, and it does not change the behavior of `mean_reversion`,
 `sector_rotation`, `both`, or `compare` mode.
 
-## Why allocation mixes are blended, not re-run
+## How allocation mixes are computed (blended, not re-run)
 
 For a given window, this module runs mean_reversion ONCE and sector_rotation
 ONCE (each at the full requested `--capital`, exactly like `--strategy
-compare` already does), then computes each allocation mix's numbers by
-capital-weighting those two already-computed equity curves/metrics --
-NOT by re-running the backtest engine once per allocation mix.
+compare` already does). Each allocation mix's numbers are then computed by
+capital-weighting those two already-computed RAW equity curves --
+`w_sr * sector_equity_curve + w_mr * mean_reversion_equity_curve`, summed
+over the dates both sleeves share -- NOT by re-running the backtest engine
+once per allocation mix, and NOT by normalizing either curve to a
+1.0-based return index first. Normalizing first would erase each sleeve's
+first-day fill/transaction-cost drag (the engine's recorded equity already
+reflects costs paid on or before that date), so this module deliberately
+blends the raw dollar curves instead -- the same convention
+`engine.combine_results` uses for `--strategy both`.
 
-This is mathematically equivalent to actually re-running each sleeve at its
-allocated capital, because every dollar decision the engine makes is sized
-as `target_weight * sleeve_equity` (a pure FRACTION of that sleeve's own
-equity -- see `engine.py`/`strategies/*.py`), and `cost_bps` is a fixed
-rate -- both scale linearly with capital, so a strategy's trade dates,
-signals, and % returns are identical regardless of dollar capital. The
-only theoretical deviation is the engine's fixed-dollar dust thresholds
-(`MIN_TRADE_NOTIONAL = 0.01`, `EPSILON_SHARES = 1e-9` in engine.py), which
-never bind at any position size a $1k+ backtest actually produces.
+This is equivalent to actually re-running each sleeve at its allocated
+capital split PROVIDED both sleeves were run at the same `capital` this
+module is blending for -- true for every caller in this codebase
+(`run_robustness` always runs both sleeves at the same `args.capital`
+before blending) -- because every dollar decision the engine makes is
+sized as `target_weight * sleeve_equity` (a pure FRACTION of that sleeve's
+own equity -- see `engine.py`/`strategies/*.py`) and `cost_bps` is a fixed
+rate, so both scale linearly with capital. Two caveats where the
+equivalence is not exact:
+
+- Fixed-dollar dust thresholds in `engine.py` (`MIN_TRADE_NOTIONAL = 0.01`,
+  `EPSILON_SHARES = 1e-9`), which never bind at any position size a
+  $1k+ backtest actually produces.
+- Whole-share rounding in `--no-fractional-shares` mode: a sleeve actually
+  re-run at a smaller allocated capital could round share counts
+  differently than the blend implies.
 
 Blending is used instead of re-running because it turns 5 windows x 6
 allocations x 2 sleeves (60 backtests) into 5 windows x 2 sleeves (10
 backtests) plus arithmetic -- a ~6x reduction in yfinance fetches and
-engine runs, with no loss of accuracy under the reasoning above.
+engine runs.
 """
 
 from __future__ import annotations
@@ -72,21 +86,28 @@ DEFAULT_ROBUSTNESS_WINDOWS: list[tuple[str, str, str]] = [
 
 
 def blend_equity_curve(
-    sr_result: BacktestResult, mr_result: BacktestResult, w_sr: float, w_mr: float, capital: float
+    sr_result: BacktestResult, mr_result: BacktestResult, w_sr: float, w_mr: float
 ) -> tuple[pd.Series, pd.Timestamp, pd.Timestamp]:
-    """Capital-weighted blend of two independently-run sleeves' equity
-    curves -- see module docstring for why this is equivalent to actually
-    re-running each sleeve at that capital split. Returns (blended_equity,
-    window_start, window_end) over the INTERSECTION of the two sleeves'
-    valid ranges (same convention `engine.combine_results` uses)."""
+    """Capital-weighted blend of two independently-run sleeves' RAW equity
+    curves -- `w_sr * sr_equity + w_mr * mr_equity` over the dates both
+    sleeves share. Deliberately does NOT normalize either curve to a
+    1.0-based return index first: both sleeves were run at the same full
+    capital (see module docstring), so their raw equity values are already
+    in matching dollar units, and summing them directly -- rather than
+    rescaling by each curve's own first value -- preserves each sleeve's
+    actual first-day fill/transaction-cost economics instead of resetting
+    every allocation mix back to a clean, cost-free `capital` starting
+    point. Returns (blended_equity, window_start, window_end) over the
+    INTERSECTION of the two sleeves' valid ranges (same convention
+    `engine.combine_results` uses)."""
     common = sr_result.equity_curve.index.intersection(mr_result.equity_curve.index).sort_values()
     if len(common) == 0:
         raise ValueError("No overlapping dates between sector_rotation and mean_reversion sleeves.")
     window_start, window_end = common[0], common[-1]
 
-    sr_norm = sr_result.equity_curve.reindex(common) / sr_result.equity_curve.loc[window_start]
-    mr_norm = mr_result.equity_curve.reindex(common) / mr_result.equity_curve.loc[window_start]
-    blended = capital * (w_sr * sr_norm + w_mr * mr_norm)
+    sr_equity = sr_result.equity_curve.reindex(common)
+    mr_equity = mr_result.equity_curve.reindex(common)
+    blended = w_sr * sr_equity + w_mr * mr_equity
     return blended, window_start, window_end
 
 
@@ -114,10 +135,12 @@ def blend_metrics(
 ) -> dict:
     """Metrics for a hypothetical `w_sr`/`w_mr` capital split, built by
     blending the two already-computed FULL-capital sleeve results (see
-    module docstring). Reuses metrics.py's existing equity-curve-based
+    module docstring). `capital` must equal the capital both `sr_result`
+    and `mr_result` were actually run at (every caller in this codebase
+    satisfies this). Reuses metrics.py's existing equity-curve-based
     metric functions on the blended curve rather than duplicating any of
     that math."""
-    equity, window_start, window_end = blend_equity_curve(sr_result, mr_result, w_sr, w_mr, capital)
+    equity, window_start, window_end = blend_equity_curve(sr_result, mr_result, w_sr, w_mr)
 
     metrics: dict = {
         "total_return": total_return(equity, start_capital=capital),

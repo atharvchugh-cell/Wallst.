@@ -151,10 +151,13 @@ def test_write_comparison_report_creates_expected_files(tmp_path):
 
 
 def _build_one_robustness_window(mr_result, sr_result, spy_close):
+    # blend_metrics requires `capital` to match the capital both sleeves
+    # were actually run at (1000.0, from _build_mr_sr_combined) -- it no
+    # longer renormalizes each curve to an arbitrary hypothetical capital.
     mr_metrics = compute_all_metrics(mr_result)
     sr_metrics = compute_all_metrics(sr_result)
     alloc_metrics = {
-        label: blend_metrics(sr_result, sr_metrics, mr_result, mr_metrics, w_sr, w_mr, capital=2000.0,
+        label: blend_metrics(sr_result, sr_metrics, mr_result, mr_metrics, w_sr, w_mr, capital=1000.0,
                               benchmark_close=spy_close)
         for label, w_sr, w_mr in ALLOCATION_MIXES
     }
