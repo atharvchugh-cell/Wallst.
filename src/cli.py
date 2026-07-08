@@ -61,10 +61,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="default",
         help="Mean-reversion universe to use. 'default' (default) is the existing hardcoded "
         "~25-stock universe -- old results stay reproducible. 'us_50b' is a current-snapshot "
-        "universe of US-listed common stock with market cap >= $50B, built from Nasdaq Trader "
-        "symbol directories + live yfinance market caps (see src/universe.py; still "
-        "survivorship-biased and NOT a point-in-time historical constituent list). Ignored by "
-        "sector_rotation (always the 11 fixed sector ETFs).",
+        "universe of US-listed common stock with market cap >= $50B, built in bulk via Yahoo "
+        "Finance's market-cap screener (see src/universe.py; still survivorship-biased and NOT "
+        "a point-in-time historical constituent list). Ignored by sector_rotation (always the "
+        "11 fixed sector ETFs).",
     )
     parser.add_argument(
         "--universe-csv", default=None,
@@ -74,9 +74,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--refresh-universe", action="store_true",
-        help="Rebuild the 'us_50b' universe from live Nasdaq Trader + yfinance data instead of "
-        "using the cached data_cache/universe_us_50b.csv snapshot, if present. Ignored unless "
-        "--universe us_50b is also set.",
+        help="Rebuild the 'us_50b' universe from live data instead of using the cached "
+        "data_cache/universe_us_50b.csv snapshot, if present. Ignored unless --universe us_50b "
+        "is also set.",
+    )
+    parser.add_argument(
+        "--max-universe-candidates", type=int, default=None,
+        help="Debug/safety cap on how many us_50b screener results to consider. NOT applied by "
+        "default -- omit this for a real run, which considers every qualifying result. Mainly "
+        "useful for fast, bounded dev/test runs. Ignored unless --universe us_50b --refresh-universe.",
     )
     return parser.parse_args(argv)
 
@@ -248,9 +254,12 @@ def resolve_mean_reversion_universe(args: argparse.Namespace) -> universe_module
     per-window computation, so every sleeve call in this run (mean_reversion,
     both, compare, or every window of robustness) shares the exact same
     ticker list. Sector rotation never calls this -- it always uses the 11
-    fixed sector ETFs regardless of --universe."""
+    fixed sector ETFs regardless of --universe. Passes `progress=print` so a
+    live `--refresh-universe` build prints its candidate/screener-page/
+    qualifying-count progress to the console rather than running silently."""
     return universe_module.resolve_mean_reversion_universe(
         mode=args.universe, csv_path=args.universe_csv, refresh=args.refresh_universe,
+        max_candidates=args.max_universe_candidates, progress=print,
     )
 
 

@@ -102,23 +102,84 @@ def test_fetch_market_caps_filters_failures_and_retries(monkeypatch):
     assert call_counts["MSFT"] == 1
 
 
+def make_quote(symbol, market_cap, name=None, exchange="NMS"):
+    return {
+        "symbol": symbol,
+        "longName": name or f"{symbol} Inc. Common Stock",
+        "intradaymarketcap": market_cap,
+        "exchange": exchange,
+    }
+
+
+def test_fetch_us_large_cap_quotes_paginates_until_short_page(monkeypatch):
+    # Two full pages of size 2, then a short (1-item) final page -- pagination
+    # must stop after the short page rather than requesting a 4th.
+    pages = [
+        [make_quote("A", 1e12), make_quote("B", 1e12)],
+        [make_quote("C", 1e12), make_quote("D", 1e12)],
+        [make_quote("E", 1e12)],
+    ]
+    calls = []
+
+    def fake_screen(query, offset, size, sortField, sortAsc):
+        calls.append((offset, size))
+        return {"quotes": pages[offset // size]}
+
+    monkeypatch.setattr(universe.yf, "screen", fake_screen)
+    quotes = universe.fetch_us_large_cap_quotes(50e9, page_size=2, max_pages=10)
+    assert [q["symbol"] for q in quotes] == ["A", "B", "C", "D", "E"]
+    assert len(calls) == 3
+
+
+def test_fetch_us_large_cap_quotes_respects_max_pages_safety_cap(monkeypatch):
+    # Every page comes back "full" (never short) -- must still stop at max_pages.
+    def fake_screen(query, offset, size, sortField, sortAsc):
+        return {"quotes": [make_quote(f"T{offset}", 1e12)] * size}
+
+    monkeypatch.setattr(universe.yf, "screen", fake_screen)
+    quotes = universe.fetch_us_large_cap_quotes(50e9, page_size=2, max_pages=3)
+    assert len(quotes) == 6  # 3 pages x 2 each, then stopped
+
+
+def test_fetch_us_large_cap_quotes_respects_max_results(monkeypatch):
+    def fake_screen(query, offset, size, sortField, sortAsc):
+        return {"quotes": [make_quote(f"T{offset}-{i}", 1e12) for i in range(size)]}
+
+    monkeypatch.setattr(universe.yf, "screen", fake_screen)
+    quotes = universe.fetch_us_large_cap_quotes(50e9, page_size=250, max_pages=10, max_results=5)
+    assert len(quotes) == 5
+
+
+def test_fetch_us_large_cap_quotes_wraps_screener_failure_in_universe_error(monkeypatch):
+    def fake_screen(query, offset, size, sortField, sortAsc):
+        raise RuntimeError("simulated Yahoo screener outage")
+
+    monkeypatch.setattr(universe.yf, "screen", fake_screen)
+    with pytest.raises(universe.UniverseError, match="Market-cap screener request failed"):
+        universe.fetch_us_large_cap_quotes(50e9)
+
+
+def test_fetch_us_large_cap_quotes_reports_progress(monkeypatch):
+    def fake_screen(query, offset, size, sortField, sortAsc):
+        return {"quotes": [make_quote("A", 1e12)]}
+
+    monkeypatch.setattr(universe.yf, "screen", fake_screen)
+    messages = []
+    universe.fetch_us_large_cap_quotes(50e9, page_size=250, progress=messages.append)
+    assert any("page 1" in m for m in messages)
+
+
 def test_build_us_50b_universe_filters_by_threshold_and_writes_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
     monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
     monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 2)
 
-    caps = {
-        "AAPL": 3_000_000_000_000.0,   # qualifies
-        "MSFT": 2_500_000_000_000.0,   # qualifies
-        "BRK-B": 800_000_000_000.0,    # qualifies
-        "JPM": 10_000_000_000.0,       # below $50B -- excluded
-        "EXRT": 5_000_000_000.0,       # below $50B -- excluded (also proves "Trust" in name wasn't dropped upstream)
-    }
-
-    def fake_get_market_cap(ticker):
-        return caps[ticker]
-
-    monkeypatch.setattr(universe, "_get_market_cap", fake_get_market_cap)
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("MSFT", 2_500_000_000_000.0),
+        make_quote("BRK-B", 800_000_000_000.0, name="Berkshire Hathaway Inc. Class B"),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
     cache_path = str(tmp_path / "universe_us_50b.csv")
 
     snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=cache_path)
@@ -136,11 +197,75 @@ def test_build_us_50b_universe_filters_by_threshold_and_writes_cache(tmp_path, m
     assert loaded.market_caps["AAPL"] == pytest.approx(3_000_000_000_000.0)
 
 
+def test_build_us_50b_universe_continues_when_nasdaq_trader_directories_unavailable(tmp_path, monkeypatch):
+    # The screener call -- not the Nasdaq Trader directories -- determines
+    # universe membership now; Nasdaq Trader only supplies supplementary
+    # name/exchange metadata, so its outage must not fail the whole build
+    # as long as the screener itself succeeds (each quote already carries
+    # its own name/exchange, used here instead of the unavailable fallback).
+    def raise_unavailable():
+        raise universe.UniverseError("simulated Nasdaq Trader outage")
+
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", raise_unavailable)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", raise_unavailable)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [make_quote("AAPL", 3_000_000_000_000.0, name="Apple Inc.")]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert snapshot.names["AAPL"] == "Apple Inc."
+
+
+def test_build_us_50b_universe_excludes_non_common_stock_name_from_screener_result(tmp_path, monkeypatch):
+    # A quote that clears the market-cap bar but whose name marks it as a
+    # non-common-stock instrument must still be excluded -- Yahoo's screener
+    # scoping to quoteType=EQUITY isn't a guaranteed substitute for the same
+    # name-pattern safety net applied to the Nasdaq Trader directories.
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        make_quote("XPRF", 60_000_000_000.0, name="Example Corp Preferred Series A"),
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert "XPRF" not in snapshot.tickers
+
+
+def test_build_us_50b_universe_counts_malformed_quote_as_unparseable_not_blocking(tmp_path, monkeypatch):
+    # A quote missing a symbol or market cap must be counted as a failed/
+    # unparseable result and skipped, without blocking the rest of the
+    # build -- the practical equivalent, in the new bulk-screener world, of
+    # "one bad ticker doesn't hang or abort the whole universe build."
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    quotes = [
+        make_quote("AAPL", 3_000_000_000_000.0),
+        {"symbol": "BROKEN"},  # no market cap field at all
+        {"intradaymarketcap": 1e12},  # no symbol
+    ]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    with pytest.warns(UserWarning, match="could not be parsed"):
+        snapshot = universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
+    assert snapshot.tickers == ["AAPL"]
+    assert snapshot.num_dropped_lookup_failed == 2
+
+
 def test_build_us_50b_universe_hard_fails_when_too_few_qualify(tmp_path, monkeypatch):
     monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
     monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
     # Nothing clears the $50B bar -- resulting universe would be empty.
-    monkeypatch.setattr(universe, "_get_market_cap", lambda ticker: 1_000_000_000.0)
+    quotes = [make_quote("AAPL", 1_000_000_000.0), make_quote("MSFT", 1_000_000_000.0)]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
 
     with pytest.raises(universe.UniverseError, match="Only 0 ticker"):
         universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"))
@@ -151,17 +276,46 @@ def test_build_us_50b_universe_warns_on_high_lookup_failure_fraction(tmp_path, m
     monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
     monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
 
-    def flaky_get_market_cap(ticker):
-        if ticker == "AAPL":
-            return 3_000_000_000_000.0
-        raise RuntimeError("simulated failure")
+    quotes = [make_quote("AAPL", 3_000_000_000_000.0)] + [{"symbol": f"BAD{i}"} for i in range(5)]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
 
-    monkeypatch.setattr(universe, "_get_market_cap", flaky_get_market_cap)
-    with pytest.warns(UserWarning, match="Market-cap lookup failed"):
+    with pytest.warns(UserWarning, match="could not be parsed"):
         snapshot = universe.build_us_50b_universe(
             min_market_cap=50e9, cache_path=str(tmp_path / "u.csv")
         )
     assert snapshot.tickers == ["AAPL"]
+
+
+def test_build_us_50b_universe_reports_progress_milestones(tmp_path, monkeypatch):
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+    quotes = [make_quote("AAPL", 3_000_000_000_000.0)]
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", lambda min_market_cap, **kw: quotes)
+
+    messages = []
+    universe.build_us_50b_universe(
+        min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"), progress=messages.append
+    )
+    joined = "\n".join(messages)
+    assert "candidate" in joined
+    assert "qualifying" in joined
+
+
+def test_build_us_50b_universe_threads_max_candidates_to_screener(tmp_path, monkeypatch):
+    monkeypatch.setattr(universe, "fetch_nasdaq_listed_text", lambda: NASDAQ_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "fetch_other_listed_text", lambda: OTHER_LISTED_SAMPLE)
+    monkeypatch.setattr(universe, "MIN_US_50B_UNIVERSE_SIZE", 1)
+
+    received = {}
+
+    def fake_fetch(min_market_cap, max_results=None, progress=None):
+        received["max_results"] = max_results
+        return [make_quote("AAPL", 3_000_000_000_000.0)]
+
+    monkeypatch.setattr(universe, "fetch_us_large_cap_quotes", fake_fetch)
+    universe.build_us_50b_universe(min_market_cap=50e9, cache_path=str(tmp_path / "u.csv"), max_candidates=7)
+    assert received["max_results"] == 7
 
 
 def test_load_universe_cache_tolerant_of_minimal_ticker_only_csv(tmp_path):
@@ -235,7 +389,7 @@ def test_resolve_mean_reversion_universe_us_50b_refresh_rebuilds(tmp_path, monke
     )
     calls = []
 
-    def fake_build(min_market_cap, cache_path):
+    def fake_build(min_market_cap, cache_path, max_candidates=None, progress=None):
         calls.append((min_market_cap, cache_path))
         return rebuilt
 
@@ -246,6 +400,26 @@ def test_resolve_mean_reversion_universe_us_50b_refresh_rebuilds(tmp_path, monke
     )
     assert resolution.tickers == ["NEW"]
     assert len(calls) == 1
+
+
+def test_resolve_mean_reversion_universe_us_50b_threads_max_candidates_and_progress(tmp_path, monkeypatch):
+    cache_path = tmp_path / "universe_us_50b.csv"
+    received = {}
+
+    def fake_build(min_market_cap, cache_path, max_candidates=None, progress=None):
+        received["max_candidates"] = max_candidates
+        received["progress"] = progress
+        return universe.UniverseSnapshot(tickers=["NEW"], cache_file=str(cache_path))
+
+    monkeypatch.setattr(universe, "build_us_50b_universe", fake_build)
+    my_progress = lambda msg: None  # noqa: E731
+
+    universe.resolve_mean_reversion_universe(
+        mode="us_50b", refresh=True, cache_path=str(cache_path),
+        max_candidates=42, progress=my_progress,
+    )
+    assert received["max_candidates"] == 42
+    assert received["progress"] is my_progress
 
 
 def test_resolve_mean_reversion_universe_unknown_mode_raises():

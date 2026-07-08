@@ -1,12 +1,39 @@
 """Optional larger mean-reversion universe: current US-listed common stocks
-with market cap >= $50B, built from Nasdaq Trader's public symbol directory
-files plus live yfinance market-cap lookups.
+with market cap >= $50B.
 
 DIAGNOSTICS ONLY -- this module does not change any strategy threshold,
 sizing rule, or execution assumption. It only builds an alternate `universe`
 list that `MeanReversionStrategy` can be constructed with instead of the
 hardcoded default in `config.MEAN_REVERSION_UNIVERSE`. Sector rotation is
 untouched -- it always uses the 11 fixed sector ETFs in `config.SECTOR_ETFS`.
+
+## How the universe is built (bulk screener, not per-ticker lookups)
+
+Market cap is fetched in BULK via Yahoo Finance's screener API (`yf.screen`
+with an `EquityQuery` filtering on `intradaymarketcap >= min_market_cap` and
+`region == "us"`) -- a small number of paginated requests (Yahoo caps each
+page at 250 results; realistically only a few hundred US companies clear a
+$50B bar, so this is typically 1-3 requests total) that return qualifying
+tickers AND their market caps directly, with progress printed per page.
+
+This deliberately does NOT check market cap one ticker at a time across the
+full ~8,000+-ticker Nasdaq Trader symbol directory. An earlier version of
+this module did exactly that (`fetch_market_caps`/`_get_market_cap`, still
+present below as a tested utility, but no longer used by the default build
+path) and was impractically slow in practice: `yfinance`'s `Ticker.fast_info`
+and `.info` can each trigger multiple additional sub-requests (share count,
+last price, history metadata) per ticker, so scanning thousands of
+candidates took minutes with no progress output and looked like a hang.
+
+The Nasdaq Trader symbol directories (`nasdaqlisted.txt`, `otherlisted.txt`)
+are still fetched and parsed (`build_candidate_universe`) -- not to drive
+per-ticker lookups anymore, but as a source of company name/exchange
+metadata for tickers the screener response doesn't already carry, and
+because the same warrant/right/unit/preferred/notes/fund name-pattern
+filter used there is also applied to whatever name the screener itself
+returns, as a safety net (Yahoo's screener already restricts results to
+`quoteType=EQUITY`, which excludes ETFs, but that alone doesn't guarantee
+every result is what we'd call plain common stock).
 
 SURVIVORSHIP BIAS / NOT POINT-IN-TIME (read before trusting any `us_50b`
 result): like the default hardcoded universe, this is a CURRENT SNAPSHOT of
@@ -30,6 +57,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -43,14 +71,21 @@ OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 DEFAULT_MIN_MARKET_CAP = 50_000_000_000.0
 DEFAULT_UNIVERSE_CACHE_PATH = f"{config.CACHE_DIR}/universe_us_50b.csv"
 
+# Yahoo's screener endpoint caps a single request at 250 results; paginate
+# via `offset` until a page comes back short (fewer than requested) or this
+# many pages have been fetched -- 10*250=2500 is a generous safety cap, far
+# more than the realistic few hundred US equities that clear a $50B bar.
+SCREENER_PAGE_SIZE = 250
+SCREENER_MAX_PAGES = 10
+
+# Legacy/fallback per-ticker lookup knobs -- see fetch_market_caps below.
 MARKET_CAP_BATCH_SIZE = 50
 MARKET_CAP_MAX_RETRIES = 3
 MARKET_CAP_RETRY_DELAY_SECONDS = 2.0
 
-# If more than this fraction of candidate tickers fail market-cap lookup,
-# warn loudly -- the resulting universe may be missing real >= $50B names
-# purely due to fetch/rate-limit trouble, not because they're actually
-# smaller than the threshold.
+# If more than this fraction of screener results can't be parsed for a
+# symbol/market cap, warn loudly -- Yahoo's response schema may have
+# changed, and the resulting universe may be missing real >= $50B names.
 MARKET_CAP_LOOKUP_FAILURE_WARN_FRACTION = 0.5
 
 # Below this many surviving tickers, hard-fail rather than silently running
@@ -68,6 +103,14 @@ MIN_US_50B_UNIVERSE_SIZE = 5
 _NON_COMMON_STOCK_KEYWORDS = (
     "warrant", "right", "units", " unit", "preferred", "notes", " note ", "fund",
 )
+
+
+def _name_is_non_common_stock(name: str) -> bool:
+    """Scalar version of the name-pattern check, shared by the Nasdaq
+    Trader directory filter (`_standardize_and_filter`, vectorized) and the
+    per-quote screener-result filter (`build_us_50b_universe`)."""
+    name_lower = (name or "").lower()
+    return any(keyword in name_lower for keyword in _NON_COMMON_STOCK_KEYWORDS)
 
 
 class UniverseError(Exception):
@@ -173,11 +216,7 @@ def _standardize_and_filter(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["test_issue"] != "Y"]
     df = df[df["etf"] != "Y"]
 
-    name_lower = df["name"].str.lower()
-    non_common_mask = pd.Series(False, index=df.index)
-    for keyword in _NON_COMMON_STOCK_KEYWORDS:
-        non_common_mask = non_common_mask | name_lower.str.contains(keyword, regex=False, na=False)
-    df = df[~non_common_mask]
+    df = df[~df["name"].apply(_name_is_non_common_stock)]
 
     df["yahoo_ticker"] = df["symbol"].apply(normalize_yahoo_ticker)
     df = df[df["yahoo_ticker"] != ""]
@@ -219,7 +258,90 @@ def build_candidate_universe(nasdaq_text: str, other_text: str) -> pd.DataFrame:
     return combined.drop_duplicates(subset="yahoo_ticker").reset_index(drop=True)
 
 
-# --- Market cap lookup ------------------------------------------------------
+# --- Market cap lookup: bulk screener (the default/primary path) -----------
+
+def _build_market_cap_equity_query(min_market_cap: float) -> yf.EquityQuery:
+    return yf.EquityQuery(
+        "and",
+        [
+            yf.EquityQuery("gte", ["intradaymarketcap", min_market_cap]),
+            yf.EquityQuery("eq", ["region", "us"]),
+        ],
+    )
+
+
+def _extract_quote_field(quote: dict, keys: tuple[str, ...]):
+    """Yahoo's screener response isn't formally documented/versioned by
+    yfinance, so field extraction is deliberately tolerant: try several
+    plausible key names in order, and unwrap the common Yahoo
+    `{"raw": ..., "fmt": ...}` numeric-field shape if present. Returns None
+    (never raises) if nothing usable is found -- callers count that as a
+    parse failure for one quote, not a reason to abort the whole build."""
+    for key in keys:
+        val = quote.get(key)
+        if val is None:
+            continue
+        if isinstance(val, dict):
+            val = val.get("raw")
+        if val not in (None, ""):
+            return val
+    return None
+
+
+def fetch_us_large_cap_quotes(
+    min_market_cap: float,
+    page_size: int = SCREENER_PAGE_SIZE,
+    max_pages: int = SCREENER_MAX_PAGES,
+    max_results: int | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict]:
+    """Bulk-fetch raw quote dicts for US equities with market cap >=
+    `min_market_cap` via Yahoo Finance's screener (`yf.screen`), paginating
+    with `offset` until a page returns fewer results than requested (end of
+    results), `max_pages` is reached, or `max_results` total quotes have
+    been collected. Raises UniverseError (not a raw yfinance/network
+    exception) if any page request fails -- a screener failure hard-fails
+    cleanly here rather than silently falling back to the much slower
+    per-ticker scan this function replaces."""
+    progress = progress or (lambda msg: None)
+    query = _build_market_cap_equity_query(min_market_cap)
+    quotes: list[dict] = []
+
+    for page in range(max_pages):
+        if max_results is not None and len(quotes) >= max_results:
+            break
+        offset = page * page_size
+        page_size_this_call = page_size if max_results is None else min(page_size, max_results - len(quotes))
+        progress(f"Querying market-cap screener page {page + 1} (offset {offset}, requesting {page_size_this_call})...")
+        try:
+            result = yf.screen(
+                query, offset=offset, size=page_size_this_call, sortField="intradaymarketcap", sortAsc=False,
+            )
+        except Exception as e:
+            raise UniverseError(
+                f"Market-cap screener request failed on page {page + 1}: {e}. This queries Yahoo "
+                f"Finance's screener for US equities with market cap >= ${min_market_cap:,.0f} in bulk "
+                f"instead of one request per candidate ticker; see src/universe.py's module docstring."
+            ) from e
+        page_quotes = result.get("quotes", []) if isinstance(result, dict) else []
+        quotes.extend(page_quotes)
+        progress(f"  page {page + 1}: {len(page_quotes)} quote(s) ({len(quotes)} total so far).")
+        if len(page_quotes) < page_size_this_call:
+            break
+
+    return quotes
+
+
+# --- Market cap lookup: legacy per-ticker fallback (NOT the default path) --
+#
+# Kept as a tested utility (e.g. useful for looking up a small, specific
+# ticker list) but no longer called by build_us_50b_universe's default
+# path -- see the module docstring for why the bulk screener above replaced
+# it as the default. If this WERE used to scan a large candidate list, each
+# call is still bounded by yfinance's own internal per-HTTP-request timeout
+# (~30s), so it fails a given ticker rather than hanging forever on it --
+# the practical problem was volume (thousands of sequential slow calls),
+# not any single call being literally unbounded.
 
 def _get_market_cap(ticker: str) -> float | None:
     """Current market cap for one ticker via yfinance. `fast_info` is
@@ -342,54 +464,111 @@ def load_universe_cache(cache_path: str) -> UniverseSnapshot | None:
 def build_us_50b_universe(
     min_market_cap: float = DEFAULT_MIN_MARKET_CAP,
     cache_path: str = DEFAULT_UNIVERSE_CACHE_PATH,
+    max_candidates: int | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> UniverseSnapshot:
-    """Fetch both Nasdaq Trader symbol directories, filter to plain common
-    stock, look up current market cap for every candidate, keep tickers
-    >= `min_market_cap`, cache the result, and return it. Hard-fails via
-    UniverseError if the resulting universe is too small to backtest
-    meaningfully -- see MIN_US_50B_UNIVERSE_SIZE."""
-    nasdaq_text = fetch_nasdaq_listed_text()
-    other_text = fetch_other_listed_text()
-    candidates = build_candidate_universe(nasdaq_text, other_text)
+    """Build the >= `min_market_cap` US-equity universe via Yahoo's bulk
+    screener (see module docstring for why), cache the result, and return
+    it. `max_candidates` is a debug/safety cap on how many screener results
+    to consider -- leave it None (the default) for a real run; it exists
+    for fast, bounded dev/test runs, not production use. `progress`, if
+    given, receives a line of text at each meaningful step (candidate
+    count, per-page screener progress, running qualifying count, final
+    summary) -- cli.py passes `print`. Hard-fails via UniverseError if the
+    resulting universe is too small to backtest meaningfully -- see
+    MIN_US_50B_UNIVERSE_SIZE."""
+    progress = progress or (lambda msg: None)
 
-    tickers = candidates["yahoo_ticker"].tolist()
-    market_caps, failed = fetch_market_caps(tickers)
+    # Nasdaq Trader directories supply supplementary name/exchange metadata
+    # ONLY -- the screener call below is what actually determines universe
+    # membership. A Nasdaq Trader outage is therefore not fatal on its own:
+    # fall back to empty candidate metadata (the screener's own quotes
+    # already carry a name/exchange for most results) rather than failing
+    # the whole build over a source that no longer drives ticker selection.
+    progress("Fetching Nasdaq Trader symbol directories (for company name/exchange metadata)...")
+    candidate_names: dict[str, str] = {}
+    candidate_exchanges: dict[str, str] = {}
+    try:
+        nasdaq_text = fetch_nasdaq_listed_text()
+        other_text = fetch_other_listed_text()
+        candidates = build_candidate_universe(nasdaq_text, other_text)
+        candidate_names = dict(zip(candidates["yahoo_ticker"], candidates["name"]))
+        candidate_exchanges = dict(zip(candidates["yahoo_ticker"], candidates["exchange"]))
+        progress(f"{len(candidates)} candidate US-listed common-stock tickers after Nasdaq Trader parsing/filtering.")
+    except UniverseError as e:
+        progress(f"Nasdaq Trader directories unavailable ({e}); continuing with screener-only metadata.")
 
-    total = len(tickers)
-    num_failed = len(failed)
-    if total > 0 and num_failed / total > MARKET_CAP_LOOKUP_FAILURE_WARN_FRACTION:
+    progress(f"Querying Yahoo Finance market-cap screener for US equities >= ${min_market_cap:,.0f}...")
+    quotes = fetch_us_large_cap_quotes(min_market_cap, max_results=max_candidates, progress=progress)
+    progress(f"Screener returned {len(quotes)} quote(s) total; parsing and filtering...")
+
+    market_caps: dict[str, float] = {}
+    names: dict[str, str] = {}
+    exchanges: dict[str, str] = {}
+    num_unparseable = 0
+    num_excluded_non_common = 0
+
+    for quote in quotes:
+        symbol = _extract_quote_field(quote, ("symbol",))
+        raw_cap = _extract_quote_field(quote, ("intradaymarketcap", "marketCap", "lastclosemarketcap.lasttwelvemonths"))
+        if not symbol or raw_cap is None:
+            num_unparseable += 1
+            continue
+        try:
+            cap = float(raw_cap)
+        except (TypeError, ValueError):
+            num_unparseable += 1
+            continue
+        if cap < min_market_cap:
+            continue
+
+        ticker = normalize_yahoo_ticker(str(symbol))
+        name = _extract_quote_field(quote, ("longName", "shortName", "displayName"))
+        name = str(name) if name else candidate_names.get(ticker, "")
+        if _name_is_non_common_stock(name):
+            num_excluded_non_common += 1
+            continue
+
+        market_caps[ticker] = cap
+        names[ticker] = name
+        exchange = _extract_quote_field(quote, ("exchange", "fullExchangeName", "exchDisp"))
+        exchanges[ticker] = str(exchange) if exchange else candidate_exchanges.get(ticker, "")
+        progress(f"  qualifying so far: {len(market_caps)} (latest: {ticker} = ${cap:,.0f})")
+
+    total_quotes = len(quotes)
+    if total_quotes > 0 and num_unparseable / total_quotes > MARKET_CAP_LOOKUP_FAILURE_WARN_FRACTION:
         warnings.warn(
-            f"Market-cap lookup failed for {num_failed}/{total} candidate tickers "
-            f"({num_failed / total:.0%}) -- yfinance rate limiting or network issues "
-            f"are the most likely cause. The resulting >= ${min_market_cap:,.0f} "
-            f"universe below may be missing real qualifying names."
+            f"{num_unparseable}/{total_quotes} screener results ({num_unparseable / total_quotes:.0%}) "
+            f"could not be parsed for a symbol/market cap -- Yahoo's screener response schema may have "
+            f"changed. The resulting >= ${min_market_cap:,.0f} universe below may be incomplete."
         )
 
-    qualifying = {t: cap for t, cap in market_caps.items() if cap >= min_market_cap}
-    if len(qualifying) < MIN_US_50B_UNIVERSE_SIZE:
+    progress(
+        f"Done: {len(market_caps)} qualifying tickers, {num_excluded_non_common} excluded as "
+        f"non-common-stock by name, {num_unparseable} unparseable screener result(s)."
+    )
+
+    if len(market_caps) < MIN_US_50B_UNIVERSE_SIZE:
         raise UniverseError(
-            f"Only {len(qualifying)} ticker(s) qualified for the >= ${min_market_cap:,.0f} "
-            f"universe (minimum required: {MIN_US_50B_UNIVERSE_SIZE}). Refusing to run a "
-            f"mean-reversion backtest on a degenerate universe rather than silently produce "
-            f"a near-empty backtest. {num_failed}/{total} candidate tickers failed "
-            f"market-cap lookup."
+            f"Only {len(market_caps)} ticker(s) qualified for the >= ${min_market_cap:,.0f} universe "
+            f"(minimum required: {MIN_US_50B_UNIVERSE_SIZE}). Refusing to run a mean-reversion backtest "
+            f"on a degenerate universe rather than silently produce a near-empty backtest. Screener "
+            f"returned {total_quotes} total result(s): {num_unparseable} unparseable, "
+            f"{num_excluded_non_common} excluded as non-common-stock by name."
         )
-
-    name_by_ticker = dict(zip(candidates["yahoo_ticker"], candidates["name"]))
-    exchange_by_ticker = dict(zip(candidates["yahoo_ticker"], candidates["exchange"]))
-    snapshot_date = datetime.now(timezone.utc).isoformat()
 
     snapshot = UniverseSnapshot(
-        tickers=sorted(qualifying, key=lambda t: qualifying[t], reverse=True),
-        market_caps=qualifying,
-        names={t: name_by_ticker.get(t, "") for t in qualifying},
-        exchanges={t: exchange_by_ticker.get(t, "") for t in qualifying},
-        num_candidates=total,
-        num_dropped_lookup_failed=num_failed,
-        snapshot_date=snapshot_date,
+        tickers=sorted(market_caps, key=lambda t: market_caps[t], reverse=True),
+        market_caps=market_caps,
+        names=names,
+        exchanges=exchanges,
+        num_candidates=total_quotes,
+        num_dropped_lookup_failed=num_unparseable,
+        snapshot_date=datetime.now(timezone.utc).isoformat(),
         cache_file=cache_path,
     )
     save_universe_cache(snapshot, cache_path)
+    progress(f"Universe cached to {cache_path}.")
     return snapshot
 
 
@@ -414,6 +593,8 @@ def resolve_mean_reversion_universe(
     refresh: bool = False,
     cache_path: str = DEFAULT_UNIVERSE_CACHE_PATH,
     min_market_cap: float = DEFAULT_MIN_MARKET_CAP,
+    max_candidates: int | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> UniverseResolution:
     """Single entry point cli.py uses to decide which ticker list
     mean_reversion should run with. `csv_path` (if given) always wins,
@@ -423,8 +604,10 @@ def resolve_mean_reversion_universe(
       available, no network, byte-identical to every mode's prior behavior.
     - "us_50b": current US-listed common stock >= $50B market cap. Loaded
       from `cache_path` unless `refresh` is set or the cache doesn't exist
-      yet, in which case it's rebuilt from live Nasdaq Trader + yfinance
-      data (see build_us_50b_universe).
+      yet, in which case it's rebuilt from live data via the bulk market-cap
+      screener (see build_us_50b_universe). `max_candidates`/`progress` are
+      passed straight through to that rebuild (ignored when loading from
+      cache, since there's nothing to page through or report progress on).
     - explicit csv_path: a user-supplied ticker list (own snapshot, or one
       previously cached by this module).
     """
@@ -448,7 +631,10 @@ def resolve_mean_reversion_universe(
     if mode == "us_50b":
         snapshot = None if refresh else load_universe_cache(cache_path)
         if snapshot is None:
-            snapshot = build_us_50b_universe(min_market_cap=min_market_cap, cache_path=cache_path)
+            snapshot = build_us_50b_universe(
+                min_market_cap=min_market_cap, cache_path=cache_path,
+                max_candidates=max_candidates, progress=progress,
+            )
         return UniverseResolution(tickers=snapshot.tickers, info=_snapshot_to_info(snapshot, "us_50b"))
 
     raise ValueError(f"Unknown universe mode: {mode!r}")
