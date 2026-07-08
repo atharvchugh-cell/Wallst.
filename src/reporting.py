@@ -545,6 +545,248 @@ def write_comparison_report(
     return run_dir
 
 
+# --- Tournament report: N strategies x windows vs. SPY --------------------------
+# Diagnostics only -- formats results the caller (cli.py's tournament mode /
+# src/tournament.py) already computed; no strategy parameter is touched here.
+
+# Superset of COMPARISON_METRIC_FIELDS (kept separate so the existing
+# comparison/robustness artifacts' contents don't change): adds win rate,
+# best/worst year, and time-in-market.
+TOURNAMENT_METRIC_FIELDS = [
+    ("total_return", "Total return", _fmt_pct),
+    ("cagr", "CAGR", _fmt_pct),
+    ("max_drawdown", "Max drawdown", _fmt_pct),
+    ("max_drawdown_duration_days", "Max DD duration (days)", _fmt_int),
+    ("sharpe_ratio", "Sharpe", _fmt_ratio),
+    ("sortino_ratio", "Sortino", _fmt_ratio),
+    ("calmar_ratio", "Calmar", _fmt_ratio),
+    ("win_rate", "Win rate (net, full exits)", _fmt_pct),
+    ("num_trades", "Round-trip trades", _fmt_int),
+    ("num_transactions", "Transactions", _fmt_int),
+    ("total_turnover", "Turnover ($)", _fmt_num),
+    ("total_transaction_costs", "Transaction costs ($)", _fmt_num),
+    ("cost_drag_pct", "Cost drag (% of capital)", _fmt_pct),
+    ("days_with_any_position_pct", "Time in market (any position)", _fmt_pct),
+    ("average_capital_invested_pct", "Avg capital invested", _fmt_pct),
+    ("best_month", "Best month", _fmt_pct),
+    ("worst_month", "Worst month", _fmt_pct),
+    ("best_year", "Best year", _fmt_pct),
+    ("worst_year", "Worst year", _fmt_pct),
+    ("excess_return", "Excess return vs SPY", _fmt_pct),
+    ("correlation_to_benchmark", "Correlation to SPY", _fmt_ratio),
+]
+
+TOURNAMENT_PREAMBLE = (
+    "Strategies are ranked for ROBUSTNESS and risk-adjusted performance, not "
+    "raw return. Every strategy in this table ran under the same capital, the "
+    "same transaction-cost assumption, the same requested windows, the same "
+    "canonical-calendar construction, and the same benchmark. A strategy "
+    "looking too good is grounds for suspecting a bug or a bias, not for "
+    "celebrating -- see docs/TOURNAMENT_DESIGN.md and docs/RED_TEAM.md."
+)
+ROBUSTNESS_SCORE_FORMULA_LINE = (
+    "robustness_score = mean(fraction of windows beating SPY's total return, "
+    "fraction of windows with a positive total return). Deliberately simple; "
+    "its raw components are printed alongside so the composite never has to "
+    "be trusted blindly."
+)
+
+
+def _write_tournament_summary_csv(path: Path, metrics_by_window: dict[str, dict[str, dict]]) -> None:
+    rows = []
+    for window_label, per_strategy in metrics_by_window.items():
+        for strategy_label, m in per_strategy.items():
+            row = {"window": window_label, "strategy": strategy_label}
+            for key, _name, _fmt in TOURNAMENT_METRIC_FIELDS:
+                row[key] = m.get(key)
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_tournament_table(lines: list, per_strategy: dict[str, dict], name_w: int = 30, col_w: int = 26) -> None:
+    labels = list(per_strategy.keys())
+    lines.append(f"{'Metric':<{name_w}}" + "".join(f"{lbl:>{col_w}}" for lbl in labels))
+    for key, label_name, fmt in TOURNAMENT_METRIC_FIELDS:
+        cells = "".join(f"{fmt(per_strategy[lbl].get(key)):>{col_w}}" for lbl in labels)
+        lines.append(f"{label_name:<{name_w}}{cells}")
+
+
+def write_tournament_report(
+    metrics_by_window: dict[str, dict[str, dict]],
+    window_ranges: dict[str, str],
+    describe_by_strategy: dict[str, dict],
+    run_config: dict,
+    robustness: dict[str, dict] | None = None,
+    cost_sensitivity: dict[str, dict[float, dict]] | None = None,
+    param_sensitivity: dict[str, dict[str, dict]] | None = None,
+    param_rationale: dict[str, dict[str, str]] | None = None,
+    failures: list[tuple[str, str, str]] | None = None,
+    output_dir: str = config.OUTPUT_DIR,
+) -> Path:
+    """Full tournament artifact set. `metrics_by_window` is
+    `{window_label: {strategy_or_"SPY": metrics}}`; `robustness` is the
+    per-strategy cross-window components dict (None for single-window runs);
+    `cost_sensitivity` is `{strategy: {cost_bps: metrics}}`;
+    `param_sensitivity` is `{strategy: {variant_label_or_"baseline": metrics}}`
+    with `param_rationale[strategy][variant_label]` explaining each variant;
+    `failures` lists (window, strategy, error) runs that could not complete."""
+    ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    dirname = f"{ts}_tournament_{run_config.get('requested_start', 'na')}_to_{run_config.get('requested_end', 'na')}"
+    run_dir = Path(output_dir) / dirname
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_tournament_summary_csv(run_dir / "tournament_summary.csv", metrics_by_window)
+
+    lines: list[str] = []
+    lines.append("=== Strategy Tournament Report ===")
+    lines.append("")
+    lines.append("** RESEARCH / EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. **")
+    lines.append("Past performance does not indicate future results. No live trades were placed.")
+    lines.append("")
+    lines.append(TOURNAMENT_PREAMBLE)
+    lines.append("")
+    lines.append(EXECUTION_MODEL_LINE)
+    lines.append(ADJUSTED_PRICE_LINE)
+    lines.append(PRETAX_WARNING_LINE)
+    lines.append(SURVIVORSHIP_WARNING)
+    lines.append("")
+    lines.append(f"Requested window: {run_config.get('requested_start')} to {run_config.get('requested_end')}")
+    lines.append(f"Capital: ${run_config.get('capital', 0):,.2f}  |  Cost assumption: {run_config.get('cost_bps')} bps")
+    lines.append(f"Strategies: {', '.join(run_config.get('strategies', []))}")
+    lines.append(f"Windows tested: {', '.join(window_ranges.keys())}")
+    for w, rng in window_ranges.items():
+        lines.append(f"  {w}: {rng}")
+
+    if failures:
+        lines.append("")
+        lines.append("--- Runs that could NOT complete (excluded from tables below) ---")
+        for window_label, strategy_label, err in failures:
+            lines.append(f"  [{window_label}] {strategy_label}: {err}")
+
+    for window_label, per_strategy in metrics_by_window.items():
+        lines.append("")
+        lines.append(f"--- Window {window_label} ({window_ranges.get(window_label, 'n/a')}) ---")
+        _write_tournament_table(lines, per_strategy)
+
+    if robustness:
+        lines.append("")
+        lines.append("--- Cross-window robustness (per strategy) ---")
+        lines.append(ROBUSTNESS_SCORE_FORMULA_LINE)
+        name_w, col_w = 26, 16
+        header = (
+            f"{'Strategy':<{name_w}}{'windows':>{col_w}}{'beats SPY %':>{col_w}}"
+            f"{'positive %':>{col_w}}{'worst DD':>{col_w}}{'dispersion':>{col_w}}{'SCORE':>{col_w}}"
+        )
+        lines.append(header)
+        for strat, comp in sorted(robustness.items(), key=lambda kv: -kv[1]["robustness_score"]):
+            lines.append(
+                f"{strat:<{name_w}}{comp['num_windows']:>{col_w}}"
+                f"{_fmt_pct(comp['pct_windows_beats_spy_return']):>{col_w}}"
+                f"{_fmt_pct(comp['pct_windows_positive_return']):>{col_w}}"
+                f"{_fmt_pct(comp['worst_window_max_drawdown']):>{col_w}}"
+                f"{_fmt_pct(comp['return_dispersion']):>{col_w}}"
+                f"{_fmt_ratio(comp['robustness_score']):>{col_w}}"
+            )
+
+    if cost_sensitivity:
+        lines.append("")
+        lines.append("--- Cost sensitivity (total return / excess vs SPY at each cost level) ---")
+        lines.append(
+            "A strategy whose excess return vs SPY flips sign as costs rise has no "
+            "margin for real-world frictions (spreads, slippage) beyond the modeled "
+            "per-trade cost -- treat it as NOT beating SPY."
+        )
+        cost_rows = []
+        for strat, by_cost in cost_sensitivity.items():
+            for bps, m in sorted(by_cost.items()):
+                cost_rows.append({
+                    "strategy": strat, "cost_bps": bps,
+                    "total_return": m.get("total_return"),
+                    "excess_return_vs_spy": m.get("excess_return"),
+                    "cost_drag_pct": m.get("cost_drag_pct"),
+                })
+                lines.append(
+                    f"  {strat:<26}{bps:>6.1f} bps   total {_fmt_pct(m.get('total_return')):>10}   "
+                    f"excess vs SPY {_fmt_pct(m.get('excess_return')):>10}   "
+                    f"cost drag {_fmt_pct(m.get('cost_drag_pct')):>8}"
+                )
+            base_excess = by_cost.get(min(by_cost), {}).get("excess_return")
+            worst_excess = by_cost.get(max(by_cost), {}).get("excess_return")
+            if base_excess is not None and worst_excess is not None and base_excess > 0 and worst_excess <= 0:
+                lines.append(f"  ^ WARNING: {strat}'s edge vs SPY disappears at higher costs (sign flip).")
+        pd.DataFrame(cost_rows).to_csv(run_dir / "cost_sensitivity.csv", index=False)
+
+    if param_sensitivity:
+        lines.append("")
+        lines.append("--- Parameter sensitivity (small disclosed variants; NEVER auto-selected) ---")
+        lines.append(
+            "Each variant nudges ONE disclosed knob (rationale shown). Large spread "
+            "between variants = fragile parameter = weaker evidence. No variant's "
+            "result is ever promoted to a default by this report."
+        )
+        param_rows = []
+        for strat, by_variant in param_sensitivity.items():
+            lines.append(f"  {strat}:")
+            for variant_label, m in by_variant.items():
+                rationale = (param_rationale or {}).get(strat, {}).get(variant_label, "")
+                param_rows.append({
+                    "strategy": strat, "variant": variant_label,
+                    "total_return": m.get("total_return"),
+                    "sharpe_ratio": m.get("sharpe_ratio"),
+                    "max_drawdown": m.get("max_drawdown"),
+                    "excess_return_vs_spy": m.get("excess_return"),
+                    "rationale": rationale,
+                })
+                lines.append(
+                    f"    {variant_label:<18} total {_fmt_pct(m.get('total_return')):>10}   "
+                    f"Sharpe {_fmt_ratio(m.get('sharpe_ratio')):>6}   "
+                    f"maxDD {_fmt_pct(m.get('max_drawdown')):>9}   "
+                    f"excess {_fmt_pct(m.get('excess_return')):>10}"
+                    + (f"   ({rationale})" if rationale else "")
+                )
+            returns = [m.get("total_return") for m in by_variant.values() if m.get("total_return") is not None]
+            excesses = [m.get("excess_return") for m in by_variant.values() if m.get("excess_return") is not None]
+            if len(returns) > 1:
+                spread = max(returns) - min(returns)
+                lines.append(f"    -> total-return spread across variants: {_fmt_pct(spread)}")
+            if excesses and min(excesses) <= 0 <= max(excesses):
+                lines.append(
+                    "    -> WARNING: beat-SPY conclusion FLIPS across these variants -- "
+                    "treat this strategy's edge as parameter-fragile."
+                )
+        pd.DataFrame(param_rows).to_csv(run_dir / "param_sensitivity.csv", index=False)
+
+    lines.append("")
+    lines.append("--- Strategy assumptions & parameters (self-declared via describe()) ---")
+    for strat, info in describe_by_strategy.items():
+        lines.append(f"  {strat} (family: {info.get('family')}, universe size: {info.get('universe_size')})")
+        for k, v in (info.get("params") or {}).items():
+            lines.append(f"    param {k} = {v}")
+        for a in info.get("assumptions") or []:
+            lines.append(f"    ! {a}")
+
+    with open(run_dir / "tournament_report.txt", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    json_payload = {
+        "run_config": run_config,
+        "windows": window_ranges,
+        "results": metrics_by_window,
+        "robustness": robustness,
+        "cost_sensitivity": (
+            {s: {str(b): m for b, m in bc.items()} for s, bc in cost_sensitivity.items()}
+            if cost_sensitivity else None
+        ),
+        "param_sensitivity": param_sensitivity,
+        "describe_by_strategy": describe_by_strategy,
+        "failures": failures,
+    }
+    with open(run_dir / "tournament.json", "w") as f:
+        json.dump(json_payload, f, indent=2, default=str)
+
+    return run_dir
+
+
 # --- Robustness report: allocation mixes x historical windows vs. SPY ---
 # Diagnostics only -- see src/robustness.py's module docstring for why
 # allocation mixes are capital-weighted blends rather than separately

@@ -18,6 +18,7 @@ from .base import Strategy, TargetEvent
 
 class SectorRotationStrategy(Strategy):
     name = "sector_rotation"
+    family = "momentum"
 
     def __init__(
         self,
@@ -39,6 +40,22 @@ class SectorRotationStrategy(Strategy):
     def reset(self) -> None:
         super().reset()
         self._last_rebalance_month = None
+
+    def describe(self) -> dict:
+        info = super().describe()
+        info["params"] = {
+            "lookback_months": self.lookback_months,
+            "top_k": self.top_k,
+        }
+        info["assumptions"] = [
+            "Always fully invested in the top-K sectors, even in a broad bear market "
+            "(ranks 'least bad' sectors rather than de-risking).",
+            f"top_k={self.top_k} was re-tuned mid-development (see config.py comments) -- "
+            "treat single-window results as in-sample.",
+            "Universe is the 11 fixed SPDR sector ETFs; earliest usable start is bounded "
+            "by XLC's 2018 inception + the lookback.",
+        ]
+        return info
 
     def prepare(
         self, price_data: dict[str, pd.DataFrame], calendar: pd.DatetimeIndex, start: pd.Timestamp

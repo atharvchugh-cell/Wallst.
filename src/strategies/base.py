@@ -40,9 +40,32 @@ class TargetEvent:
 class Strategy(abc.ABC):
     name: str
     universe: list[str]
+    # Human-readable strategy-family label for tournament grouping/reporting
+    # (e.g. "mean_reversion", "momentum", "regime_switch"). Purely metadata.
+    family: str = "unspecified"
+    # Tickers the strategy needs PRICE DATA for but must never trade (e.g.
+    # SPY as a market-regime signal). The tournament data-fetch layer unions
+    # these with `universe`; they are structurally untradable because every
+    # entry/exit loop iterates `self.universe` only, and these are not in it.
+    signal_tickers: list[str] = []
 
     def __init__(self) -> None:
         self.dropped_tickers: list[tuple[str, str]] = []
+
+    def describe(self) -> dict:
+        """Metadata for tournament reporting: name/family/universe size plus
+        subclass-supplied `params` (every knob and its value -- nothing
+        hidden) and `assumptions` (plain-language statements a reader must
+        accept before trusting this strategy's results). Subclasses override
+        and extend; the base implementation reports what it can see."""
+        return {
+            "name": self.name,
+            "family": self.family,
+            "universe_size": len(self.universe),
+            "signal_tickers": list(self.signal_tickers),
+            "params": {},
+            "assumptions": [],
+        }
 
     def reset(self) -> None:
         """Reset all internal mutable state before a run. Subclasses with

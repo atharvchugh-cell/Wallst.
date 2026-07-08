@@ -59,6 +59,36 @@ SECTOR_TOP_K = 2                # reduced from 3 for more concentrated momentum 
 # months" effective-start calculation, to comfortably cover month-end alignment.
 SECTOR_WARMUP_BUFFER_CALENDAR_DAYS = 40
 
+# --- Momentum / trend following (tournament strategy; does not affect the
+# --- two original strategies) ---
+# Parameter-choice principle (see docs/TOURNAMENT_DESIGN.md section 3): these
+# are the most-cited, decades-old conventions in the literature -- 6-month
+# cross-sectional momentum (Jegadeesh-Titman) and the 200-day SMA trend line
+# (Faber) -- chosen for canonical status, NOT tuned against this repo's data.
+MOMENTUM_LOOKBACK_TRADING_DAYS = 126   # ~6 months of trading days
+MOMENTUM_TOP_K = 5                     # matches mean reversion's 5 slots at 20% each
+MOMENTUM_TREND_SMA_PERIOD = 200        # classic long-term trend filter
+# 200-day SMA + 126-day lookback needs ~330 valid trading days before the
+# first walk day (~470 calendar days); 500 gives comfortable slack.
+MOMENTUM_WARMUP_CALENDAR_DAYS = 500
+
+# --- Market-regime filter (shared by mean_reversion_filtered and
+# --- regime_switch, so there is exactly ONE regime definition in the repo) ---
+REGIME_TICKER = "SPY"
+REGIME_SMA_PERIOD = 200
+# A 200-trading-day regime SMA needs ~290 calendar days of history before
+# the first walk day; 500 gives comfortable slack (also covers the baseline
+# mean-reversion indicators, which need far less).
+REGIME_WARMUP_CALENDAR_DAYS = 500
+
+# --- Filtered mean reversion (tournament strategy) ---
+# Falling-knife guard: skip an RSI-oversold entry candidate whose trailing
+# 5-trading-day return is <= -15%. A round, severe, DISCLOSED heuristic (a
+# -15% week is an event, not a dip), not a fitted threshold -- see
+# docs/TOURNAMENT_DESIGN.md section 3.2.
+FILTERED_MR_KNIFE_LOOKBACK_TRADING_DAYS = 5
+FILTERED_MR_KNIFE_RETURN_THRESHOLD = -0.15
+
 # --- Data layer ---
 CACHE_DIR = "data_cache"
 CACHE_REFRESH_THRESHOLD_DAYS = 7
