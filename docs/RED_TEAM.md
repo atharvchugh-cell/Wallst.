@@ -27,6 +27,19 @@ sector-rotation-on-ETFs) are biased IN FAVOR of the stock strategies.
 Momentum beating sector rotation in this tournament is weak evidence;
 sector rotation beating momentum despite momentum's tailwind is strong.
 
+**Partial mitigation — the look-ahead half of the problem is now fixed, the
+selection half is not.** A current-$50B `us_50b` snapshot contains names that
+did not exist for older windows (ARM, GEV, HOOD, SNOW, ABNB, APP, RKLB, …).
+Running them in, say, a 2019 window would be a *look-ahead* error (trading a
+company before it was public). The tournament now filters, per strategy and
+per window, to tickers with enough listing history to warm up that strategy's
+indicators for that window, excluding the rest with an explicit reason
+(reported per strategy/window). That removes the look-ahead artifact and the
+noisy degraded runs it caused. It does NOT remove survivorship bias: the
+universe is still *today's* survivors, so within any window the members are
+the ones that went on to reach $50B and stay listed. Treat the filter as
+"no longer also wrong about listing dates," not as "survivorship-corrected."
+
 ### A2. The incumbents' defaults are in-sample tuned; the challengers' are not
 `config.py` records that mean reversion's RSI 35 / SMA-30 / 10-day timeout
 and sector rotation's top-2 were re-tuned mid-development against one

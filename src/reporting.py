@@ -590,6 +590,14 @@ ROBUSTNESS_SCORE_FORMULA_LINE = (
     "its raw components are printed alongside so the composite never has to "
     "be trusted blindly."
 )
+ROBUSTNESS_COVERAGE_LINE = (
+    "Denominators are the number of windows the strategy was EXPECTED to run "
+    "(every window that ran for at least one strategy), NOT just the windows it "
+    "survived -- so a missing/failed window counts against the score exactly "
+    "like a lost one, and a strategy that only cleared its easy windows cannot "
+    "outrank a full-coverage peer. The 'ran/exp' column shows coverage; any "
+    "strategy with missing windows is flagged below the table."
+)
 
 
 def _write_tournament_summary_csv(path: Path, metrics_by_window: dict[str, dict[str, dict]]) -> None:
@@ -621,6 +629,7 @@ def write_tournament_report(
     param_sensitivity: dict[str, dict[str, dict]] | None = None,
     param_rationale: dict[str, dict[str, str]] | None = None,
     failures: list[tuple[str, str, str]] | None = None,
+    universe_exclusions: dict[str, dict[str, list]] | None = None,
     output_dir: str = config.OUTPUT_DIR,
 ) -> Path:
     """Full tournament artifact set. `metrics_by_window` is
@@ -629,7 +638,11 @@ def write_tournament_report(
     `cost_sensitivity` is `{strategy: {cost_bps: metrics}}`;
     `param_sensitivity` is `{strategy: {variant_label_or_"baseline": metrics}}`
     with `param_rationale[strategy][variant_label]` explaining each variant;
-    `failures` lists (window, strategy, error) runs that could not complete."""
+    `failures` lists (window, strategy, error) runs that could not complete;
+    `universe_exclusions` is `{window: {strategy: [(ticker, reason), ...]}}`
+    of tickers dropped per strategy/window (insufficient listing history for
+    that window, no data, or in-range gaps) -- surfaced so a survivorship-
+    biased snapshot universe's per-window exclusions are explicit."""
     ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
     dirname = f"{ts}_tournament_{run_config.get('requested_start', 'na')}_to_{run_config.get('requested_end', 'na')}"
     run_dir = Path(output_dir) / dirname
@@ -663,6 +676,29 @@ def write_tournament_report(
         for window_label, strategy_label, err in failures:
             lines.append(f"  [{window_label}] {strategy_label}: {err}")
 
+    if universe_exclusions:
+        lines.append("")
+        lines.append("--- Per-strategy/window universe exclusions (listing-history filter) ---")
+        lines.append(
+            "Tickers dropped for a specific strategy/window because they lacked enough "
+            "listing history to warm up that strategy's indicators for that window (a "
+            "current-snapshot universe like us_50b contains names that did not exist for "
+            "older windows). These are EXCLUDED, not run with missing history -- so the "
+            "same rules run only on names actually tradable in each window. The full "
+            "per-ticker reason list is in each strategy/window's own report.txt."
+        )
+        for window_label in metrics_by_window:
+            per_strategy = universe_exclusions.get(window_label)
+            if not per_strategy:
+                continue
+            lines.append(f"  Window {window_label}:")
+            for strategy_label, dropped in per_strategy.items():
+                if not dropped:
+                    continue
+                sample = ", ".join(t for t, _r in dropped[:8])
+                more = f", +{len(dropped) - 8} more" if len(dropped) > 8 else ""
+                lines.append(f"    {strategy_label}: {len(dropped)} excluded ({sample}{more})")
+
     for window_label, per_strategy in metrics_by_window.items():
         lines.append("")
         lines.append(f"--- Window {window_label} ({window_ranges.get(window_label, 'n/a')}) ---")
@@ -672,21 +708,38 @@ def write_tournament_report(
         lines.append("")
         lines.append("--- Cross-window robustness (per strategy) ---")
         lines.append(ROBUSTNESS_SCORE_FORMULA_LINE)
+        lines.append(ROBUSTNESS_COVERAGE_LINE)
         name_w, col_w = 26, 16
         header = (
-            f"{'Strategy':<{name_w}}{'windows':>{col_w}}{'beats SPY %':>{col_w}}"
+            f"{'Strategy':<{name_w}}{'ran/exp':>{col_w}}{'beats SPY %':>{col_w}}"
             f"{'positive %':>{col_w}}{'worst DD':>{col_w}}{'dispersion':>{col_w}}{'SCORE':>{col_w}}"
         )
         lines.append(header)
+        incomplete = []
         for strat, comp in sorted(robustness.items(), key=lambda kv: -kv[1]["robustness_score"]):
+            ran = comp.get("num_windows_ran", comp.get("num_windows"))
+            exp = comp.get("num_windows_expected", ran)
+            coverage = f"{ran}/{exp}"
+            flag = "" if comp.get("full_coverage", ran == exp) else "  <- INCOMPLETE"
             lines.append(
-                f"{strat:<{name_w}}{comp['num_windows']:>{col_w}}"
+                f"{strat:<{name_w}}{coverage:>{col_w}}"
                 f"{_fmt_pct(comp['pct_windows_beats_spy_return']):>{col_w}}"
                 f"{_fmt_pct(comp['pct_windows_positive_return']):>{col_w}}"
                 f"{_fmt_pct(comp['worst_window_max_drawdown']):>{col_w}}"
                 f"{_fmt_pct(comp['return_dispersion']):>{col_w}}"
-                f"{_fmt_ratio(comp['robustness_score']):>{col_w}}"
+                f"{_fmt_ratio(comp['robustness_score']):>{col_w}}{flag}"
             )
+            if comp.get("num_missing_windows", 0) > 0:
+                incomplete.append((strat, comp["num_missing_windows"], exp))
+        if incomplete:
+            lines.append("")
+            for strat, missing, exp in incomplete:
+                lines.append(
+                    f"  ! {strat} is missing {missing} of {exp} expected windows -- its score is "
+                    f"penalized for them (they count as neither positive nor beating SPY). Missing "
+                    f"windows usually mean the strategy FAILED there (e.g. too few tickers with "
+                    f"enough history); do not read its score as validated over the full period."
+                )
 
     if cost_sensitivity:
         lines.append("")

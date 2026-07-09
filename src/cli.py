@@ -157,6 +157,19 @@ def run_mean_reversion_sleeve(
     if excluded_today:
         warnings.append("Excluded today's bar (not finalized at fetch time); effective end shifted back one trading day.")
 
+    # Per-window listing-history filter: exclude any universe ticker that
+    # lacks enough history to warm up mean reversion's indicators for THIS
+    # window (e.g. a current-$50B name via --universe us_50b that IPO'd after
+    # the window start). A NO-OP for the default hardcoded universe, whose
+    # members all predate any window -- so default-universe behavior is
+    # unchanged -- and only bites survivorship-biased snapshot universes.
+    present_universe = [t for t in strat.universe if t in price_data]
+    _hist_kept, history_excluded = data.filter_by_sufficient_history(
+        price_data, present_universe, start, config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS
+    )
+    for t, _reason in history_excluded:
+        price_data.pop(t, None)
+
     calendar_in_range = full_calendar[(full_calendar >= pd.Timestamp(start)) & (full_calendar <= pd.Timestamp(end))]
     gap_dropped: list[tuple[str, str]] = []
     clean_price_data = {}
@@ -168,7 +181,7 @@ def run_mean_reversion_sleeve(
         clean_price_data[ticker] = df
 
     strat.universe = [t for t in strat.universe if t in clean_price_data]
-    pre_drops = list(fetch_dropped) + gap_dropped
+    pre_drops = list(fetch_dropped) + history_excluded + gap_dropped
 
     min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
     if len(strat.universe) < min_required:
@@ -472,6 +485,12 @@ def run_tournament(args: argparse.Namespace) -> int:
     metrics_by_window: dict[str, dict[str, dict]] = {}
     window_ranges: dict[str, str] = {}
     failures: list[tuple[str, str, str]] = []
+    # {window_label: {strategy: [(ticker, reason), ...]}} -- tickers dropped
+    # for THIS strategy/window (insufficient listing history, no data for the
+    # window, or in-range gaps). Surfaced in the tournament report so the
+    # us_50b current-universe/listing-history exclusions are explicit, never
+    # silent.
+    universe_exclusions: dict[str, dict[str, list]] = {}
 
     for window_label, w_start, w_end in windows:
         print(f"\n=== Tournament window {window_label}: {w_start} to {w_end} ===")
@@ -486,9 +505,13 @@ def run_tournament(args: argparse.Namespace) -> int:
                 continue
             results_by_strategy[name] = result
             per_strategy_metrics[name] = metrics
+            dropped = list(getattr(result, "dropped_tickers", []) or [])
+            if dropped:
+                universe_exclusions.setdefault(window_label, {})[name] = dropped
             print(
                 f"  [{window_label}] {name}: total_return={metrics.get('total_return'):.2%}  "
                 f"maxDD={metrics.get('max_drawdown'):.2%}  sharpe={metrics.get('sharpe_ratio'):.2f}"
+                f"  ({len(result.universe)} tickers, {len(dropped)} excluded for this window)"
             )
         if not per_strategy_metrics:
             continue
@@ -585,17 +608,22 @@ def run_tournament(args: argparse.Namespace) -> int:
         metrics_by_window, window_ranges, describe_by_strategy, run_config,
         robustness=robustness, cost_sensitivity=cost_sensitivity,
         param_sensitivity=param_sensitivity, param_rationale=param_rationale,
-        failures=failures or None, output_dir=args.output_dir,
+        failures=failures or None, universe_exclusions=universe_exclusions or None,
+        output_dir=args.output_dir,
     )
     print(f"\n[tournament] artifacts written to: {run_dir}")
     if robustness:
         print("[tournament] robustness scores (mean of beats-SPY-fraction and positive-return-fraction):")
         for strat, comp in sorted(robustness.items(), key=lambda kv: -kv[1]["robustness_score"]):
+            worst_dd = comp.get("worst_window_max_drawdown")
+            worst_dd_str = f"{worst_dd:.2%}" if worst_dd is not None else "n/a"
+            coverage = f"{comp.get('num_windows_ran', comp['num_windows'])}/{comp.get('num_windows_expected', comp['num_windows'])}"
+            flag = "" if comp.get("full_coverage", True) else f"  [INCOMPLETE: missing {comp.get('num_missing_windows', 0)} window(s), score penalized]"
             print(
                 f"  {strat}: score={comp['robustness_score']:.2f} "
-                f"(beats SPY {comp['pct_windows_beats_spy_return']:.0%} of {comp['num_windows']} windows, "
-                f"positive {comp['pct_windows_positive_return']:.0%}, "
-                f"worst window maxDD {comp['worst_window_max_drawdown']:.2%})"
+                f"(beats SPY {comp['pct_windows_beats_spy_return']:.0%} / positive "
+                f"{comp['pct_windows_positive_return']:.0%} of {coverage} expected windows, "
+                f"worst window maxDD {worst_dd_str}){flag}"
             )
     return 0
 

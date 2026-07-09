@@ -37,6 +37,104 @@ def mocked_data(monkeypatch):
     return frames
 
 
+def test_cli_tournament_us_50b_excludes_insufficient_history_ticker_per_window(tmp_path, monkeypatch):
+    # Concern #12 / #5: a current-snapshot us_50b universe contains a name
+    # (here YOUNGCO) that did not exist for an older window. It must be
+    # EXCLUDED from the window it lacks history for -- cleanly, with a
+    # reason, and without failing the run -- while still being usable in a
+    # later window it does have history for. This drives the real per-window
+    # code path, not a mocked happy path where every ticker has full history.
+    full = pd.bdate_range("1990-01-01", "2024-12-31")
+    # IPO'd mid-2021: absent for the 2020 window entirely, but with enough
+    # history by the 2023-06 window for BOTH strategies' warmups (momentum
+    # 500d, mean reversion 200d).
+    young = pd.bdate_range("2021-06-01", "2024-12-31")
+
+    def frame(dates, seed):
+        rng = np.random.default_rng(seed)
+        base = 100.0 + np.cumsum(rng.normal(0.02, 0.5, size=len(dates)))
+        base = np.clip(base, 10.0, None)
+        return pd.DataFrame(
+            {"Open": base, "High": base, "Low": base, "Close": base, "Volume": 1000}, index=dates
+        )
+
+    old_tickers = ["OLD1", "OLD2", "OLD3", "OLD4", "OLD5"]
+    universe = old_tickers + ["YOUNGCO"]
+
+    def fake_get_price_data(tickers, start, end, warmup_calendar_days, hard_fail_on_missing, **kw):
+        # Mirrors the real data.get_price_data contract: a ticker with no bars
+        # in the requested (warmup-adjusted) range is reported in `dropped`
+        # with a reason, NOT silently omitted -- this is what a young ticker
+        # like YOUNGCO does in an older window.
+        out, dropped = {}, []
+        fetch_start = pd.Timestamp(start) - pd.Timedelta(days=warmup_calendar_days)
+        for t in tickers:
+            dates = young if t == "YOUNGCO" else full
+            df = frame(dates, abs(hash(t)) % 10_000)
+            df = df[(df.index >= fetch_start) & (df.index <= pd.Timestamp(end))]
+            if df.empty:
+                dropped.append((t, f"Empty history for {t}"))
+            else:
+                out[t] = df
+        return out, dropped
+
+    def fake_get_benchmark_data(start, end, **kw):
+        df = frame(full, 999)
+        return df[(df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))]
+
+    fake_resolution = cli.universe_module.UniverseResolution(
+        tickers=universe,
+        info={"mode": "us_50b", "num_selected": len(universe), "num_candidates": None,
+              "num_dropped_lookup_failed": None, "num_excluded_not_listed": None,
+              "num_excluded_non_common": None, "num_excluded_identity_mismatch": None,
+              "num_excluded_no_price_data": None, "num_duplicate_companies_collapsed": None,
+              "min_market_cap": None, "max_market_cap": None, "cache_file": None,
+              "snapshot_date": None, "price_data_validated_start": None, "price_data_validated_end": None},
+    )
+    monkeypatch.setattr(cli.universe_module, "resolve_mean_reversion_universe", lambda **kw: fake_resolution)
+    monkeypatch.setattr(cli.data, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(cli.data, "get_benchmark_data", fake_get_benchmark_data)
+    monkeypatch.setattr(tournament.data, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(tournament.data, "get_benchmark_data", fake_get_benchmark_data)
+
+    # momentum (stock plan) + mean_reversion (incumbent runner) both must
+    # apply the filter; an early window YOUNGCO can't warm up in, and a late
+    # window it can.
+    exit_code = cli.main([
+        "--strategy", "tournament", "--universe", "us_50b",
+        "--start", "2020-01-01", "--end", "2024-12-31",
+        "--capital", "15000", "--output-dir", str(tmp_path),
+        "--tournament-strategies", "momentum,mean_reversion",
+        "--tournament-windows", "2020-01-01:2020-12-31,2023-06-01:2024-12-31",
+    ])
+    assert exit_code == 0
+
+    t_dir = list(tmp_path.glob("*_tournament_*"))[0]
+    report = (t_dir / "tournament_report.txt").read_text()
+    assert "Per-strategy/window universe exclusions" in report
+    assert "YOUNGCO" in report  # excluded somewhere, explicitly named
+
+    # YOUNGCO was excluded in the EARLY window's per-strategy run reports...
+    early_reports = list(tmp_path.glob("*_momentum_2020-01-01_to_2020-12-31*/report.txt")) + \
+        list(tmp_path.glob("*_mean_reversion_2020-01-01_to_2020-12-31*/report.txt"))
+    assert early_reports, "no early-window run reports were written"
+    assert any("YOUNGCO" in p.read_text() for p in early_reports)
+
+    # ...but NOT dropped in the late window it has history for: its late-window
+    # run report must not list YOUNGCO as a dropped ticker.
+    late_reports = list(tmp_path.glob("*_momentum_2023-06-01_to_2024-12-31*/report.txt")) + \
+        list(tmp_path.glob("*_mean_reversion_2023-06-01_to_2024-12-31*/report.txt"))
+    assert late_reports, "no late-window run reports were written"
+    for p in late_reports:
+        text = p.read_text()
+        dropped_section = text.split("Dropped tickers:")[1] if "Dropped tickers:" in text else ""
+        assert "YOUNGCO" not in dropped_section, f"YOUNGCO wrongly dropped in late window: {p}"
+
+    # The run did NOT fail -- both strategies produced rows in both windows.
+    summary = pd.read_csv(t_dir / "tournament_summary.csv")
+    assert set(summary["window"]) == {"2020-2020", "2023-2024"}
+
+
 # --- Registry & configuration sanity ------------------------------------------
 
 def test_registry_contains_all_five_strategies_with_expected_plans():
@@ -102,15 +200,93 @@ def test_robustness_components_math():
     assert b["robustness_score"] == pytest.approx(0.5)
 
 
-def test_robustness_components_skips_missing_windows_without_counting_them_as_losses():
+def test_failed_window_cannot_inflate_score_above_full_coverage_peer():
+    # The core anti-inflation guarantee. FRAGILE beats SPY in the one easy
+    # window it survives and FAILS (is absent from) the hard window that its
+    # peer ROBUST completed. ROBUST beats SPY in one of its two windows.
+    # A naive "average only the windows you survived" score would hand
+    # FRAGILE 1.0 and ROBUST 0.5 -- ranking the strategy that blew up in the
+    # hard window ABOVE the one that showed up for both. The fix must not.
+    all_window_metrics = {
+        "easy": {"FRAGILE": {"total_return": 0.20, "max_drawdown": -0.03},
+                 "ROBUST": {"total_return": 0.10, "max_drawdown": -0.06}},
+        "hard": {"ROBUST": {"total_return": -0.02, "max_drawdown": -0.25}},
+        # FRAGILE absent from "hard" -- it failed there.
+    }
+    spy_by_window = {"easy": {"total_return": 0.05}, "hard": {"total_return": 0.05}}
+    comps = tournament.robustness_components(all_window_metrics, spy_by_window)
+
+    fragile, robust = comps["FRAGILE"], comps["ROBUST"]
+    # FRAGILE was EXPECTED in both windows (ROBUST ran "hard"), ran only 1.
+    assert fragile["num_windows_expected"] == 2
+    assert fragile["num_windows_ran"] == 1
+    assert fragile["num_missing_windows"] == 1
+    assert fragile["full_coverage"] is False
+    # Its beat is counted out of 2 expected windows, not 1 survived -> 0.5.
+    assert fragile["pct_windows_beats_spy_return"] == pytest.approx(0.5)
+    assert fragile["pct_windows_positive_return"] == pytest.approx(0.5)
+    assert fragile["robustness_score"] == pytest.approx(0.5)
+
+    assert robust["full_coverage"] is True
+    assert robust["num_windows_ran"] == 2
+    # ROBUST: beats SPY in "easy" only (0.5), positive in "easy" only (0.5).
+    assert robust["robustness_score"] == pytest.approx(0.5)
+
+    # The decisive property: failing the hard window did NOT let FRAGILE
+    # outrank the full-coverage peer.
+    assert fragile["robustness_score"] <= robust["robustness_score"]
+
+
+def test_failing_more_windows_strictly_lowers_score_all_else_equal():
+    # Two strategies that both beat SPY and go positive in every window they
+    # run; the only difference is FLAKY is absent from one window a peer ran.
+    # FLAKY must score strictly lower -- missing windows are penalized.
+    all_window_metrics = {
+        "w1": {"STEADY": {"total_return": 0.10, "max_drawdown": -0.05},
+               "FLAKY": {"total_return": 0.10, "max_drawdown": -0.05}},
+        "w2": {"STEADY": {"total_return": 0.10, "max_drawdown": -0.05},
+               "FLAKY": {"total_return": 0.10, "max_drawdown": -0.05}},
+        "w3": {"STEADY": {"total_return": 0.10, "max_drawdown": -0.05}},  # FLAKY failed here
+    }
+    spy = {w: {"total_return": 0.0} for w in all_window_metrics}
+    comps = tournament.robustness_components(all_window_metrics, spy)
+    assert comps["STEADY"]["robustness_score"] == pytest.approx(1.0)  # 3/3 beats + positive
+    assert comps["FLAKY"]["robustness_score"] == pytest.approx(2 / 3)  # 2 of 3 EXPECTED
+    assert comps["FLAKY"]["robustness_score"] < comps["STEADY"]["robustness_score"]
+
+
+def test_window_dead_for_all_strategies_penalizes_no_one():
+    # A window where NO strategy produced a result is a tournament-level
+    # infra/data failure, not a strategy-specific one -- it must be dropped
+    # from the EXPECTED set for everyone, penalizing nobody.
     all_window_metrics = {
         "w1": {"A": {"total_return": 0.10, "max_drawdown": -0.05}},
-        "w2": {},  # A missing here entirely (e.g. failed run)
+        "w2": {},  # nobody ran here
     }
     spy_by_window = {"w1": {"total_return": 0.05}, "w2": {"total_return": 0.05}}
     comps = tournament.robustness_components(all_window_metrics, spy_by_window)
-    assert comps["A"]["num_windows"] == 1
+    assert comps["A"]["num_windows_expected"] == 1  # w2 excluded for everyone
+    assert comps["A"]["full_coverage"] is True
+    assert comps["A"]["num_missing_windows"] == 0
     assert comps["A"]["pct_windows_beats_spy_return"] == pytest.approx(1.0)
+
+
+def test_strategy_absent_from_every_expected_window_scores_zero_not_hidden():
+    # A strategy that FAILED every window a peer ran must still appear, with
+    # a floor score of 0 and full missing coverage -- never silently dropped
+    # from the table (which would hide the failure).
+    all_window_metrics = {
+        "w1": {"WINNER": {"total_return": 0.10, "max_drawdown": -0.05},
+               "DEAD": {"total_return": None}},
+        "w2": {"WINNER": {"total_return": 0.08, "max_drawdown": -0.04}},
+    }
+    spy_by_window = {"w1": {"total_return": 0.05}, "w2": {"total_return": 0.05}}
+    comps = tournament.robustness_components(all_window_metrics, spy_by_window)
+    assert "DEAD" in comps
+    assert comps["DEAD"]["robustness_score"] == pytest.approx(0.0)
+    assert comps["DEAD"]["num_windows_ran"] == 0
+    assert comps["DEAD"]["num_missing_windows"] == comps["DEAD"]["num_windows_expected"]
+    assert comps["DEAD"]["full_coverage"] is False
 
 
 # --- Generic runner equivalence with the incumbent standalone runners -----------

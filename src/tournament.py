@@ -282,6 +282,21 @@ def _run_stock_plan(
     if excluded_today:
         warnings.append("Excluded today's bar (not finalized at fetch time).")
 
+    # Per-window, per-strategy listing-history filter: exclude universe
+    # tickers that lack enough history to warm up THIS strategy's indicators
+    # for THIS window (e.g. a current-$50B name that IPO'd after the window
+    # start). Applied to the tradable universe only -- signal tickers (SPY)
+    # go through their own required-history/gap path below. Fetch-failed
+    # tickers keep their own `fetch_dropped` reason; this adds the
+    # partial-history exclusions on top, so nothing missing-history is
+    # silently treated as valid.
+    present_universe = [t for t in strategy.universe if t in price_data]
+    _hist_kept, history_excluded = data.filter_by_sufficient_history(
+        price_data, present_universe, start, warmup_days
+    )
+    for t, _reason in history_excluded:
+        price_data.pop(t, None)
+
     calendar_in_range = full_calendar[
         (full_calendar >= pd.Timestamp(start)) & (full_calendar <= pd.Timestamp(end))
     ]
@@ -301,7 +316,7 @@ def _run_stock_plan(
         clean_price_data[ticker] = df
 
     strategy.universe = [t for t in strategy.universe if t in clean_price_data]
-    pre_drops = list(fetch_dropped) + gap_dropped
+    pre_drops = list(fetch_dropped) + history_excluded + gap_dropped
 
     min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
     if len(strategy.universe) < min_required:
@@ -321,6 +336,11 @@ def _run_stock_plan(
     metrics = compute_all_metrics(result, benchmark_close=spy_df["Close"])
     run_config = _base_run_config(strategy, result, start, end, capital, cost_bps, fractional_shares, warnings)
     run_config["cache_summary"] = f"{len(clean_price_data)} tickers used, {len(pre_drops)} dropped"
+    run_config["num_history_excluded"] = len(history_excluded)
+    run_config["num_universe_window_excluded"] = len(pre_drops)
+    run_config["universe_window_excluded"] = [
+        {"ticker": t, "reason": r} for t, r in pre_drops
+    ]
     return result, metrics, run_config
 
 
@@ -401,24 +421,53 @@ def robustness_components(
 ) -> dict[str, dict]:
     """Per-strategy robustness components across windows, plus the composite
     `robustness_score = mean(pct_windows_beats_spy_return,
-    pct_windows_positive_return)`. The composite is deliberately this simple
-    -- and its components are always reported next to it -- so nobody has to
-    trust an opaque number. Windows where a strategy has no result are
-    excluded from that strategy's fractions (they don't count as losses),
-    but `num_windows` shows how many windows actually contributed."""
+    pct_windows_positive_return)`.
+
+    A strategy that FAILS or is missing in a window it was expected to run
+    must NOT come out looking stronger than one that ran everywhere -- a
+    strategy that only survived its one easy window should not score 1.0
+    while a full-coverage peer that beat SPY in 4 of 6 windows scores 0.67.
+    So the fraction denominators are the number of windows the strategy was
+    EXPECTED to run (every window that genuinely ran for at least one
+    strategy), NOT just the windows it happened to survive. A missing/failed
+    window therefore counts as neither a beat nor a positive -- i.e. it
+    counts against the score, exactly as a lost window would.
+
+    Windows in which NO strategy produced a result at all (a tournament-level
+    data/infrastructure failure, not a strategy-specific one) are excluded
+    from the expected set for everyone, so they penalize no one.
+
+    Reported per strategy: `num_windows_ran` (coverage numerator),
+    `num_windows_expected` (denominator), `num_missing_windows`, and
+    `full_coverage` -- so incomplete coverage is always visible next to the
+    score rather than silently baked into a flattering fraction. `num_windows`
+    is kept as an alias of `num_windows_ran` for backward compatibility."""
     strategies = sorted({s for wm in all_window_metrics.values() for s in wm})
+
+    def _window_ran(per_strategy: dict) -> bool:
+        return any(m is not None and m.get("total_return") is not None for m in per_strategy.values())
+
+    ranked_windows = [w for w, per in all_window_metrics.items() if _window_ran(per)]
+    num_expected = len(ranked_windows)
     out: dict[str, dict] = {}
+    if num_expected == 0:
+        return out
+
     for strat in strategies:
         total_returns: list[float] = []
         beats_spy = 0
         positive = 0
-        counted = 0
+        ran = 0
         worst_dd = None
-        for window_label, per_strategy in all_window_metrics.items():
-            m = per_strategy.get(strat)
+        for window_label in ranked_windows:
+            m = all_window_metrics[window_label].get(strat)
             if m is None or m.get("total_return") is None:
+                # Expected (a peer ran this window) but this strategy did not:
+                # a missing/failed window. It contributes to the denominator
+                # via num_expected below but adds nothing to beats/positive,
+                # so it drags the score down instead of being quietly dropped.
                 continue
-            counted += 1
+            ran += 1
             tr = m["total_return"]
             total_returns.append(tr)
             if tr > 0:
@@ -429,13 +478,27 @@ def robustness_components(
             dd = m.get("max_drawdown")
             if dd is not None and (worst_dd is None or dd < worst_dd):
                 worst_dd = dd
-        if counted == 0:
+        if ran == 0:
+            # Never ran in any expected window -- still emit a visibly-worst
+            # row (score 0, all windows missing) rather than vanishing from
+            # the table, so a strategy that failed everywhere can't hide.
+            out[strat] = {
+                "num_windows": 0, "num_windows_ran": 0, "num_windows_expected": num_expected,
+                "num_missing_windows": num_expected, "full_coverage": False,
+                "pct_windows_beats_spy_return": 0.0, "pct_windows_positive_return": 0.0,
+                "worst_window_max_drawdown": None, "return_dispersion": 0.0,
+                "robustness_score": 0.0,
+            }
             continue
-        beats_frac = beats_spy / counted
-        pos_frac = positive / counted
+        beats_frac = beats_spy / num_expected
+        pos_frac = positive / num_expected
         dispersion = float(pd.Series(total_returns).std(ddof=0)) if len(total_returns) > 1 else 0.0
         out[strat] = {
-            "num_windows": counted,
+            "num_windows": ran,  # backward-compat alias of num_windows_ran
+            "num_windows_ran": ran,
+            "num_windows_expected": num_expected,
+            "num_missing_windows": num_expected - ran,
+            "full_coverage": ran == num_expected,
             "pct_windows_beats_spy_return": beats_frac,
             "pct_windows_positive_return": pos_frac,
             "worst_window_max_drawdown": worst_dd,

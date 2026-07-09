@@ -5,6 +5,7 @@ the canonical trading calendar used to drive the backtest walk.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -16,6 +17,18 @@ import pandas as pd
 import yfinance as yf
 
 from . import config
+
+# yfinance logs a per-ticker "possibly delisted; no price data found" message
+# (at WARNING level, to its own logger) whenever a requested range returns no
+# bars. That is EXPECTED and already handled here -- a ticker that IPO'd after
+# a window start legitimately has no data for an older window, and callers
+# exclude it explicitly (see filter_by_sufficient_history / get_price_data's
+# `dropped`). Left at default level it produces dozens of near-identical
+# stderr lines during an older-window us_50b run, drowning out the structured
+# exclusion report. Raise the threshold to ERROR so genuine yfinance errors
+# still surface but the delisted/no-data noise does not. Our own FetchError
+# and warnings.warn calls are unaffected.
+logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 
 class FetchError(Exception):
@@ -290,6 +303,58 @@ def find_gaps(df: pd.DataFrame, calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
     active_calendar = calendar[calendar >= df.index.min()]
     reindexed = df.reindex(active_calendar)
     return reindexed[reindexed["Close"].isna()].index
+
+
+def filter_by_sufficient_history(
+    price_data: dict[str, pd.DataFrame],
+    tickers: list[str],
+    window_start,
+    warmup_calendar_days: int,
+    tolerance_days: int = 7,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split `tickers` into (kept, excluded) by whether each has enough
+    listing history to be a valid member for a backtest window starting at
+    `window_start`, given a strategy that needs `warmup_calendar_days` of
+    pre-window history to warm up its indicators.
+
+    A ticker is KEPT only if its earliest available bar is on or before the
+    warmup cutoff (`window_start - warmup_calendar_days`, plus a small
+    `tolerance_days` slack so a cutoff landing on a weekend/holiday isn't
+    treated as missing history). A ticker whose first bar is after that --
+    i.e. it IPO'd during or shortly before the window and never had the
+    required warmup -- is EXCLUDED with an explicit reason, rather than
+    silently run with missing early history (which would either sit dead for
+    much of the window or, worse, start trading partway through as if it had
+    always been listed). Tickers absent from `price_data` entirely (fetch
+    returned nothing for this window -- typically listed after the window
+    end) are excluded too.
+
+    This is the current-universe/listing-history guard for survivorship-biased
+    snapshot universes like `us_50b`: today's >= $50B list contains names
+    (ARM, GEV, HOOD, SNOW, ABNB, ...) that did not exist for older windows.
+    For a universe whose members all predate the window (e.g. the default
+    hardcoded 25 mega-caps), this is a no-op -- every ticker is kept."""
+    required_start = pd.Timestamp(window_start) - pd.Timedelta(days=warmup_calendar_days)
+    cutoff = required_start + pd.Timedelta(days=tolerance_days)
+    kept: list[str] = []
+    excluded: list[tuple[str, str]] = []
+    for t in tickers:
+        df = price_data.get(t)
+        if df is None or df.empty:
+            excluded.append((t, f"no price data for this window (listed after {pd.Timestamp(window_start).date()} "
+                                f"or delisted before it)"))
+            continue
+        first_bar = df.index.min()
+        if first_bar > cutoff:
+            excluded.append((
+                t,
+                f"insufficient history for this window: first bar {first_bar.date()} is after the "
+                f"warmup cutoff {cutoff.date()} (needs data back to ~{required_start.date()} to warm "
+                f"up over the {warmup_calendar_days}-day buffer before {pd.Timestamp(window_start).date()})",
+            ))
+            continue
+        kept.append(t)
+    return kept, excluded
 
 
 def exclude_unfinalized_today(calendar: pd.DatetimeIndex) -> tuple[pd.DatetimeIndex, bool]:
