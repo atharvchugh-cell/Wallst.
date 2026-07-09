@@ -32,6 +32,7 @@ class _PositionState:
 
 class MeanReversionStrategy(Strategy):
     name = "mean_reversion"
+    family = "mean_reversion"
 
     def __init__(
         self,
@@ -86,6 +87,35 @@ class MeanReversionStrategy(Strategy):
         self.universe = kept_universe
         self._state = {t: _PositionState() for t in self.universe}
         return enriched
+
+    def describe(self) -> dict:
+        info = super().describe()
+        info["params"] = {
+            "rsi_period": self.rsi_period,
+            "rsi_entry_threshold": self.rsi_entry,
+            "rsi_exit_threshold": self.rsi_exit,
+            "sma_period": self.sma_period,
+            "stop_loss_pct": self.stop_loss_pct,
+            "max_holding_days": self.max_holding_days,
+            "max_concurrent_positions": self.max_concurrent_positions,
+        }
+        info["assumptions"] = [
+            "Universe is survivorship-biased (today's large caps, not point-in-time).",
+            "Default thresholds were re-tuned mid-development against historical data "
+            "(see config.py comments) -- treat single-window results as in-sample.",
+            "The stop-loss is a delayed close-to-close exit rule, not an intraday stop.",
+            "Short holding periods mean gains are mostly short-term (higher tax rates).",
+        ]
+        return info
+
+    def _entry_allowed(self, ticker: str, day: pd.Timestamp, market: MarketDataView) -> bool:
+        """Entry-eligibility hook, called once per RSI-qualified candidate on
+        its signal day. The BASELINE strategy always returns True -- this
+        exists solely so subclasses (mean_reversion_filtered) can veto
+        entries with additional filters without duplicating any of the
+        entry/exit/slot machinery. Exits are deliberately NOT routed through
+        any hook: a risk-reducing exit must never be vetoed by a filter."""
+        return True
 
     def on_day(self, day: pd.Timestamp, market: MarketDataView, sleeve_equity: float) -> list[TargetEvent]:
         events: list[TargetEvent] = []
@@ -155,7 +185,7 @@ class MeanReversionStrategy(Strategy):
                 if st.status != "flat" or not market.has_data(ticker, day):
                     continue
                 rsi_val = market.indicator(ticker, "RSI_14", day)
-                if pd.notna(rsi_val) and rsi_val < self.rsi_entry:
+                if pd.notna(rsi_val) and rsi_val < self.rsi_entry and self._entry_allowed(ticker, day, market):
                     candidates.append((rsi_val, ticker))
             candidates.sort(key=lambda pair: pair[0])  # lowest RSI (most oversold) first
             for rsi_val, ticker in candidates[:free_slots]:

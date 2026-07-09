@@ -135,6 +135,21 @@ def annual_returns(equity: pd.Series, years: list[int] | None = None) -> dict[in
     return result
 
 
+def best_worst_year(equity: pd.Series) -> dict:
+    """Best/worst calendar-year return over the equity curve, via
+    annual_returns (whose first-year figure is partial-year, not fabricated
+    full-year -- see its docstring). NaN when the curve doesn't span at
+    least two calendar years, where a single (possibly partial) year would
+    be a meaningless 'best AND worst'."""
+    if len(equity) == 0 or len(set(equity.index.year)) < 2:
+        return {"best_year": float("nan"), "worst_year": float("nan")}
+    yearly = annual_returns(equity)
+    if not yearly:
+        return {"best_year": float("nan"), "worst_year": float("nan")}
+    vals = list(yearly.values())
+    return {"best_year": float(max(vals)), "worst_year": float(min(vals))}
+
+
 def spy_standalone_metrics(spy_close: pd.Series) -> dict:
     """Absolute (not benchmark-relative) performance of SPY itself over the
     given date range, formatted with the same key names used by
@@ -161,6 +176,7 @@ def spy_standalone_metrics(spy_close: pd.Series) -> dict:
         "excess_return": 0.0,
     }
     metrics.update(best_worst_month(spy_close))
+    metrics.update(best_worst_year(spy_close))
     return metrics
 
 
@@ -309,6 +325,7 @@ def compute_all_metrics(result: BacktestResult, benchmark_close: pd.Series | Non
         "final_equity": float(equity.iloc[-1]) if len(equity) else result.capital,
     }
     metrics.update(best_worst_month(equity))
+    metrics.update(best_worst_year(equity))
     metrics.update(exposure_stats(result.positions, result.universe))
     if benchmark_close is not None:
         metrics.update(benchmark_metrics(equity, benchmark_close))

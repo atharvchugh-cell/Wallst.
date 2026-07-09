@@ -11,11 +11,13 @@ import pandas as pd
 import yfinance as yf
 
 from . import config, data
+from . import tournament as tournament_module
 from . import universe as universe_module
 from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
 from .reporting import (
     write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
+    write_tournament_report,
 )
 from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
@@ -31,7 +33,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy",
-        choices=["mean_reversion", "sector_rotation", "both", "compare", "robustness"],
+        choices=["mean_reversion", "sector_rotation", "both", "compare", "robustness", "tournament"],
         required=True,
     )
     today = pd.Timestamp.now().normalize()
@@ -54,6 +56,31 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Comma-separated start:end windows for --strategy robustness, e.g. "
         "'2019-01-01:2021-12-31,2020-01-01:2022-12-31' (default: the 5 standard windows "
         "2019-2021/2020-2022/2021-2023/2022-2024/2019-2024). Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--tournament-strategies", default=None,
+        help="Comma-separated strategy names for --strategy tournament (default: all "
+        f"registered: {','.join(tournament_module.STRATEGY_REGISTRY)}). Ignored for "
+        "other --strategy values.",
+    )
+    parser.add_argument(
+        "--tournament-windows", default=None,
+        help="Windows for --strategy tournament: omit for one window spanning --start/--end; "
+        "'regimes' for the named bull/bear/choppy presets (see src/tournament.py); or "
+        "explicit 'start:end,start:end,...'. Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--tournament-cost-bps-list", default=None,
+        help="Comma-separated per-trade cost levels in bps (e.g. '0,5,10,20') for --strategy "
+        "tournament's cost-sensitivity section, each a full re-run of every strategy over "
+        "--start/--end. Omit to skip cost sensitivity. Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--tournament-param-sensitivity", action="store_true",
+        help="Run --strategy tournament's small, disclosed parameter-sensitivity variants "
+        "(see src/tournament.py PARAM_SENSITIVITY_VARIANTS -- a few variants per strategy, "
+        "each with a written rationale, NEVER auto-selected). Off by default; adds one "
+        "re-run per variant over --start/--end.",
     )
     parser.add_argument(
         "--universe",
@@ -130,6 +157,19 @@ def run_mean_reversion_sleeve(
     if excluded_today:
         warnings.append("Excluded today's bar (not finalized at fetch time); effective end shifted back one trading day.")
 
+    # Per-window listing-history filter: exclude any universe ticker that
+    # lacks enough history to warm up mean reversion's indicators for THIS
+    # window (e.g. a current-$50B name via --universe us_50b that IPO'd after
+    # the window start). A NO-OP for the default hardcoded universe, whose
+    # members all predate any window -- so default-universe behavior is
+    # unchanged -- and only bites survivorship-biased snapshot universes.
+    present_universe = [t for t in strat.universe if t in price_data]
+    _hist_kept, history_excluded = data.filter_by_sufficient_history(
+        price_data, present_universe, start, config.MEAN_REVERSION_WARMUP_CALENDAR_DAYS
+    )
+    for t, _reason in history_excluded:
+        price_data.pop(t, None)
+
     calendar_in_range = full_calendar[(full_calendar >= pd.Timestamp(start)) & (full_calendar <= pd.Timestamp(end))]
     gap_dropped: list[tuple[str, str]] = []
     clean_price_data = {}
@@ -141,7 +181,7 @@ def run_mean_reversion_sleeve(
         clean_price_data[ticker] = df
 
     strat.universe = [t for t in strat.universe if t in clean_price_data]
-    pre_drops = list(fetch_dropped) + gap_dropped
+    pre_drops = list(fetch_dropped) + history_excluded + gap_dropped
 
     min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
     if len(strat.universe) < min_required:
@@ -363,6 +403,231 @@ def run_robustness(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_tournament(args: argparse.Namespace) -> int:
+    """Run every requested strategy under identical conditions (same capital,
+    cost assumption, windows, calendar construction, benchmark) and write one
+    side-by-side tournament report. Each strategy runs at the FULL --capital
+    -- the tournament compares alternatives for the same account, it does not
+    split capital into simultaneous sleeves (that's --strategy both/compare).
+
+    The two incumbent strategies run through the SAME sleeve runners their
+    standalone modes use, so their tournament rows are identical to their
+    standalone results; newer strategies and all sensitivity re-runs go
+    through tournament.run_tournament_sleeve, which is regression-tested to
+    reproduce the incumbent runners' equity curves exactly."""
+    fractional_shares = not args.no_fractional_shares
+    windows = tournament_module.parse_tournament_windows(args.tournament_windows, args.start, args.end)
+
+    if args.tournament_strategies:
+        names = [n.strip() for n in args.tournament_strategies.split(",") if n.strip()]
+        unknown = [n for n in names if n not in tournament_module.STRATEGY_REGISTRY]
+        if unknown:
+            print(
+                f"Error: unknown tournament strategies {unknown}; registered: "
+                f"{list(tournament_module.STRATEGY_REGISTRY)}", file=sys.stderr,
+            )
+            return 1
+    else:
+        names = list(tournament_module.STRATEGY_REGISTRY)
+
+    cost_bps_levels: list[float] = []
+    if args.tournament_cost_bps_list:
+        try:
+            cost_bps_levels = [float(x.strip()) for x in args.tournament_cost_bps_list.split(",")]
+        except ValueError:
+            print(f"Error: could not parse --tournament-cost-bps-list {args.tournament_cost_bps_list!r}", file=sys.stderr)
+            return 1
+        if any(b < 0 for b in cost_bps_levels):
+            print("Error: --tournament-cost-bps-list values must be >= 0", file=sys.stderr)
+            return 1
+
+    needs_stock_universe = any(
+        tournament_module.STRATEGY_REGISTRY[n].uses_stock_universe for n in names
+    )
+    mr_universe = None
+    if needs_stock_universe:
+        try:
+            union_start = min(pd.Timestamp(w_start) for _l, w_start, _e in windows)
+            union_end = max(pd.Timestamp(w_end) for _l, _s, w_end in windows)
+            mr_universe = resolve_mean_reversion_universe(args, backtest_start=union_start, backtest_end=union_end)
+        except (universe_module.UniverseError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    def _run_one(name: str, w_start, w_end, cost_bps: float, overrides=None, warmup=None, artifacts=True):
+        spec = tournament_module.STRATEGY_REGISTRY[name]
+        if overrides is None and artifacts:
+            # Baseline table rows for the incumbents go through their own
+            # standalone runners -- guaranteed identical to standalone modes.
+            if name == "mean_reversion":
+                result, metrics, _cfg, _dir = run_mean_reversion_sleeve(
+                    w_start, w_end, args.capital, cost_bps, fractional_shares,
+                    args.refresh_cache, args.output_dir,
+                    universe=mr_universe.tickers if mr_universe else None,
+                    universe_info=mr_universe.info if mr_universe else None,
+                )
+                return result, metrics
+            if name == "sector_rotation":
+                result, metrics, _cfg, _dir = run_sector_rotation_sleeve(
+                    w_start, w_end, args.capital, cost_bps, fractional_shares,
+                    args.refresh_cache, args.output_dir,
+                )
+                return result, metrics
+        run = tournament_module.run_tournament_sleeve(
+            spec, w_start, w_end, args.capital, cost_bps, fractional_shares,
+            args.refresh_cache, args.output_dir,
+            universe=mr_universe.tickers if (mr_universe and spec.uses_stock_universe) else None,
+            universe_info=mr_universe.info if (mr_universe and spec.uses_stock_universe) else None,
+            param_overrides=overrides, warmup_override=warmup, write_artifacts=artifacts,
+        )
+        return run.result, run.metrics
+
+    metrics_by_window: dict[str, dict[str, dict]] = {}
+    window_ranges: dict[str, str] = {}
+    failures: list[tuple[str, str, str]] = []
+    # {window_label: {strategy: [(ticker, reason), ...]}} -- tickers dropped
+    # for THIS strategy/window (insufficient listing history, no data for the
+    # window, or in-range gaps). Surfaced in the tournament report so the
+    # us_50b current-universe/listing-history exclusions are explicit, never
+    # silent.
+    universe_exclusions: dict[str, dict[str, list]] = {}
+
+    for window_label, w_start, w_end in windows:
+        print(f"\n=== Tournament window {window_label}: {w_start} to {w_end} ===")
+        results_by_strategy: dict = {}
+        per_strategy_metrics: dict[str, dict] = {}
+        for name in names:
+            try:
+                result, metrics = _run_one(name, w_start, w_end, args.cost_bps)
+            except (data.FetchError, ValueError, tournament_module.TournamentError) as e:
+                print(f"  [{window_label}] {name} FAILED: {e}", file=sys.stderr)
+                failures.append((window_label, name, str(e)))
+                continue
+            results_by_strategy[name] = result
+            per_strategy_metrics[name] = metrics
+            dropped = list(getattr(result, "dropped_tickers", []) or [])
+            if dropped:
+                universe_exclusions.setdefault(window_label, {})[name] = dropped
+            print(
+                f"  [{window_label}] {name}: total_return={metrics.get('total_return'):.2%}  "
+                f"maxDD={metrics.get('max_drawdown'):.2%}  sharpe={metrics.get('sharpe_ratio'):.2f}"
+                f"  ({len(result.universe)} tickers, {len(dropped)} excluded for this window)"
+            )
+        if not per_strategy_metrics:
+            continue
+        spy_row = tournament_module.spy_row_for_window(results_by_strategy, refresh_cache=args.refresh_cache)
+        if spy_row is not None:
+            spy_metrics, spy_range = spy_row
+            per_strategy_metrics["SPY"] = spy_metrics
+            window_ranges[window_label] = f"{w_start} to {w_end} (SPY row over common range {spy_range})"
+        else:
+            window_ranges[window_label] = f"{w_start} to {w_end}"
+        metrics_by_window[window_label] = per_strategy_metrics
+
+    if not metrics_by_window:
+        print("Error: tournament produced no usable strategy runs.", file=sys.stderr)
+        return 1
+
+    robustness = None
+    if len(metrics_by_window) > 1:
+        spy_by_window = {w: m.get("SPY", {}) for w, m in metrics_by_window.items()}
+        strat_only = {
+            w: {s: m for s, m in wm.items() if s != "SPY"} for w, wm in metrics_by_window.items()
+        }
+        robustness = tournament_module.robustness_components(strat_only, spy_by_window)
+
+    cost_sensitivity = None
+    if cost_bps_levels:
+        print("\n=== Cost sensitivity (full --start/--end window) ===")
+        cost_sensitivity = {}
+        for name in names:
+            by_cost: dict[float, dict] = {}
+            for bps in cost_bps_levels:
+                try:
+                    _result, metrics = _run_one(name, args.start, args.end, bps, artifacts=False)
+                except (data.FetchError, ValueError, tournament_module.TournamentError) as e:
+                    failures.append((f"cost_{bps}bps", name, str(e)))
+                    continue
+                by_cost[bps] = metrics
+            if by_cost:
+                cost_sensitivity[name] = by_cost
+
+    param_sensitivity = None
+    param_rationale: dict[str, dict[str, str]] = {}
+    if args.tournament_param_sensitivity:
+        print("\n=== Parameter sensitivity (full --start/--end window) ===")
+        param_sensitivity = {}
+        for name in names:
+            variants = tournament_module.PARAM_SENSITIVITY_VARIANTS.get(name, [])
+            if not variants:
+                continue
+            by_variant: dict[str, dict] = {}
+            rationales: dict[str, str] = {}
+            try:
+                _result, baseline_metrics = _run_one(name, args.start, args.end, args.cost_bps, artifacts=False)
+                by_variant["baseline"] = baseline_metrics
+                rationales["baseline"] = "shipped defaults, re-run through the same generic runner"
+            except (data.FetchError, ValueError, tournament_module.TournamentError) as e:
+                failures.append(("param_baseline", name, str(e)))
+            for variant_label, overrides, rationale, warmup in variants:
+                try:
+                    _result, metrics = _run_one(
+                        name, args.start, args.end, args.cost_bps,
+                        overrides=overrides, warmup=warmup, artifacts=False,
+                    )
+                except (data.FetchError, ValueError, tournament_module.TournamentError) as e:
+                    failures.append((f"param_{variant_label}", name, str(e)))
+                    continue
+                by_variant[variant_label] = metrics
+                rationales[variant_label] = rationale
+            if by_variant:
+                param_sensitivity[name] = by_variant
+                param_rationale[name] = rationales
+
+    describe_by_strategy = {}
+    for name in names:
+        spec = tournament_module.STRATEGY_REGISTRY[name]
+        if spec.uses_stock_universe and mr_universe is not None:
+            describe_by_strategy[name] = spec.factory(universe=mr_universe.tickers).describe()
+        else:
+            describe_by_strategy[name] = spec.factory().describe()
+
+    run_config = {
+        "requested_start": str(pd.Timestamp(args.start).date()),
+        "requested_end": str(pd.Timestamp(args.end).date()),
+        "capital": args.capital,
+        "cost_bps": args.cost_bps,
+        "fractional_shares": fractional_shares,
+        "strategies": names,
+        "windows": [label for label, _s, _e in windows],
+        "universe_mode": args.universe,
+        "capital_note": "each strategy runs at the FULL --capital (alternatives for one "
+                        "account, not simultaneous sleeves)",
+    }
+    run_dir = write_tournament_report(
+        metrics_by_window, window_ranges, describe_by_strategy, run_config,
+        robustness=robustness, cost_sensitivity=cost_sensitivity,
+        param_sensitivity=param_sensitivity, param_rationale=param_rationale,
+        failures=failures or None, universe_exclusions=universe_exclusions or None,
+        output_dir=args.output_dir,
+    )
+    print(f"\n[tournament] artifacts written to: {run_dir}")
+    if robustness:
+        print("[tournament] robustness scores (mean of beats-SPY-fraction and positive-return-fraction):")
+        for strat, comp in sorted(robustness.items(), key=lambda kv: -kv[1]["robustness_score"]):
+            worst_dd = comp.get("worst_window_max_drawdown")
+            worst_dd_str = f"{worst_dd:.2%}" if worst_dd is not None else "n/a"
+            coverage = f"{comp.get('num_windows_ran', comp['num_windows'])}/{comp.get('num_windows_expected', comp['num_windows'])}"
+            flag = "" if comp.get("full_coverage", True) else f"  [INCOMPLETE: missing {comp.get('num_missing_windows', 0)} window(s), score penalized]"
+            print(
+                f"  {strat}: score={comp['robustness_score']:.2f} "
+                f"(beats SPY {comp['pct_windows_beats_spy_return']:.0%} / positive "
+                f"{comp['pct_windows_positive_return']:.0%} of {coverage} expected windows, "
+                f"worst window maxDD {worst_dd_str}){flag}"
+            )
+    return 0
+
+
 def _print_summary(label: str, metrics: dict, run_dir) -> None:
     print(f"\n[{label}] total_return={metrics.get('total_return'):.2%}  "
           f"cagr={metrics.get('cagr'):.2%}  max_drawdown={metrics.get('max_drawdown'):.2%}  "
@@ -380,6 +645,9 @@ def main(argv=None) -> int:
 
     if args.strategy == "robustness":
         return run_robustness(args)
+
+    if args.strategy == "tournament":
+        return run_tournament(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None

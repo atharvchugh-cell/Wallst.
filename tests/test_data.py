@@ -262,3 +262,69 @@ def test_benchmark_does_not_hard_fail_when_short_end_is_a_weekend(monkeypatch):
     monkeypatch.setattr(data_module, "get_price_history", fake_get_price_history)
     result = data_module.get_benchmark_data("2024-12-01", "2024-12-29")  # a Sunday
     assert result.index.max() == dates.max()  # no exception -- weekend shortfall is expected
+
+
+# --- filter_by_sufficient_history: per-window listing-history guard ------------
+
+def test_filter_by_sufficient_history_keeps_full_history_excludes_young_and_missing():
+    window_start = "2019-01-01"
+    warmup = 200
+    # OLD has data reaching well before the warmup cutoff (2018-06-15-ish);
+    # YOUNG IPO'd mid-2021 (long after the window start); GONE has no data at
+    # all for this window (empty frame).
+    old_dates = pd.bdate_range("2015-01-01", "2024-12-31")
+    young_dates = pd.bdate_range("2021-06-01", "2024-12-31")
+    price_data = {
+        "OLD": make_df(old_dates),
+        "YOUNG": make_df(young_dates),
+        "GONE": pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]),
+    }
+    kept, excluded = data_module.filter_by_sufficient_history(
+        price_data, ["OLD", "YOUNG", "GONE"], window_start, warmup
+    )
+    assert kept == ["OLD"]
+    excluded_map = dict(excluded)
+    assert set(excluded_map) == {"YOUNG", "GONE"}
+    assert "insufficient history" in excluded_map["YOUNG"]
+    assert "no price data" in excluded_map["GONE"]
+    # Every exclusion carries a human-readable reason (never silent).
+    assert all(reason for _t, reason in excluded)
+
+
+def test_filter_by_sufficient_history_is_a_noop_for_a_universe_that_predates_the_window():
+    # The default-universe guarantee: every member has deep history, so the
+    # filter excludes nobody -- behavior for the hardcoded universe is
+    # unchanged by adding this filter.
+    dates = pd.bdate_range("1995-01-01", "2024-12-31")
+    price_data = {t: make_df(dates) for t in ["AAA", "BBB", "CCC"]}
+    kept, excluded = data_module.filter_by_sufficient_history(
+        price_data, ["AAA", "BBB", "CCC"], "2019-01-01", 200
+    )
+    assert kept == ["AAA", "BBB", "CCC"]
+    assert excluded == []
+
+
+def test_filter_by_sufficient_history_tolerance_allows_cutoff_on_a_weekend():
+    # A ticker whose first bar is a few days after the exact warmup cutoff
+    # (because the cutoff landed on a weekend/holiday) must NOT be wrongly
+    # excluded -- the small tolerance covers that.
+    window_start = pd.Timestamp("2020-01-02")
+    warmup = 100
+    required_start = window_start - pd.Timedelta(days=warmup)  # 2019-09-24
+    # First bar 3 days after required_start -- within the 7-day tolerance.
+    dates = pd.bdate_range(required_start + pd.Timedelta(days=3), "2021-12-31")
+    price_data = {"BORDER": make_df(dates)}
+    kept, excluded = data_module.filter_by_sufficient_history(
+        price_data, ["BORDER"], window_start, warmup
+    )
+    assert kept == ["BORDER"]
+    assert excluded == []
+
+
+def test_yfinance_logger_quieted_to_reduce_delisted_noise():
+    # The noisy per-ticker "possibly delisted; no price data found" lines are
+    # suppressed by raising the yfinance logger threshold (importing data.py
+    # sets it). Our own FetchError/warnings are unaffected -- exclusions are
+    # still reported structurally.
+    import logging
+    assert logging.getLogger("yfinance").level >= logging.ERROR
