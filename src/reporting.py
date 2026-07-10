@@ -28,8 +28,9 @@ from .robustness import (  # noqa: E402
     rank_allocations,
 )
 
-if TYPE_CHECKING:  # avoid a runtime import cycle (reporting <- portfolio <- tournament <- reporting)
+if TYPE_CHECKING:  # avoid a runtime import cycle (reporting <- portfolio/walk_forward <- tournament <- reporting)
     from .portfolio import PortfolioResult
+    from .walk_forward import WalkForwardResult
 
 EXECUTION_MODEL_LINE = (
     "Execution model: close-to-close, one-day signal-to-fill lag, "
@@ -1339,3 +1340,203 @@ def write_portfolio_report(
         json.dump(json_out, f, indent=2, default=str)
 
     return run_dir
+
+
+# --- Walk-forward report: out-of-sample validation across (train, test) folds ---
+# Diagnostics only -- formats a WalkForwardResult the caller (cli.py's
+# walk_forward mode / src/walk_forward.py) already computed.
+
+WALK_FORWARD_SURVIVORSHIP_DISCLOSURE = (
+    "WALK-FORWARD SCOPE: this validates that the portfolio's PARAMETERS are not "
+    "overfit -- it evaluates only on test periods that did not influence the "
+    "parameters used. It does NOT fix survivorship bias: the stock universe is a "
+    "CURRENT snapshot of today's survivors (not a point-in-time constituent "
+    "list) in EVERY fold, so even a clean out-of-sample result here is not "
+    "evidence of a general, tradable edge. See docs/RED_TEAM.md A1 and the "
+    "README's Known Limitations."
+)
+
+
+def _selected_variants_str(selected: dict[str, str]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in selected.items())
+
+
+def _write_walk_forward_folds_csv(path: Path, wf: "WalkForwardResult") -> None:
+    rows = []
+    for f in wf.folds:
+        rows.append({
+            "fold": f.index,
+            "train_start": f.train_start.date(),
+            "train_end": f.train_end.date(),
+            "test_start": f.test_start.date(),
+            "test_end": f.test_end.date(),
+            "actual_test_range": f.actual_test_range,
+            "start_capital": f.start_capital,
+            "final_equity": f.final_equity,
+            "portfolio_test_return": f.test_return,
+            "spy_test_return": f.spy_return,
+            "excess_return": f.excess_return,
+            "max_drawdown": f.max_drawdown,
+            "sharpe_ratio": f.sharpe_ratio,
+            "transaction_costs": f.transaction_costs,
+            "selected_variants": _selected_variants_str(f.selected_variants),
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_walk_forward_equity_csv(path: Path, wf: "WalkForwardResult") -> None:
+    """The stitched out-of-sample equity curve. A `fold` column tags each date
+    with the fold whose TEST period it belongs to, making it self-evident that
+    the stitched curve contains only test-period dates."""
+    rows = []
+    for f in wf.folds:
+        eq = f.portfolio_result.combined_result.equity_curve
+        for d, v in eq.items():
+            rows.append({"date": d.date(), "equity": float(v), "fold": f.index})
+    df = pd.DataFrame(rows).drop_duplicates(subset="date", keep="first")
+    df.to_csv(path, index=False)
+
+
+def _write_walk_forward_txt(path: Path, wf: "WalkForwardResult") -> None:
+    agg = wf.aggregate
+    lines = []
+    lines.append("=== Walk-Forward / Out-of-Sample Validation Report ===")
+    lines.append("")
+    lines.append("** RESEARCH / EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. **")
+    lines.append("Past performance does not indicate future results. No live trades were placed.")
+    lines.append("")
+    lines.append(WALK_FORWARD_SURVIVORSHIP_DISCLOSURE)
+    lines.append("")
+    mode = "OPTIMIZE (per-sleeve variant ranked on training, frozen for test)" if wf.optimize \
+        else "FIXED parameters (shipped defaults; NO parameter selection -- clean baseline)"
+    lines.append(f"Mode: {mode}")
+    lines.append(
+        f"Windows: {wf.window_mode}, train={wf.train_years}y test={wf.test_years}y "
+        f"step={wf.step_years}y"
+    )
+    weight_str = ", ".join(f"{n}={w:.0%}" for n, w in wf.weights)
+    lines.append(f"Portfolio weights: {weight_str}")
+    lines.append(f"Starting capital: ${wf.total_capital:,.2f}")
+    lines.append(
+        "Fold boundaries: each fold's training window ends the day BEFORE its test window begins "
+        "(train_end < test_start), so no test data can influence the parameters used. Capital "
+        "compounds across folds -- each test period starts with the prior fold's ending equity, and "
+        "re-establishes the portfolio from cash (fold boundaries incur re-entry costs; conservative)."
+    )
+
+    lines.append("")
+    lines.append("--- Per-fold results (evaluated on the TEST period only) ---")
+    header = (
+        f"{'Fold':<5}{'Train':<26}{'Test':<26}{'Port ret':>10}{'SPY ret':>10}"
+        f"{'Excess':>10}{'MaxDD':>10}{'Sharpe':>8}{'Costs $':>12}"
+    )
+    lines.append(header)
+    for f in wf.folds:
+        train = f"{f.train_start.date()}..{f.train_end.date()}"
+        test = f"{f.test_start.date()}..{f.test_end.date()}"
+        sharpe = f.sharpe_ratio
+        sharpe_str = f"{sharpe:.2f}" if pd.notna(sharpe) else "n/a"
+        lines.append(
+            f"{f.index:<5}{train:<26}{test:<26}{_fmt_pct(f.test_return):>10}"
+            f"{_fmt_pct(f.spy_return):>10}{_fmt_pct(f.excess_return):>10}"
+            f"{_fmt_pct(f.max_drawdown):>10}{sharpe_str:>8}{_fmt_num(f.transaction_costs):>12}"
+        )
+    if wf.optimize:
+        lines.append("")
+        lines.append("Selected variant per fold (frozen from the training window):")
+        for f in wf.folds:
+            lines.append(f"  fold {f.index} ({f.test_start.date()}..{f.test_end.date()}): "
+                         f"{_selected_variants_str(f.selected_variants)}")
+
+    lines.append("")
+    lines.append("--- Aggregate stitched out-of-sample result ---")
+    lines.append(f"Out-of-sample span: {agg.get('oos_start')} to {agg.get('oos_end')} "
+                 f"({agg.get('num_folds')} folds)")
+    lines.append(f"Stitched final equity: ${_fmt_num(agg.get('final_equity'))}")
+    lines.append(f"Stitched total return: {_fmt_pct(agg.get('stitched_total_return'))}")
+    lines.append(f"Stitched CAGR: {_fmt_pct(agg.get('stitched_cagr'))}")
+    lines.append(f"Stitched max drawdown: {_fmt_pct(agg.get('stitched_max_drawdown'))}")
+    stitched_sharpe = agg.get("stitched_sharpe_ratio")
+    lines.append(f"Stitched Sharpe (rf=0): {stitched_sharpe:.2f}" if pd.notna(stitched_sharpe)
+                 else "Stitched Sharpe (rf=0): n/a")
+    lines.append(f"Total transaction costs (all folds): ${_fmt_num(agg.get('total_transaction_costs'))}")
+    lines.append(f"Test folds beating SPY: {_fmt_pct(agg.get('pct_folds_beating_spy'))} "
+                 f"of {agg.get('num_folds')} folds")
+    lines.append(f"Profitable test folds: {_fmt_pct(agg.get('pct_folds_profitable'))} "
+                 f"of {agg.get('num_folds')} folds")
+
+    lines.append("")
+    lines.append(EXECUTION_MODEL_LINE)
+    lines.append(ADJUSTED_PRICE_LINE)
+    lines.append(PRETAX_WARNING_LINE)
+    lines.append("")
+    lines.append(
+        "Read the aggregate as the honest number: it is the return an investor would have earned "
+        "taking each period's decision using only prior data. A big in-sample backtest that decays "
+        "to a weak stitched out-of-sample result is the classic overfitting signature."
+    )
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_walk_forward_report(
+    wf: "WalkForwardResult",
+    run_config: dict,
+    output_dir: str = config.OUTPUT_DIR,
+) -> Path:
+    """Write the walk-forward artifact set (walk_forward_report.txt,
+    walk_forward_folds.csv, walk_forward_equity.csv, walk_forward.json) for an
+    already-computed WalkForwardResult. Diagnostics only."""
+    ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    dirname = f"{ts}_walk_forward_{run_config.get('requested_start')}_to_{run_config.get('requested_end')}"
+    run_dir = Path(output_dir) / dirname
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_walk_forward_folds_csv(run_dir / "walk_forward_folds.csv", wf)
+    _write_walk_forward_equity_csv(run_dir / "walk_forward_equity.csv", wf)
+    _write_walk_forward_txt(run_dir / "walk_forward_report.txt", wf)
+    if len(wf.stitched_equity):
+        _plot_stitched_equity(wf, run_dir / "walk_forward_equity.png")
+
+    json_out = dict(run_config)
+    json_out["mode"] = "optimize" if wf.optimize else "fixed"
+    json_out["window_mode"] = wf.window_mode
+    json_out["train_years"] = wf.train_years
+    json_out["test_years"] = wf.test_years
+    json_out["step_years"] = wf.step_years
+    json_out["weights"] = {n: w for n, w in wf.weights}
+    json_out["total_capital"] = wf.total_capital
+    json_out["aggregate"] = wf.aggregate
+    json_out["folds"] = [
+        {
+            "fold": f.index,
+            "train_start": str(f.train_start.date()), "train_end": str(f.train_end.date()),
+            "test_start": str(f.test_start.date()), "test_end": str(f.test_end.date()),
+            "start_capital": f.start_capital, "final_equity": f.final_equity,
+            "portfolio_test_return": f.test_return, "spy_test_return": f.spy_return,
+            "excess_return": f.excess_return, "max_drawdown": f.max_drawdown,
+            "sharpe_ratio": f.sharpe_ratio, "transaction_costs": f.transaction_costs,
+            "selected_variants": f.selected_variants,
+        }
+        for f in wf.folds
+    ]
+    with open(run_dir / "walk_forward.json", "w") as f:
+        json.dump(json_out, f, indent=2, default=str)
+
+    return run_dir
+
+
+def _plot_stitched_equity(wf: "WalkForwardResult", path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    wf.stitched_equity.plot(ax=ax)
+    # Shade fold boundaries so the stitched-from-test-periods structure is visible.
+    for f in wf.folds:
+        ax.axvline(f.test_start, color="grey", alpha=0.25, linestyle="--")
+    ax.set_title("Stitched out-of-sample equity curve (test periods only)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Equity ($)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)

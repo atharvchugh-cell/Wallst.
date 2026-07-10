@@ -274,6 +274,8 @@ def run_portfolio(
     mr_universe: list[str] | None = None,
     mr_universe_info: dict | None = None,
     write_sleeve_artifacts: bool = True,
+    param_overrides_by_strategy: dict[str, dict] | None = None,
+    warmup_overrides_by_strategy: dict[str, int] | None = None,
 ) -> PortfolioResult:
     """Validate the weights, allocate `total_capital` proportionally, run each
     sleeve independently at its allocated capital, then combine the sleeves'
@@ -285,10 +287,18 @@ def run_portfolio(
     nothing); it is recorded in `skipped_zero_weight` and reported, not
     silently dropped. Stock-plan sleeves receive the pre-resolved
     `mr_universe`/`mr_universe_info`; sector-plan sleeves ignore them (they
-    always use the 11 fixed sector ETFs)."""
+    always use the 11 fixed sector ETFs).
+
+    `param_overrides_by_strategy`/`warmup_overrides_by_strategy` (per strategy
+    name) are used by walk-forward's optimize mode to run a sleeve with a
+    variant's frozen parameters/warmup; when None (the default), every sleeve
+    runs with its shipped defaults -- i.e. no parameter selection happens
+    here, which is exactly the fixed-parameter baseline."""
     if registry is None:
         registry = STRATEGY_REGISTRY
     validate_portfolio_weights(pairs, registry)
+    param_overrides_by_strategy = param_overrides_by_strategy or {}
+    warmup_overrides_by_strategy = warmup_overrides_by_strategy or {}
 
     allocations = allocate_capital(pairs, total_capital)
     sleeves: list[SleeveAllocation] = []
@@ -302,6 +312,8 @@ def run_portfolio(
             spec, start, end, allocated, cost_bps, fractional_shares, refresh_cache, output_dir,
             universe=mr_universe if spec.uses_stock_universe else None,
             universe_info=mr_universe_info if spec.uses_stock_universe else None,
+            param_overrides=param_overrides_by_strategy.get(name),
+            warmup_override=warmup_overrides_by_strategy.get(name),
             write_artifacts=write_sleeve_artifacts,
         )
         sleeves.append(
