@@ -19,3 +19,5 @@ secrets.json
 *_secret*
 account_export*
 *.log
+
+.DS_Store
