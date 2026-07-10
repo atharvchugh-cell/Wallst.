@@ -14,11 +14,12 @@ from . import config, data
 from . import portfolio as portfolio_module
 from . import tournament as tournament_module
 from . import universe as universe_module
+from . import walk_forward as walk_forward_module
 from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
 from .reporting import (
     write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
-    write_tournament_report, write_portfolio_report,
+    write_tournament_report, write_portfolio_report, write_walk_forward_report,
 )
 from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
@@ -36,7 +37,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--strategy",
         choices=[
             "mean_reversion", "sector_rotation", "both", "compare", "robustness",
-            "tournament", "portfolio",
+            "tournament", "portfolio", "walk_forward",
         ],
         required=True,
     )
@@ -88,12 +89,42 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--portfolio-weights", default=None,
-        help="Allocation for --strategy portfolio: 'strategy=weight,...' e.g. "
-        "'momentum=0.60,sector_rotation=0.35,regime_switch=0.05'. Weights must be "
-        "non-negative and sum to 1.0. Each sleeve gets weight x --capital and runs as a "
-        "fully independent, static (non-rebalanced) sleeve. Omit to use the default "
-        "60/35/5 momentum/sector_rotation/regime_switch mix. Ignored for other "
-        "--strategy values.",
+        help="Allocation for --strategy portfolio and --strategy walk_forward: "
+        "'strategy=weight,...' e.g. 'momentum=0.60,sector_rotation=0.35,regime_switch=0.05'. "
+        "Weights must be non-negative and sum to 1.0. Each sleeve gets weight x --capital and "
+        "runs as a fully independent, static (non-rebalanced) sleeve. Omit to use the default "
+        "60/35/5 momentum/sector_rotation/regime_switch mix. Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--walk-forward-train-years", type=int, default=walk_forward_module.DEFAULT_TRAIN_YEARS,
+        help="--strategy walk_forward: length of each fold's training window in years (default 3). "
+        "In the default fixed-parameter mode the training window is reported and its dates are "
+        "enforced to end before the test period, but it does not influence results. Ignored for "
+        "other --strategy values.",
+    )
+    parser.add_argument(
+        "--walk-forward-test-years", type=int, default=walk_forward_module.DEFAULT_TEST_YEARS,
+        help="--strategy walk_forward: length of each fold's out-of-sample test window in years "
+        "(default 1). Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--walk-forward-step-years", type=int, default=walk_forward_module.DEFAULT_STEP_YEARS,
+        help="--strategy walk_forward: how many years to move forward between folds (default 1). "
+        "Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--walk-forward-window", choices=["expanding", "rolling"], default="expanding",
+        help="--strategy walk_forward: 'expanding' (default) anchors every fold's training window "
+        "at --start (growing training set); 'rolling' uses a fixed train-years-wide window that "
+        "slides forward. Ignored for other --strategy values.",
+    )
+    parser.add_argument(
+        "--walk-forward-optimize", action="store_true",
+        help="--strategy walk_forward: enable the OPTIONAL optimize mode -- for each fold, rank each "
+        "sleeve's PREDEFINED sensitivity variants (from tournament.PARAM_SENSITIVITY_VARIANTS, never "
+        "a free sweep) on the TRAINING window only, freeze the best per sleeve, then evaluate the test "
+        "period with it. Off by default: v1 evaluates the shipped fixed parameters (no selection, no "
+        "new overfitting). Ignored for other --strategy values.",
     )
     parser.add_argument(
         "--universe",
@@ -720,6 +751,78 @@ def run_portfolio(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_walk_forward(args: argparse.Namespace) -> int:
+    """Walk-forward / out-of-sample validation of the weighted portfolio: split
+    --start/--end into (train, test) folds, evaluate the portfolio on each
+    fold's TEST period with capital carried forward, and stitch the test-period
+    curves into one out-of-sample equity curve. v1 (default) evaluates the
+    shipped fixed parameters -- no selection, no new overfitting. With
+    --walk-forward-optimize, each sleeve's predefined variants are ranked on the
+    training window and frozen before the test period."""
+    fractional_shares = not args.no_fractional_shares
+
+    try:
+        pairs = portfolio_module.parse_portfolio_weights(args.portfolio_weights)
+        portfolio_module.validate_portfolio_weights(pairs, tournament_module.STRATEGY_REGISTRY)
+    except portfolio_module.PortfolioError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    needs_stock_universe = any(
+        tournament_module.STRATEGY_REGISTRY[name].uses_stock_universe for name, _ in pairs
+    )
+    mr_universe = None
+    if needs_stock_universe:
+        try:
+            mr_universe = resolve_mean_reversion_universe(args)
+        except (universe_module.UniverseError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    try:
+        wf = walk_forward_module.run_walk_forward(
+            pairs, args.capital, args.start, args.end, args.cost_bps, fractional_shares,
+            args.refresh_cache, args.output_dir,
+            train_years=args.walk_forward_train_years, test_years=args.walk_forward_test_years,
+            step_years=args.walk_forward_step_years, expanding=(args.walk_forward_window == "expanding"),
+            optimize=args.walk_forward_optimize, registry=tournament_module.STRATEGY_REGISTRY,
+            mr_universe=mr_universe.tickers if mr_universe else None,
+            mr_universe_info=mr_universe.info if mr_universe else None,
+        )
+    except (data.FetchError, ValueError, walk_forward_module.WalkForwardError,
+            portfolio_module.PortfolioError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    run_config = {
+        "requested_start": str(pd.Timestamp(args.start).date()),
+        "requested_end": str(pd.Timestamp(args.end).date()),
+        "capital": args.capital,
+        "cost_bps": args.cost_bps,
+        "fractional_shares": fractional_shares,
+        "universe_mode": args.universe,
+    }
+    run_dir = write_walk_forward_report(wf, run_config, output_dir=args.output_dir)
+
+    agg = wf.aggregate
+    mode = "optimize" if wf.optimize else "fixed"
+    print(f"\n[walk_forward] mode={mode}, {wf.window_mode} windows "
+          f"(train={wf.train_years}y test={wf.test_years}y step={wf.step_years}y), "
+          f"{agg['num_folds']} folds")
+    for fold in wf.folds:
+        sharpe = fold.sharpe_ratio
+        sharpe_str = f"{sharpe:.2f}" if pd.notna(sharpe) else "n/a"
+        print(f"  fold {fold.index}: test {fold.test_start.date()}..{fold.test_end.date()}  "
+              f"port={fold.test_return:.2%}  spy={fold.spy_return:.2%}  "
+              f"excess={fold.excess_return:.2%}  maxDD={fold.max_drawdown:.2%}  sharpe={sharpe_str}")
+    print(f"  STITCHED OOS: total_return={agg['stitched_total_return']:.2%}  "
+          f"cagr={agg['stitched_cagr']:.2%}  maxDD={agg['stitched_max_drawdown']:.2%}  "
+          f"beat SPY {agg['pct_folds_beating_spy']:.0%} of folds, "
+          f"profitable {agg['pct_folds_profitable']:.0%} of folds")
+    print(f"[walk_forward] artifacts written to: {run_dir}")
+    return 0
+
+
 def _print_summary(label: str, metrics: dict, run_dir) -> None:
     print(f"\n[{label}] total_return={metrics.get('total_return'):.2%}  "
           f"cagr={metrics.get('cagr'):.2%}  max_drawdown={metrics.get('max_drawdown'):.2%}  "
@@ -743,6 +846,9 @@ def main(argv=None) -> int:
 
     if args.strategy == "portfolio":
         return run_portfolio(args)
+
+    if args.strategy == "walk_forward":
+        return run_walk_forward(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None
