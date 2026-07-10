@@ -11,13 +11,14 @@ import pandas as pd
 import yfinance as yf
 
 from . import config, data
+from . import portfolio as portfolio_module
 from . import tournament as tournament_module
 from . import universe as universe_module
 from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
 from .reporting import (
     write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
-    write_tournament_report,
+    write_tournament_report, write_portfolio_report,
 )
 from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
@@ -33,7 +34,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy",
-        choices=["mean_reversion", "sector_rotation", "both", "compare", "robustness", "tournament"],
+        choices=[
+            "mean_reversion", "sector_rotation", "both", "compare", "robustness",
+            "tournament", "portfolio",
+        ],
         required=True,
     )
     today = pd.Timestamp.now().normalize()
@@ -81,6 +85,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(see src/tournament.py PARAM_SENSITIVITY_VARIANTS -- a few variants per strategy, "
         "each with a written rationale, NEVER auto-selected). Off by default; adds one "
         "re-run per variant over --start/--end.",
+    )
+    parser.add_argument(
+        "--portfolio-weights", default=None,
+        help="Allocation for --strategy portfolio: 'strategy=weight,...' e.g. "
+        "'momentum=0.60,sector_rotation=0.35,regime_switch=0.05'. Weights must be "
+        "non-negative and sum to 1.0. Each sleeve gets weight x --capital and runs as a "
+        "fully independent, static (non-rebalanced) sleeve. Omit to use the default "
+        "60/35/5 momentum/sector_rotation/regime_switch mix. Ignored for other "
+        "--strategy values.",
     )
     parser.add_argument(
         "--universe",
@@ -628,6 +641,85 @@ def run_tournament(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_portfolio(args: argparse.Namespace) -> int:
+    """Backtest ONE account allocated across weighted strategy sleeves (default
+    60% momentum / 35% sector_rotation / 5% regime_switch). Each sleeve gets
+    weight x --capital and runs as a fully independent, static (non-rebalanced)
+    sleeve; the portfolio curve is the sum of the sleeves' independent equity
+    curves over their common date intersection. Distinct from --strategy
+    tournament (every strategy at FULL capital, compared) and --strategy
+    both/compare (fixed 50/50 of the two original strategies)."""
+    fractional_shares = not args.no_fractional_shares
+
+    try:
+        pairs = portfolio_module.parse_portfolio_weights(args.portfolio_weights)
+        portfolio_module.validate_portfolio_weights(pairs, tournament_module.STRATEGY_REGISTRY)
+    except portfolio_module.PortfolioError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Resolve the shared stock universe ONCE if any selected sleeve needs it
+    # (momentum / mean_reversion*). Sector-plan sleeves ignore --universe.
+    needs_stock_universe = any(
+        tournament_module.STRATEGY_REGISTRY[name].uses_stock_universe for name, _ in pairs
+    )
+    mr_universe = None
+    if needs_stock_universe:
+        try:
+            mr_universe = resolve_mean_reversion_universe(args)
+        except (universe_module.UniverseError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    try:
+        pf = portfolio_module.run_portfolio(
+            pairs, args.capital, args.start, args.end, args.cost_bps, fractional_shares,
+            args.refresh_cache, args.output_dir, tournament_module.STRATEGY_REGISTRY,
+            mr_universe=mr_universe.tickers if mr_universe else None,
+            mr_universe_info=mr_universe.info if mr_universe else None,
+        )
+    except (data.FetchError, ValueError, portfolio_module.PortfolioError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    describe_by_strategy = {}
+    for name, _weight in pairs:
+        spec = tournament_module.STRATEGY_REGISTRY[name]
+        if spec.uses_stock_universe and mr_universe is not None:
+            describe_by_strategy[name] = spec.factory(universe=mr_universe.tickers).describe()
+        else:
+            describe_by_strategy[name] = spec.factory().describe()
+
+    run_config = {
+        "requested_start": str(pd.Timestamp(args.start).date()),
+        "requested_end": str(pd.Timestamp(args.end).date()),
+        "capital": args.capital,
+        "cost_bps": args.cost_bps,
+        "fractional_shares": fractional_shares,
+        "universe_mode": args.universe,
+        "weights": {name: w for name, w in pairs},
+        "allocation_note": "static allocation: capital split once at the start, sleeve weights "
+                           "drift with performance, no cash transferred between sleeves",
+    }
+    run_dir = write_portfolio_report(pf, run_config, describe_by_strategy, output_dir=args.output_dir)
+
+    print("\n[portfolio] allocation and result:")
+    for sleeve in pf.sleeves:
+        print(
+            f"  {sleeve.strategy}: start ${sleeve.allocated_capital:,.2f} ({sleeve.weight:.0%}) "
+            f"-> final ${sleeve.final_value:,.2f} (end wt {sleeve.ending_weight:.0%}, "
+            f"P&L ${sleeve.pnl_contribution:,.2f})"
+        )
+    print(
+        f"  PORTFOLIO: ${pf.total_capital:,.2f} -> ${pf.metrics.get('final_equity', 0):,.2f}  "
+        f"total_return={pf.metrics.get('total_return'):.2%}  cagr={pf.metrics.get('cagr'):.2%}  "
+        f"maxDD={pf.metrics.get('max_drawdown'):.2%}  sharpe={pf.metrics.get('sharpe_ratio'):.2f}  "
+        f"excess vs SPY={pf.metrics.get('excess_return'):.2%}"
+    )
+    print(f"[portfolio] artifacts written to: {run_dir}")
+    return 0
+
+
 def _print_summary(label: str, metrics: dict, run_dir) -> None:
     print(f"\n[{label}] total_return={metrics.get('total_return'):.2%}  "
           f"cagr={metrics.get('cagr'):.2%}  max_drawdown={metrics.get('max_drawdown'):.2%}  "
@@ -648,6 +740,9 @@ def main(argv=None) -> int:
 
     if args.strategy == "tournament":
         return run_tournament(args)
+
+    if args.strategy == "portfolio":
+        return run_portfolio(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None
