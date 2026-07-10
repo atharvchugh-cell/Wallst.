@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import matplotlib
 
@@ -26,6 +27,9 @@ from .robustness import (  # noqa: E402
     mean_reversion_tradeoff,
     rank_allocations,
 )
+
+if TYPE_CHECKING:  # avoid a runtime import cycle (reporting <- portfolio <- tournament <- reporting)
+    from .portfolio import PortfolioResult
 
 EXECUTION_MODEL_LINE = (
     "Execution model: close-to-close, one-day signal-to-fill lag, "
@@ -1056,5 +1060,282 @@ def write_robustness_report(
             },
             f, indent=2, default=str,
         )
+
+    return run_dir
+
+
+# --- Portfolio report: one account allocated across weighted sleeves ------------
+# Diagnostics only -- formats a PortfolioResult the caller (cli.py's portfolio
+# mode / src/portfolio.py) already computed; no strategy parameter is touched.
+
+STATIC_ALLOCATION_DISCLOSURE = (
+    "STATIC ALLOCATION (v1): capital was allocated ONCE at the start (weight x "
+    "starting capital per sleeve). Sleeve weights then DRIFT with performance "
+    "and NO cash is ever transferred between sleeves -- there is no periodic "
+    "rebalancing back to the target weights. Each sleeve is a fully independent "
+    "engine run (its own cash/shares/lots); the portfolio curve is the sum of "
+    "the sleeves' independent equity curves over their common date "
+    "intersection. No cash is shared and no capital is double-counted."
+)
+
+
+def _write_portfolio_summary_csv(path: Path, metrics_by_label: dict[str, dict], labels: list[str]) -> None:
+    rows = []
+    for lbl in labels:
+        row = {"strategy": lbl}
+        for key, _name, _fmt in TOURNAMENT_METRIC_FIELDS:
+            row[key] = metrics_by_label[lbl].get(key)
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_portfolio_equity_csv(path: Path, pf: "PortfolioResult") -> None:
+    """One row per common-window date: the total portfolio equity plus each
+    sleeve's equity aligned to that same common index (so the columns visibly
+    sum to the portfolio column, proving the combination is a plain sum)."""
+    common = pf.combined_result.equity_curve.index
+    frame = {"portfolio": pf.combined_result.equity_curve}
+    for sleeve in pf.sleeves:
+        frame[sleeve.strategy] = sleeve.result.equity_curve.reindex(common)
+    df = pd.DataFrame(frame, index=common)
+    df.index.name = "date"
+    df.to_csv(path)
+
+
+def _write_portfolio_sleeves_csv(path: Path, pf: "PortfolioResult") -> None:
+    rows = []
+    for sleeve in pf.sleeves:
+        rows.append({
+            "strategy": sleeve.strategy,
+            "target_weight": sleeve.weight,
+            "allocated_capital": sleeve.allocated_capital,
+            "final_value": sleeve.final_value,
+            "ending_weight": sleeve.ending_weight,
+            "pnl_contribution": sleeve.pnl_contribution,
+            "cost_contribution": sleeve.cost_contribution,
+            "total_return": sleeve.metrics.get("total_return"),
+            "cagr": sleeve.metrics.get("cagr"),
+            "max_drawdown": sleeve.metrics.get("max_drawdown"),
+            "sharpe_ratio": sleeve.metrics.get("sharpe_ratio"),
+            "total_turnover": sleeve.metrics.get("total_turnover"),
+            "total_transaction_costs": sleeve.metrics.get("total_transaction_costs"),
+        })
+    # A reconciliation total row: allocated capital and final value sum to the
+    # portfolio's, ending weights sum to 1.0, P&L contributions sum to the
+    # portfolio's total dollar gain -- all visible in one place.
+    rows.append({
+        "strategy": "PORTFOLIO_TOTAL",
+        "target_weight": sum(w for _n, w in pf.weights),
+        "allocated_capital": sum(s.allocated_capital for s in pf.sleeves),
+        "final_value": sum(s.final_value for s in pf.sleeves),
+        "ending_weight": sum(s.ending_weight for s in pf.sleeves),
+        "pnl_contribution": sum(s.pnl_contribution for s in pf.sleeves),
+        "cost_contribution": sum(s.cost_contribution for s in pf.sleeves),
+        "total_return": pf.metrics.get("total_return"),
+        "cagr": pf.metrics.get("cagr"),
+        "max_drawdown": pf.metrics.get("max_drawdown"),
+        "sharpe_ratio": pf.metrics.get("sharpe_ratio"),
+        "total_turnover": pf.metrics.get("total_turnover"),
+        "total_transaction_costs": pf.metrics.get("total_transaction_costs"),
+    })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _write_portfolio_txt(
+    path: Path, pf: "PortfolioResult", run_config: dict, describe_by_strategy: dict[str, dict]
+) -> None:
+    m = pf.metrics
+    lines = []
+    lines.append("=== Portfolio Combination Report ===")
+    lines.append("")
+    lines.append("** RESEARCH / EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. **")
+    lines.append("Past performance does not indicate future results. No live trades were placed.")
+    lines.append("")
+    lines.append(STATIC_ALLOCATION_DISCLOSURE)
+    lines.append("")
+    lines.append(f"Requested window: {run_config.get('requested_start')} to {run_config.get('requested_end')}")
+    lines.append(
+        f"Effective (common) window used: {pf.common_start.date()} to {pf.common_end.date()} "
+        f"(intersection of all sleeves' valid ranges)"
+    )
+    lines.append(f"Starting capital: ${pf.total_capital:,.2f}")
+    lines.append(f"Transaction cost assumption: {run_config.get('cost_bps')} bps per trade")
+    lines.append(
+        f"Fractional shares: {'enabled' if run_config.get('fractional_shares') else 'disabled'}"
+    )
+    if pf.skipped_zero_weight:
+        lines.append(
+            f"Skipped zero-weight sleeves (allocated $0, contribute nothing): "
+            f"{', '.join(pf.skipped_zero_weight)}"
+        )
+
+    lines.append("")
+    lines.append("--- Allocation (start -> end) ---")
+    header = (
+        f"{'Strategy':<24}{'Target wt':>12}{'Allocated $':>16}"
+        f"{'Final $':>16}{'End wt':>12}{'P&L $':>16}"
+    )
+    lines.append(header)
+    for sleeve in pf.sleeves:
+        lines.append(
+            f"{sleeve.strategy:<24}{_fmt_pct(sleeve.weight):>12}"
+            f"{_fmt_num(sleeve.allocated_capital):>16}{_fmt_num(sleeve.final_value):>16}"
+            f"{_fmt_pct(sleeve.ending_weight):>12}{_fmt_num(sleeve.pnl_contribution):>16}"
+        )
+    lines.append(
+        f"{'PORTFOLIO':<24}{_fmt_pct(sum(w for _n, w in pf.weights)):>12}"
+        f"{_fmt_num(pf.total_capital):>16}{_fmt_num(m.get('final_equity')):>16}"
+        f"{_fmt_pct(sum(s.ending_weight for s in pf.sleeves)):>12}"
+        f"{_fmt_num(m.get('final_equity', 0) - pf.total_capital):>16}"
+    )
+    lines.append(
+        "(Target weights are the START allocation; end weights are what those "
+        "sleeves drifted to. They differ precisely because this is a static, "
+        "non-rebalanced allocation.)"
+    )
+
+    lines.append("")
+    lines.append(EXECUTION_MODEL_LINE)
+    lines.append(ADJUSTED_PRICE_LINE)
+    lines.append(PRETAX_WARNING_LINE)
+    # Any stock-universe sleeve (momentum, mean_reversion*) inherits the
+    # survivorship-biased research universe -- keep that warning explicit.
+    if any(
+        d.get("universe_size", 0) and d.get("family") not in ("sector_rotation", "regime_switch")
+        for d in describe_by_strategy.values()
+    ):
+        lines.append("")
+        lines.append(SURVIVORSHIP_WARNING)
+
+    lines.append("")
+    lines.append("--- Portfolio performance ---")
+    lines.append(f"Final equity: ${_fmt_num(m.get('final_equity'))}")
+    lines.append(f"Total return: {_fmt_pct(m.get('total_return'))}")
+    lines.append(f"CAGR: {_fmt_pct(m.get('cagr'))}")
+    if m.get("short_period_warning"):
+        lines.append("  (WARNING: effective period < 90 days -- CAGR/Sharpe are unstable over short windows)")
+    lines.append(f"Max drawdown: {_fmt_pct(m.get('max_drawdown'))}")
+    lines.append(f"Max drawdown duration: {m.get('max_drawdown_duration_days')} calendar days")
+    for key, label in [
+        ("sharpe_ratio", "Sharpe ratio (rf=0)"),
+        ("sortino_ratio", "Sortino ratio (rf=0)"),
+        ("calmar_ratio", "Calmar ratio (CAGR / |max DD|)"),
+    ]:
+        val = m.get(key)
+        lines.append(f"{label}: {val:.2f}" if pd.notna(val) else f"{label}: n/a")
+    lines.append(
+        f"Best month: {_fmt_pct(m.get('best_month'))}  |  Worst month: {_fmt_pct(m.get('worst_month'))}"
+    )
+    lines.append(
+        f"Best year: {_fmt_pct(m.get('best_year'))}  |  Worst year: {_fmt_pct(m.get('worst_year'))}"
+    )
+
+    lines.append("")
+    lines.append("--- Calendar-year returns (portfolio) ---")
+    yearly = annual_returns(pf.combined_result.equity_curve)
+    for y in sorted(yearly):
+        lines.append(f"  {y}: {_fmt_pct(yearly[y])}")
+
+    lines.append("")
+    lines.append("--- Cost & turnover (combined, over the common window) ---")
+    lines.append(f"Total transaction costs paid: ${_fmt_num(m.get('total_transaction_costs'))}")
+    lines.append(f"Total turnover: ${_fmt_num(m.get('total_turnover'))}")
+    lines.append(f"Cost drag (% of starting capital): {_fmt_pct(m.get('cost_drag_pct'))}")
+    lines.append(f"Round-trip trades: {m.get('num_trades')}  |  Transactions: {m.get('num_transactions')}")
+
+    lines.append("")
+    lines.append("--- Exposure ---")
+    lines.append(f"Days with any position: {_fmt_pct(m.get('days_with_any_position_pct'))}")
+    lines.append(f"Average capital invested: {_fmt_pct(m.get('average_capital_invested_pct'))}")
+
+    lines.append("")
+    lines.append("--- Benchmark (adjusted-price SPY total-return proxy, common window) ---")
+    lines.append(f"SPY total return: {_fmt_pct(pf.spy_metrics.get('total_return'))}")
+    lines.append(f"SPY CAGR: {_fmt_pct(pf.spy_metrics.get('cagr'))}")
+    lines.append(f"SPY max drawdown: {_fmt_pct(pf.spy_metrics.get('max_drawdown'))}")
+    lines.append(f"Excess return vs. SPY: {_fmt_pct(m.get('excess_return'))}")
+    corr = m.get("correlation_to_benchmark")
+    lines.append(f"Correlation to SPY: {corr:.2f}" if pd.notna(corr) else "Correlation to SPY: n/a")
+
+    lines.append("")
+    lines.append("--- Per-sleeve breakdown (each sleeve's own standalone metrics) ---")
+    metrics_by_label = {s.strategy: s.metrics for s in pf.sleeves}
+    _write_tournament_table(lines, metrics_by_label, name_w=30, col_w=22)
+    lines.append("")
+    lines.append(
+        "Contribution to portfolio P&L (sums to the portfolio's total $ gain), "
+        "and each sleeve's share of combined transaction costs:"
+    )
+    total_pnl = sum(s.pnl_contribution for s in pf.sleeves)
+    total_costs = sum(s.cost_contribution for s in pf.sleeves)
+    for sleeve in pf.sleeves:
+        pnl_share = (sleeve.pnl_contribution / total_pnl) if total_pnl else float("nan")
+        cost_share = (sleeve.cost_contribution / total_costs) if total_costs else float("nan")
+        lines.append(
+            f"  {sleeve.strategy}: P&L ${_fmt_num(sleeve.pnl_contribution)} "
+            f"({_fmt_pct(pnl_share)} of portfolio P&L)  |  "
+            f"costs ${_fmt_num(sleeve.cost_contribution)} ({_fmt_pct(cost_share)} of combined costs)"
+        )
+
+    # Each sleeve's disclosed assumptions -- nothing hidden behind the blend.
+    lines.append("")
+    lines.append("--- Sleeve assumptions (from each strategy's describe()) ---")
+    for name, desc in describe_by_strategy.items():
+        assumptions = desc.get("assumptions") or []
+        if assumptions:
+            lines.append(f"  {name}:")
+            for a in assumptions:
+                lines.append(f"    - {a}")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_portfolio_report(
+    pf: "PortfolioResult",
+    run_config: dict,
+    describe_by_strategy: dict[str, dict],
+    output_dir: str = config.OUTPUT_DIR,
+) -> Path:
+    """Write the portfolio-combination artifact set (portfolio_report.txt,
+    portfolio_summary.csv, portfolio_equity.csv, portfolio_sleeves.csv,
+    portfolio.json) for an already-computed PortfolioResult. Diagnostics only:
+    formats results, runs no backtest, touches no strategy parameter."""
+    ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    dirname = f"{ts}_portfolio_{run_config.get('requested_start')}_to_{run_config.get('requested_end')}"
+    run_dir = Path(output_dir) / dirname
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Summary table rows: each sleeve, the portfolio, and SPY.
+    metrics_by_label: dict[str, dict] = {s.strategy: s.metrics for s in pf.sleeves}
+    metrics_by_label["portfolio"] = pf.metrics
+    metrics_by_label["SPY"] = pf.spy_metrics
+    labels = [s.strategy for s in pf.sleeves] + ["portfolio", "SPY"]
+
+    _write_portfolio_summary_csv(run_dir / "portfolio_summary.csv", metrics_by_label, labels)
+    _write_portfolio_equity_csv(run_dir / "portfolio_equity.csv", pf)
+    _write_portfolio_sleeves_csv(run_dir / "portfolio_sleeves.csv", pf)
+    _write_portfolio_txt(run_dir / "portfolio_report.txt", pf, run_config, describe_by_strategy)
+    _write_equity_png(pf.combined_result, run_dir / "portfolio_equity.png")
+
+    json_out = dict(run_config)
+    json_out["weights"] = {name: w for name, w in pf.weights}
+    json_out["total_capital"] = pf.total_capital
+    json_out["common_window"] = {"start": str(pf.common_start.date()), "end": str(pf.common_end.date())}
+    json_out["skipped_zero_weight"] = pf.skipped_zero_weight
+    json_out["portfolio_metrics"] = pf.metrics
+    json_out["spy_metrics"] = pf.spy_metrics
+    json_out["sleeves"] = [
+        {
+            "strategy": s.strategy, "target_weight": s.weight, "allocated_capital": s.allocated_capital,
+            "final_value": s.final_value, "ending_weight": s.ending_weight,
+            "pnl_contribution": s.pnl_contribution, "cost_contribution": s.cost_contribution,
+            "metrics": s.metrics,
+        }
+        for s in pf.sleeves
+    ]
+    json_out["describe"] = describe_by_strategy
+    with open(run_dir / "portfolio.json", "w") as f:
+        json.dump(json_out, f, indent=2, default=str)
 
     return run_dir
