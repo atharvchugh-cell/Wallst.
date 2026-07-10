@@ -73,25 +73,43 @@ class BacktestResult:
     universe: list[str]
     cost_bps: float
     fractional_shares: bool
+    # Signals emitted on/around `end` whose fill_date falls BEYOND this run's
+    # execution horizon (i.e. > `end`). Empty for an ordinary backtest; used by
+    # paper trading, where a day-T signal's next-session fill has not happened
+    # yet. These are NOT executed and NOT reflected in equity/positions.
+    pending_orders: list[TargetEvent] = field(default_factory=list)
+    # Events whose scheduled fill session is inside the execution window but had
+    # no usable fill price (gap/delisting). Only populated when the caller opts
+    # into `defer_unfillable=True`; such orders are reported, never silently
+    # filled. Empty for an ordinary backtest (which hard-fails instead).
+    stale_orders: list[TargetEvent] = field(default_factory=list)
 
 
 class EventValidationError(Exception):
     pass
 
 
-def _validate_event(e: TargetEvent, calendar_walk: pd.DatetimeIndex, seen_keys: set, price_data: dict) -> None:
+def _validate_event_shape(e: TargetEvent, seen_keys: set) -> None:
+    """Horizon-independent checks that are always bugs if violated: a missing
+    fill_date, a fill_date not strictly after the signal, or a duplicate
+    (strategy, ticker, fill_date) event. Applied to executed AND pending
+    orders alike."""
     if e.fill_date is None:
         raise EventValidationError(f"{e.ticker}: event has no fill_date")
     if e.fill_date <= e.signal_date:
         raise EventValidationError(
             f"{e.ticker}: fill_date {e.fill_date.date()} is not after signal_date {e.signal_date.date()}"
         )
-    if e.fill_date not in calendar_walk:
-        raise EventValidationError(f"{e.ticker}: fill_date {e.fill_date.date()} is not in the canonical calendar")
     key = (e.strategy, e.ticker, e.fill_date)
     if key in seen_keys:
         raise EventValidationError(f"Duplicate target event for {key}")
     seen_keys.add(key)
+
+
+def _validate_event(e: TargetEvent, calendar_walk: pd.DatetimeIndex, seen_keys: set, price_data: dict) -> None:
+    _validate_event_shape(e, seen_keys)
+    if e.fill_date not in calendar_walk:
+        raise EventValidationError(f"{e.ticker}: fill_date {e.fill_date.date()} is not in the canonical calendar")
     if e.ticker not in price_data or e.fill_date not in price_data[e.ticker].index:
         raise EventValidationError(f"{e.ticker}: no price data at scheduled fill_date {e.fill_date.date()}")
 
@@ -105,12 +123,36 @@ def run_backtest(
     capital: float,
     cost_bps: float = 5.0,
     fractional_shares: bool = True,
+    signal_calendar: pd.DatetimeIndex | None = None,
+    defer_unfillable: bool = False,
 ) -> BacktestResult:
+    """Drive one strategy sleeve day-by-day over [start, end], executing fills
+    and marking equity through `end`.
+
+    `signal_calendar` (paper trading): a calendar the strategy's on_day view uses
+    for CALENDAR NAVIGATION ONLY (next_trading_day / is_month_end). It must be a
+    superset of the execution calendar and may extend one or more sessions beyond
+    `end` so that a signal generated on day `end` gets a real future fill_date and
+    a true month-end on `end` is detected. No price beyond `end` is ever read (the
+    MarketDataView is still bounded at each walk day's as_of). Events whose
+    fill_date lands beyond `end` are collected in `result.pending_orders` rather
+    than executed. Default None -> exactly the historical-backtest behavior
+    (signal_calendar == execution calendar, no pending orders possible).
+
+    `defer_unfillable` (paper trading): if an event's scheduled fill session is
+    inside the execution window but has no usable price for that ticker, record it
+    in `result.stale_orders` instead of raising -- never silently fill an order
+    whose fill price is unavailable. Default False -> hard-fail, as before.
+    """
     start = pd.Timestamp(start)
     end = pd.Timestamp(end)
     calendar_walk = full_calendar[(full_calendar >= start) & (full_calendar <= end)].sort_values()
     if len(calendar_walk) == 0:
         raise ValueError(f"No trading days in [{start.date()}, {end.date()}]")
+    if signal_calendar is not None:
+        signal_calendar = pd.DatetimeIndex(signal_calendar).unique().sort_values()
+    else:
+        signal_calendar = calendar_walk
 
     strategy.reset()
     enriched = strategy.prepare(price_data, calendar_walk, start)
@@ -130,11 +172,47 @@ def run_backtest(
     positions: list[dict] = []
     equity_curve: dict[pd.Timestamp, float] = {}
     pending_by_fill_date: dict[pd.Timestamp, list[TargetEvent]] = {}
+    pending_orders: list[TargetEvent] = []  # fill_date > end (paper next-session orders)
+    stale_orders: list[TargetEvent] = []    # unfillable within window (defer_unfillable)
     seen_keys: set = set()
 
     def queue_event(e: TargetEvent, sizing_equity: float) -> None:
         e.requested_notional = e.target_weight * sizing_equity
-        _validate_event(e, calendar_walk, seen_keys, enriched)
+        # Shape checks that are always bugs regardless of horizon.
+        _validate_event_shape(e, seen_keys)
+        if e.fill_date > end:
+            if e.fill_date in signal_calendar:
+                # Pending: fills in an (extended-calendar) session beyond this
+                # run's execution horizon -- paper trading, where a day-`end`
+                # signal's next-session fill has not happened yet. Recorded, not
+                # executed. In an ordinary backtest signal_calendar == the walk
+                # calendar (all <= end), so this branch is never taken and a
+                # fill_date past `end` still raises below, as before.
+                target_events_log.append(e)
+                pending_orders.append(e)
+                return
+            raise EventValidationError(
+                f"{e.ticker}: fill_date {e.fill_date.date()} is not in the canonical calendar"
+            )
+        if e.fill_date not in calendar_walk:
+            raise EventValidationError(
+                f"{e.ticker}: fill_date {e.fill_date.date()} is not in the canonical calendar"
+            )
+        price_ok = (
+            e.ticker in enriched
+            and e.fill_date in enriched[e.ticker].index
+            and pd.notna(enriched[e.ticker].loc[e.fill_date, "Close"])
+        )
+        if not price_ok:
+            if defer_unfillable:
+                # Do NOT silently fill an order whose scheduled fill price is
+                # unavailable; report it as stale/rejected.
+                target_events_log.append(e)
+                stale_orders.append(e)
+                return
+            raise EventValidationError(
+                f"{e.ticker}: no price data at scheduled fill_date {e.fill_date.date()}"
+            )
         target_events_log.append(e)
         pending_by_fill_date.setdefault(e.fill_date, []).append(e)
 
@@ -182,7 +260,10 @@ def run_backtest(
 
         equity_curve[d] = sleeve_equity_today
 
-        view = MarketDataView(enriched, as_of=d, calendar=calendar_walk)
+        # `signal_calendar` (== calendar_walk unless paper trading extends it)
+        # supplies calendar navigation only; the as_of bound still forbids any
+        # price read after `d`.
+        view = MarketDataView(enriched, as_of=d, calendar=signal_calendar)
         for e in strategy.on_day(d, view, sleeve_equity_today):
             queue_event(e, sleeve_equity_today)
 
@@ -201,6 +282,8 @@ def run_backtest(
         universe=list(strategy.universe),
         cost_bps=cost_bps,
         fractional_shares=fractional_shares,
+        pending_orders=pending_orders,
+        stale_orders=stale_orders,
     )
 
 

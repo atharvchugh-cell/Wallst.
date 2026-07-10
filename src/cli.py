@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import sys
 import warnings as warnings_module
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
+import shutil
+
 from . import config, data
+from . import paper as paper_module
 from . import portfolio as portfolio_module
 from . import tournament as tournament_module
 from . import universe as universe_module
@@ -19,7 +23,7 @@ from .engine import combine_results, run_backtest
 from .metrics import compute_all_metrics, spy_standalone_metrics
 from .reporting import (
     write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
-    write_tournament_report, write_portfolio_report, write_walk_forward_report,
+    write_tournament_report, write_portfolio_report, write_walk_forward_report, write_paper_artifacts,
 )
 from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
@@ -37,7 +41,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--strategy",
         choices=[
             "mean_reversion", "sector_rotation", "both", "compare", "robustness",
-            "tournament", "portfolio", "walk_forward",
+            "tournament", "portfolio", "walk_forward", "paper",
         ],
         required=True,
     )
@@ -125,6 +129,53 @@ def parse_args(argv=None) -> argparse.Namespace:
         "a free sweep) on the TRAINING window only, freeze the best per sleeve, then evaluate the test "
         "period with it. Off by default: v1 evaluates the shipped fixed parameters (no selection, no "
         "new overfitting). Ignored for other --strategy values.",
+    )
+    # --- Forward paper-trading (--strategy paper) --------------------------------
+    # Research/paper-trading only: never connects to a broker, never sends a real
+    # order. Exactly one action flag is chosen per invocation.
+    paper_group = parser.add_argument_group("paper trading (--strategy paper)")
+    paper_group.add_argument(
+        "--paper-state-dir", default=paper_module.DEFAULT_PAPER_STATE_DIR,
+        help="Directory holding the persistent paper account (default 'paper_state').",
+    )
+    paper_group.add_argument(
+        "--paper-init", action="store_true",
+        help="Initialize a new paper account: split --capital across --portfolio-weights "
+        "(default 60/35/5), freeze the universe snapshot, and write an all-cash starting ledger. "
+        "Inception is --paper-start (default today).",
+    )
+    paper_group.add_argument(
+        "--paper-start", default=None,
+        help="Paper account inception date (YYYY-MM-DD) for --paper-init. Default: today. "
+        "Pass a past date to enable deterministic historical multi-day simulation via --paper-date.",
+    )
+    paper_group.add_argument(
+        "--paper-run", action="store_true",
+        help="Process the next unprocessed finalized market session (advance one day).",
+    )
+    paper_group.add_argument(
+        "--paper-date", default=None,
+        help="Process forward through this finalized session (YYYY-MM-DD), one session at a time, "
+        "enforcing the information boundary that existed on each date. Rejects future/unfinalized dates.",
+    )
+    paper_group.add_argument("--paper-status", action="store_true", help="Print the current account status.")
+    paper_group.add_argument("--paper-orders", action="store_true", help="List pending (and stale) orders.")
+    paper_group.add_argument("--paper-trades", action="store_true", help="List completed paper trades (fills).")
+    paper_group.add_argument(
+        "--paper-export", action="store_true",
+        help="Export a timestamped copy of all ledger artifacts to --output-dir.",
+    )
+    paper_group.add_argument(
+        "--paper-reconcile", action="store_true",
+        help="Re-verify the persisted state's accounting invariants (no replay).",
+    )
+    paper_group.add_argument(
+        "--paper-reset", action="store_true",
+        help="Reset the account. Requires --confirm-paper-reset; backs up state first, never deletes silently.",
+    )
+    paper_group.add_argument(
+        "--confirm-paper-reset", action="store_true",
+        help="Explicit confirmation required by --paper-reset.",
     )
     parser.add_argument(
         "--universe",
@@ -823,6 +874,146 @@ def run_walk_forward(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_paper_banner() -> None:
+    print("=" * 60)
+    for n in paper_module.PAPER_NOTICES:
+        print(f"** {n}")
+    print("=" * 60)
+
+
+def _print_paper_run_summary(s: dict) -> None:
+    print(
+        f"[paper] processed {s['paper_date']} (data cutoff {s['data_cutoff_date']}): "
+        f"{s['num_new_signals']} new signals, {s['num_pending_created']} pending orders created, "
+        f"{s['num_fills']} fills, {s['num_stale']} stale."
+    )
+    print(
+        f"        equity ${s['total_equity']:,.2f}  daily {s['daily_return']:+.2%}  "
+        f"cumulative {s['cumulative_return']:+.2%}  costs ${s['transaction_costs_run']:,.2f}  "
+        f"reconciliation {'OK' if s['reconciliation_ok'] else 'FAILED'}"
+    )
+
+
+def _print_paper_file(state_dir, filename: str, title: str) -> None:
+    df = pd.read_csv(Path(state_dir) / filename)
+    print(f"--- {title} ({len(df)}) ---")
+    if len(df):
+        print(df.to_string(index=False))
+    else:
+        print("(none)")
+
+
+def _paper_export(args, cfg: dict, st: dict, state_dir) -> Path:
+    ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
+    export_dir = Path(args.output_dir) / f"{ts}_paper_export"
+    write_paper_artifacts(cfg, st, export_dir)
+    # Include the authoritative state/config JSON alongside the derived views.
+    for fname in (paper_module.CONFIG_FILENAME, paper_module.STATE_FILENAME):
+        src = Path(state_dir) / fname
+        if src.exists():
+            shutil.copy2(src, export_dir / fname)
+    return export_dir
+
+
+def run_paper(args: argparse.Namespace) -> int:
+    """Forward paper-trading driver: a persistent, reloadable simulation of the
+    fixed 60/35/5 portfolio that processes finalized sessions one at a time using
+    only data available as of each date. NEVER connects to a broker or sends a
+    real order. Exactly one action flag is chosen per invocation."""
+    state_dir = args.paper_state_dir
+    fractional_shares = not args.no_fractional_shares
+
+    action_flags = [
+        args.paper_init, args.paper_run, args.paper_date is not None, args.paper_status,
+        args.paper_orders, args.paper_trades, args.paper_export, args.paper_reconcile,
+        args.paper_reset,
+    ]
+    n_actions = sum(1 for a in action_flags if a)
+    if n_actions == 0:
+        print(
+            "Error: --strategy paper requires exactly one action: --paper-init, --paper-run, "
+            "--paper-date, --paper-status, --paper-orders, --paper-trades, --paper-export, "
+            "--paper-reconcile, or --paper-reset.", file=sys.stderr,
+        )
+        return 1
+    if n_actions > 1:
+        print("Error: choose exactly one paper action per invocation.", file=sys.stderr)
+        return 1
+
+    try:
+        if args.paper_reset:
+            backup = paper_module.reset_account(state_dir, confirm=args.confirm_paper_reset)
+            print(f"[paper] account reset. Prior state backed up to: {backup}")
+            print("[paper] run --paper-init to start a new account.")
+            return 0
+
+        if args.paper_init:
+            pairs = portfolio_module.parse_portfolio_weights(args.portfolio_weights)
+            portfolio_module.validate_portfolio_weights(pairs, tournament_module.STRATEGY_REGISTRY)
+            inception = args.paper_start or pd.Timestamp.now().normalize().date().isoformat()
+            needs_stock = any(
+                tournament_module.STRATEGY_REGISTRY[n].uses_stock_universe for n, _ in pairs
+            )
+            mr_universe = None
+            if needs_stock:
+                mr_universe = resolve_mean_reversion_universe(
+                    args, backtest_start=inception, backtest_end=pd.Timestamp.now().normalize(),
+                )
+            paper_module.init_account(
+                state_dir, args.capital, inception, pairs, args.cost_bps, fractional_shares,
+                args.universe, mr_universe.tickers if mr_universe else None,
+                mr_universe.info if mr_universe else None,
+            )
+            cfg, st = paper_module.load_account(state_dir)
+            write_paper_artifacts(cfg, st, state_dir)
+            print(f"[paper] initialized account in {state_dir}: ${args.capital:,.2f}, inception {inception}")
+            for name, w in pairs:
+                print(f"  {name}: {w:.0%}")
+            _print_paper_banner()
+            return 0
+
+        if args.paper_run or args.paper_date is not None:
+            result = paper_module.advance(
+                state_dir, target_date=args.paper_date, refresh_cache=args.refresh_cache,
+            )
+            cfg, st = result["config"], result["state"]
+            write_paper_artifacts(cfg, st, state_dir)
+            if result["message"]:
+                print(f"[paper] {result['message']}")
+            for s in result["processed"]:
+                _print_paper_run_summary(s)
+            if result["processed"]:
+                print(f"[paper] ledger updated in: {state_dir}")
+            _print_paper_banner()
+            return 0
+
+        # Read-only commands: load + regenerate the derived views, then display.
+        cfg, st = paper_module.load_account(state_dir)
+        write_paper_artifacts(cfg, st, state_dir)
+        if args.paper_status:
+            print((Path(state_dir) / "paper_status.txt").read_text())
+        elif args.paper_orders:
+            _print_paper_file(state_dir, "paper_orders.csv", "Pending / stale orders")
+            _print_paper_banner()
+        elif args.paper_trades:
+            _print_paper_file(state_dir, "paper_trades.csv", "Completed paper trades")
+            _print_paper_banner()
+        elif args.paper_reconcile:
+            recon = paper_module.reconcile_saved_state(state_dir)
+            print(f"[paper] reconciliation of persisted state: {'OK' if recon['ok'] else 'FAILED'}")
+            for c in recon["checks"]:
+                print(f"  [{'ok' if c['ok'] else 'XX'}] {c['check']}: {c['detail']}")
+            return 0 if recon["ok"] else 1
+        elif args.paper_export:
+            export_dir = _paper_export(args, cfg, st, state_dir)
+            print(f"[paper] exported all ledger artifacts to: {export_dir}")
+        return 0
+    except (paper_module.PaperError, data.FetchError, ValueError,
+            universe_module.UniverseError, portfolio_module.PortfolioError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
 def _print_summary(label: str, metrics: dict, run_dir) -> None:
     print(f"\n[{label}] total_return={metrics.get('total_return'):.2%}  "
           f"cagr={metrics.get('cagr'):.2%}  max_drawdown={metrics.get('max_drawdown'):.2%}  "
@@ -849,6 +1040,9 @@ def main(argv=None) -> int:
 
     if args.strategy == "walk_forward":
         return run_walk_forward(args)
+
+    if args.strategy == "paper":
+        return run_paper(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None
