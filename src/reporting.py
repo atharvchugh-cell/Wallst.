@@ -1570,7 +1570,7 @@ PAPER_RUN_LOG_COLUMNS = [
     "run_index", "timestamp", "paper_date", "data_cutoff_date", "next_session",
     "num_new_signals", "num_pending_created", "num_fills", "num_stale",
     "total_equity", "cumulative_return", "daily_return", "transaction_costs_run",
-    "reconciliation_ok",
+    "reconciliation_ok", "warnings",
 ]
 
 
@@ -1636,7 +1636,13 @@ def _write_paper_equity_csv(path: Path, state: dict) -> None:
 
 
 def _write_paper_run_log_csv(path: Path, state: dict) -> None:
-    _write_csv(path, list(state.get("run_log", [])), PAPER_RUN_LOG_COLUMNS)
+    rows = []
+    for r in state.get("run_log", []):
+        row = dict(r)
+        warnings = row.get("warnings") or []
+        row["warnings"] = "; ".join(warnings) if warnings else ""
+        rows.append(row)
+    _write_csv(path, rows, PAPER_RUN_LOG_COLUMNS)
 
 
 def _write_paper_status_txt(path: Path, config_data: dict, state: dict) -> None:
@@ -1658,6 +1664,9 @@ def _write_paper_status_txt(path: Path, config_data: dict, state: dict) -> None:
                  f"Fractional shares: {'on' if config_data.get('fractional_shares') else 'off'}")
     lines.append(f"State schema version: {state.get('schema_version')}")
     lines.append(f"Git commit at init: {config_data.get('git_commit_sha')}")
+    fp = config_data.get("config_fingerprint")
+    lines.append(f"Config fingerprint (weights/params/costs/universe/strategy source, frozen at init): "
+                 f"{fp[:16] + '...' if fp else '(none)'}")
     lines.append("")
     lines.append("--- Account snapshot ---")
     lines.append(f"Last processed market date: {state.get('last_processed_date') or '(none yet)'}")
@@ -1725,6 +1734,11 @@ def _write_paper_status_txt(path: Path, config_data: dict, state: dict) -> None:
                      f"Cumulative: {_fmt_pct(last.get('cumulative_return'))}")
         lines.append(f"  Run transaction costs: ${_fmt_num(last.get('transaction_costs_run'))}")
         lines.append(f"  Reconciliation: {'OK' if last.get('reconciliation_ok') else 'FAILED'}")
+        run_warnings = last.get("warnings") or []
+        if run_warnings:
+            lines.append(f"  Warnings/deviations ({len(run_warnings)}):")
+            for w in run_warnings[:10]:
+                lines.append(f"    - {w}")
 
     lines.append("")
     lines.append("Execution model: close-to-close fills with a one-trading-day signal-to-fill "

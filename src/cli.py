@@ -15,6 +15,7 @@ import shutil
 
 from . import config, data
 from . import paper as paper_module
+from . import paper_db as paper_db_module
 from . import portfolio as portfolio_module
 from . import tournament as tournament_module
 from . import universe as universe_module
@@ -907,8 +908,10 @@ def _paper_export(args, cfg: dict, st: dict, state_dir) -> Path:
     ts = pd.Timestamp.now().strftime("%Y%m%dT%H%M%S")
     export_dir = Path(args.output_dir) / f"{ts}_paper_export"
     write_paper_artifacts(cfg, st, export_dir)
-    # Include the authoritative state/config JSON alongside the derived views.
-    for fname in (paper_module.CONFIG_FILENAME, paper_module.STATE_FILENAME):
+    # Include the authoritative SQLite ledger (paper_db.DB_FILENAME) alongside
+    # the derived paper_config.json/paper_state.json views and CSVs.
+    export_names = [paper_module.CONFIG_FILENAME, paper_module.STATE_FILENAME, paper_db_module.DB_FILENAME]
+    for fname in export_names:
         src = Path(state_dir) / fname
         if src.exists():
             shutil.copy2(src, export_dir / fname)
