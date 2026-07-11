@@ -1540,3 +1540,228 @@ def _plot_stitched_equity(wf: "WalkForwardResult", path: Path) -> None:
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+# --- Paper trading artifacts ----------------------------------------------------
+# Prominent notices printed on every paper report (requirement 20). These are a
+# hard, non-negotiable banner: this system never sends real orders.
+PAPER_NOTICE_LINES = [
+    "PAPER TRADING ONLY",
+    "NO REAL ORDERS WERE SENT",
+    "NOT FINANCIAL ADVICE",
+    "NO BROKERAGE CONNECTION EXISTS",
+    "RESULTS MAY DIFFER FROM LIVE EXECUTION",
+]
+
+PAPER_ORDER_COLUMNS = [
+    "id", "sleeve", "ticker", "signal_date", "scheduled_fill_date", "intended_side",
+    "target_weight", "requested_notional", "sizing_price", "reason", "status",
+]
+PAPER_TRADE_COLUMNS = [
+    "id", "sleeve", "ticker", "signal_date", "fill_date", "side", "shares",
+    "fill_price", "notional", "transaction_cost", "reason",
+]
+PAPER_POSITION_COLUMNS = ["sleeve", "ticker", "shares", "avg_cost", "last_price", "market_value"]
+PAPER_SLEEVE_COLUMNS = [
+    "strategy", "weight", "allocated_capital", "cash", "equity", "ending_weight",
+    "transaction_costs", "turnover",
+]
+PAPER_RUN_LOG_COLUMNS = [
+    "run_index", "timestamp", "paper_date", "data_cutoff_date", "next_session",
+    "num_new_signals", "num_pending_created", "num_fills", "num_stale",
+    "total_equity", "cumulative_return", "daily_return", "transaction_costs_run",
+    "reconciliation_ok", "warnings",
+]
+
+
+def _paper_banner() -> list[str]:
+    line = "*" * 64
+    out = [line]
+    for n in PAPER_NOTICE_LINES:
+        out.append(f"** {n}")
+    out.append(line)
+    return out
+
+
+def _write_paper_orders_csv(path: Path, state: dict) -> None:
+    rows = list(state.get("pending_orders", [])) + list(state.get("rejected_stale_orders", []))
+    _write_csv(path, rows, PAPER_ORDER_COLUMNS)
+
+
+def _write_paper_trades_csv(path: Path, state: dict) -> None:
+    _write_csv(path, list(state.get("completed_trades", [])), PAPER_TRADE_COLUMNS)
+
+
+def _write_paper_positions_csv(path: Path, state: dict) -> None:
+    rows = []
+    for name, sleeve in state.get("sleeves", {}).items():
+        for p in sleeve.get("positions", []):
+            rows.append({"sleeve": name, **p})
+    _write_csv(path, rows, PAPER_POSITION_COLUMNS)
+
+
+def _write_paper_sleeves_csv(path: Path, state: dict) -> None:
+    sleeves = state.get("sleeves", {})
+    rows = [
+        {k: s.get(k) for k in PAPER_SLEEVE_COLUMNS}
+        for s in sleeves.values()
+    ]
+    # Reconciliation total row: allocated sums to the account, ending weights to 1.
+    if sleeves:
+        rows.append({
+            "strategy": "PAPER_TOTAL",
+            "weight": sum(s.get("weight", 0.0) for s in sleeves.values()),
+            "allocated_capital": sum(s.get("allocated_capital", 0.0) for s in sleeves.values()),
+            "cash": sum(s.get("cash", 0.0) for s in sleeves.values()),
+            "equity": sum(s.get("equity", 0.0) for s in sleeves.values()),
+            "ending_weight": sum(s.get("ending_weight", 0.0) for s in sleeves.values()),
+            "transaction_costs": sum(s.get("transaction_costs", 0.0) for s in sleeves.values()),
+            "turnover": sum(s.get("turnover", 0.0) for s in sleeves.values()),
+        })
+    _write_csv(path, rows, PAPER_SLEEVE_COLUMNS)
+
+
+def _write_paper_equity_csv(path: Path, state: dict) -> None:
+    port_hist = state.get("portfolio_equity_history", [])
+    sleeve_hist = state.get("sleeve_equity_history", {})
+    if not port_hist:
+        pd.DataFrame(columns=["date", "portfolio"]).to_csv(path, index=False)
+        return
+    df = pd.DataFrame(port_hist).set_index("date").rename(columns={"equity": "portfolio"})
+    for name, hist in sleeve_hist.items():
+        if hist:
+            s = pd.DataFrame(hist).set_index("date")["equity"].rename(name)
+            df = df.join(s, how="left")
+    df.to_csv(path, index_label="date")
+
+
+def _write_paper_run_log_csv(path: Path, state: dict) -> None:
+    rows = []
+    for r in state.get("run_log", []):
+        row = dict(r)
+        warnings = row.get("warnings") or []
+        row["warnings"] = "; ".join(warnings) if warnings else ""
+        rows.append(row)
+    _write_csv(path, rows, PAPER_RUN_LOG_COLUMNS)
+
+
+def _write_paper_status_txt(path: Path, config_data: dict, state: dict) -> None:
+    lines: list[str] = []
+    lines.extend(_paper_banner())
+    lines.append("")
+    lines.append("=== Paper Trading Status ===")
+    lines.append("Research/educational simulation only. No brokerage connection exists.")
+    lines.append("")
+    lines.append(f"Account created: {config_data.get('created_at')}")
+    lines.append(f"Inception date: {config_data.get('inception_date')}")
+    lines.append(f"Starting capital: ${_fmt_num(state.get('starting_capital'))}")
+    lines.append(f"Portfolio weights: " + ", ".join(
+        f"{n}={w:.0%}" for n, w in config_data.get("weights", [])
+    ))
+    lines.append(f"Universe mode: {config_data.get('universe_mode')} "
+                 f"({len(config_data.get('universe_tickers', []))} tickers, frozen at init)")
+    lines.append(f"Cost assumption: {config_data.get('cost_bps')} bps/trade   "
+                 f"Fractional shares: {'on' if config_data.get('fractional_shares') else 'off'}")
+    lines.append(f"State schema version: {state.get('schema_version')}")
+    lines.append(f"Git commit at init: {config_data.get('git_commit_sha')}")
+    fp = config_data.get("config_fingerprint")
+    lines.append(f"Config fingerprint (weights/params/costs/universe/strategy source, frozen at init): "
+                 f"{fp[:16] + '...' if fp else '(none)'}")
+    lines.append("")
+    lines.append("--- Account snapshot ---")
+    lines.append(f"Last processed market date: {state.get('last_processed_date') or '(none yet)'}")
+    lines.append(f"Data cutoff date: {state.get('data_cutoff_date') or '(none yet)'}")
+    lines.append(f"Sessions processed (runs): {state.get('num_runs', 0)}")
+    lines.append(f"Total portfolio equity: ${_fmt_num(state.get('total_equity'))}")
+    lines.append(f"Cumulative return: {_fmt_pct(state.get('cumulative_return'))}")
+    lines.append(f"Cumulative transaction costs: ${_fmt_num(state.get('transaction_costs_total'))}")
+    lines.append(f"Cumulative turnover (traded notional): ${_fmt_num(state.get('turnover_total'))}")
+
+    recon = state.get("reconciliation", {})
+    lines.append("")
+    lines.append(f"Reconciliation: {'OK' if recon.get('ok') else 'FAILED'}")
+    for c in recon.get("checks", []):
+        flag = "ok " if c.get("ok") else "XX "
+        lines.append(f"  [{flag}] {c.get('check')}: {c.get('detail')}")
+
+    lines.append("")
+    lines.append("--- Sleeves (independent; no shared cash, no rebalancing) ---")
+    for name, s in state.get("sleeves", {}).items():
+        lines.append(
+            f"  {name}: start ${_fmt_num(s.get('allocated_capital'))} ({s.get('weight', 0):.0%}) "
+            f"-> equity ${_fmt_num(s.get('equity'))} (cash ${_fmt_num(s.get('cash'))}, "
+            f"end wt {s.get('ending_weight', float('nan')):.0%}, {len(s.get('positions', []))} positions)"
+        )
+
+    positions = [(name, p) for name, s in state.get("sleeves", {}).items() for p in s.get("positions", [])]
+    lines.append("")
+    lines.append(f"--- Current positions ({len(positions)}) ---")
+    for name, p in positions[:40]:
+        lines.append(
+            f"  {name} {p['ticker']}: {p['shares']:.4f} sh @ avg ${_fmt_num(p['avg_cost'])} "
+            f"(last ${_fmt_num(p['last_price'])}, mkt ${_fmt_num(p['market_value'])})"
+        )
+    if len(positions) > 40:
+        lines.append(f"  ... and {len(positions) - 40} more (see paper_positions.csv)")
+
+    pending = state.get("pending_orders", [])
+    lines.append("")
+    lines.append(f"--- Pending orders ({len(pending)}) -- fill on next processed session ---")
+    for o in pending[:40]:
+        lines.append(
+            f"  {o['sleeve']} {o['ticker']}: {o['intended_side']} target wt {o['target_weight']:.2%} "
+            f"(~${_fmt_num(o['requested_notional'])}), signal {o['signal_date']} -> fill {o['scheduled_fill_date']}"
+        )
+    if len(pending) > 40:
+        lines.append(f"  ... and {len(pending) - 40} more (see paper_orders.csv)")
+
+    stale = state.get("rejected_stale_orders", [])
+    if stale:
+        lines.append("")
+        lines.append(f"--- Rejected / stale orders ({len(stale)}) -- reported, NOT filled ---")
+        for o in stale[:20]:
+            lines.append(f"  {o['sleeve']} {o['ticker']}: {o['reason']} (scheduled {o['scheduled_fill_date']})")
+
+    log = state.get("run_log", [])
+    if log:
+        last = log[-1]
+        lines.append("")
+        lines.append("--- Most recent run ---")
+        lines.append(f"  Paper date processed: {last.get('paper_date')}  (data cutoff {last.get('data_cutoff_date')})")
+        lines.append(f"  New signals: {last.get('num_new_signals')}   Pending created: {last.get('num_pending_created')}"
+                     f"   Fills: {last.get('num_fills')}   Stale: {last.get('num_stale')}")
+        lines.append(f"  Daily return: {_fmt_pct(last.get('daily_return'))}   "
+                     f"Cumulative: {_fmt_pct(last.get('cumulative_return'))}")
+        lines.append(f"  Run transaction costs: ${_fmt_num(last.get('transaction_costs_run'))}")
+        lines.append(f"  Reconciliation: {'OK' if last.get('reconciliation_ok') else 'FAILED'}")
+        run_warnings = last.get("warnings") or []
+        if run_warnings:
+            lines.append(f"  Warnings/deviations ({len(run_warnings)}):")
+            for w in run_warnings[:10]:
+                lines.append(f"    - {w}")
+
+    lines.append("")
+    lines.append("Execution model: close-to-close fills with a one-trading-day signal-to-fill "
+                 "lag (a signal on date T fills at the next session's close). No intraday "
+                 "assumptions, no same-close execution, no bid/ask spread, no market impact.")
+    lines.append("")
+    lines.extend(_paper_banner())
+
+    path.write_text("\n".join(lines) + "\n")
+
+
+def write_paper_artifacts(config_data: dict, state: dict, dest_dir) -> Path:
+    """Write the derived paper artifacts (status txt + CSVs) into ``dest_dir``.
+    The authoritative paper_state.json / paper_config.json are written by
+    src.paper on each advance; this renders the human/CSV VIEWS of that state and
+    is safe to regenerate any time (it is a pure function of the passed dicts)."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    _write_paper_status_txt(dest_dir / "paper_status.txt", config_data, state)
+    _write_paper_orders_csv(dest_dir / "paper_orders.csv", state)
+    _write_paper_trades_csv(dest_dir / "paper_trades.csv", state)
+    _write_paper_positions_csv(dest_dir / "paper_positions.csv", state)
+    _write_paper_equity_csv(dest_dir / "paper_equity.csv", state)
+    _write_paper_sleeves_csv(dest_dir / "paper_sleeves.csv", state)
+    _write_paper_run_log_csv(dest_dir / "paper_run_log.csv", state)
+    return dest_dir

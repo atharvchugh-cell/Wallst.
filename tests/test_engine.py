@@ -268,3 +268,87 @@ def test_missing_price_at_scheduled_fill_date_raises():
     strat = ScriptedStrategy(["A"], schedule)
     with pytest.raises(EventValidationError):
         run_backtest(strat, truncated, dates, dates[0], dates[-1], capital=1000.0)
+
+
+# --- Paper-trading engine features: signal_calendar (pending orders) + defer_unfillable (stale) ---
+
+def test_signal_calendar_collects_day_end_signal_as_pending_order():
+    """With a signal_calendar that extends one session beyond `end`, a signal
+    emitted on day `end` gets a valid future fill_date and is collected as a
+    PENDING order (not executed, not in transactions) -- the paper-trading
+    one-day-lag primitive."""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    next_session = dates[-1] + pd.offsets.BDay(1)
+    price_data = {"A": make_price_df([100.0] * 5, dates)}
+    # Signal on the LAST executed day, filling on the (beyond-end) next session.
+    schedule = {dates[-1]: [("A", next_session, 1.0, "entry")]}
+    strat = ScriptedStrategy(["A"], schedule)
+    sig_cal = dates.append(pd.DatetimeIndex([next_session]))
+    result = run_backtest(
+        strat, price_data, dates, dates[0], dates[-1], capital=1000.0, cost_bps=0.0,
+        signal_calendar=sig_cal,
+    )
+    assert len(result.pending_orders) == 1
+    assert result.pending_orders[0].ticker == "A"
+    assert result.pending_orders[0].fill_date == next_session
+    # NOT executed: no transaction, equity untouched by the pending order.
+    assert all(pd.Timestamp(tx.fill_date) <= dates[-1] for tx in result.transactions)
+    assert not any(tx.ticker == "A" for tx in result.transactions)
+    assert result.equity_curve.iloc[-1] == pytest.approx(1000.0)
+
+
+def test_pending_order_beyond_end_not_in_signal_calendar_still_raises():
+    """A fill_date past `end` that is NOT in the signal_calendar is a bug, not a
+    pending order -- it must still raise (default backtest behavior preserved)."""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    bogus = pd.Timestamp("2030-01-01")
+    price_data = {"A": make_price_df([100.0] * 5, dates)}
+    schedule = {dates[0]: [("A", bogus, 1.0, "entry")]}
+    strat = ScriptedStrategy(["A"], schedule)
+    with pytest.raises(EventValidationError):
+        run_backtest(strat, price_data, dates, dates[0], dates[-1], capital=1000.0)
+
+
+def test_defer_unfillable_routes_missing_fill_price_to_stale_not_filled():
+    """When a scheduled fill session has no usable price for the ticker,
+    defer_unfillable records a STALE order and does NOT fill it (never silently
+    fill an order whose fill price is unavailable)."""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    df = make_price_df([100.0] * 5, dates)
+    df.loc[dates[2], "Close"] = float("nan")  # no usable price at the fill date
+    price_data = {"A": df}
+    schedule = {dates[1]: [("A", dates[2], 1.0, "entry")]}
+    strat = ScriptedStrategy(["A"], schedule)
+    result = run_backtest(
+        strat, price_data, dates, dates[0], dates[-1], capital=1000.0, cost_bps=0.0,
+        defer_unfillable=True,
+    )
+    assert len(result.stale_orders) == 1
+    assert result.stale_orders[0].ticker == "A"
+    assert not any(tx.ticker == "A" for tx in result.transactions)  # never filled
+    assert result.equity_curve.iloc[-1] == pytest.approx(1000.0)
+
+
+def test_missing_fill_price_without_defer_raises():
+    """Default behavior (no defer_unfillable) still hard-fails on a missing fill
+    price rather than skipping it."""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    df = make_price_df([100.0] * 5, dates)
+    df.loc[dates[2], "Close"] = float("nan")
+    price_data = {"A": df}
+    schedule = {dates[1]: [("A", dates[2], 1.0, "entry")]}
+    strat = ScriptedStrategy(["A"], schedule)
+    with pytest.raises(EventValidationError):
+        run_backtest(strat, price_data, dates, dates[0], dates[-1], capital=1000.0)
+
+
+def test_signal_calendar_none_is_unchanged_behavior():
+    """Omitting signal_calendar reproduces the pre-existing behavior exactly:
+    no pending orders, no stale orders."""
+    dates = pd.bdate_range("2024-01-01", periods=6)
+    price_data = {"A": make_price_df([100.0] * 6, dates)}
+    schedule = {dates[0]: [("A", dates[1], 1.0, "entry")]}
+    strat = ScriptedStrategy(["A"], schedule)
+    result = run_backtest(strat, price_data, dates, dates[0], dates[-1], capital=1000.0, cost_bps=0.0)
+    assert result.pending_orders == []
+    assert result.stale_orders == []

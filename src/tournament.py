@@ -199,6 +199,171 @@ class SleeveRun:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PreparedSleeveData:
+    """The fully validated inputs a sleeve's engine walk needs: clean price
+    frames, the canonical calendar, the (possibly clipped) effective start, the
+    benchmark frame, and the audit bookkeeping (dropped tickers, warnings,
+    cache summary). Produced once by prepare_stock_plan/prepare_sector_plan and
+    consumed by BOTH the tournament sleeve runners and the paper-trading driver,
+    so paper can never diverge from backtest in how data is fetched, gap-checked,
+    or history-filtered."""
+
+    clean_price_data: dict[str, pd.DataFrame]
+    full_calendar: pd.DatetimeIndex
+    effective_start: pd.Timestamp
+    spy_df: pd.DataFrame
+    pre_drops: list[tuple[str, str]]
+    warnings: list[str]
+    cache_summary: str
+    history_excluded: list[tuple[str, str]] = field(default_factory=list)
+    first_dates: dict = field(default_factory=dict)
+
+
+def prepare_stock_plan(
+    spec: StrategySpec,
+    strategy: Strategy,
+    start,
+    end,
+    refresh_cache: bool,
+    warmup_override: int | None = None,
+) -> PreparedSleeveData:
+    """Fetch + validate a "stock" data plan: per-window warmup fetch, per-window
+    listing-history filter, in-range gap drops (signal-ticker gaps hard-fail),
+    and the minimum-usable-universe guard. Mutates strategy.universe down to the
+    surviving tickers. This is the exact logic the stock sleeve runner used
+    inline; extracted verbatim so paper reuses it."""
+    warmup_days = warmup_override if warmup_override is not None else spec.warmup_calendar_days
+    original_universe_size = len(strategy.universe)
+    warnings: list[str] = []
+
+    fetch_tickers = list(strategy.universe) + [
+        t for t in strategy.signal_tickers if t != config.BENCHMARK_TICKER
+    ]
+    price_data, fetch_dropped = data.get_price_data(
+        fetch_tickers, start, end,
+        warmup_calendar_days=warmup_days,
+        hard_fail_on_missing=False, force_refresh=refresh_cache,
+    )
+    fetch_start = pd.Timestamp(start) - pd.Timedelta(days=warmup_days)
+    spy_df = data.get_benchmark_data(fetch_start, end, force_refresh=refresh_cache)
+    if config.BENCHMARK_TICKER in strategy.signal_tickers:
+        price_data[config.BENCHMARK_TICKER] = spy_df.copy()
+
+    full_calendar = data.build_canonical_calendar(spy_df, fetch_start, end)
+    full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
+    if excluded_today:
+        warnings.append("Excluded today's bar (not finalized at fetch time).")
+
+    present_universe = [t for t in strategy.universe if t in price_data]
+    _hist_kept, history_excluded = data.filter_by_sufficient_history(
+        price_data, present_universe, start, warmup_days
+    )
+    for t, _reason in history_excluded:
+        price_data.pop(t, None)
+
+    calendar_in_range = full_calendar[
+        (full_calendar >= pd.Timestamp(start)) & (full_calendar <= pd.Timestamp(end))
+    ]
+    gap_dropped: list[tuple[str, str]] = []
+    clean_price_data = {}
+    for ticker, df in price_data.items():
+        gaps = data.find_gaps(df, calendar_in_range)
+        if len(gaps) > 0:
+            if ticker in strategy.signal_tickers:
+                raise data.FetchError(
+                    f"Signal ticker {ticker} (required by {strategy.name}) has "
+                    f"{len(gaps)} gap day(s) in the active range (e.g. {gaps[0].date()}); "
+                    f"refusing to run with a degraded regime signal."
+                )
+            gap_dropped.append((ticker, f"{len(gaps)} gap day(s) in active range, e.g. {gaps[0].date()}"))
+            continue
+        clean_price_data[ticker] = df
+
+    strategy.universe = [t for t in strategy.universe if t in clean_price_data]
+    pre_drops = list(fetch_dropped) + history_excluded + gap_dropped
+
+    min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
+    if len(strategy.universe) < min_required:
+        raise data.FetchError(
+            f"Only {len(strategy.universe)}/{original_universe_size} {strategy.name} tickers have "
+            f"usable data (minimum required: {min_required}, "
+            f"{config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION:.0%} of configured universe). Refusing "
+            f"to run on a degraded universe. Dropped: {pre_drops}"
+        )
+
+    return PreparedSleeveData(
+        clean_price_data=clean_price_data,
+        full_calendar=full_calendar,
+        effective_start=pd.Timestamp(start),
+        spy_df=spy_df,
+        pre_drops=pre_drops,
+        warnings=warnings,
+        cache_summary=f"{len(clean_price_data)} tickers used, {len(pre_drops)} dropped",
+        history_excluded=history_excluded,
+    )
+
+
+def prepare_sector_plan(
+    strategy: Strategy, start, end, refresh_cache: bool,
+) -> PreparedSleeveData:
+    """Fetch + validate a "sector" data plan: broad fetch from BROAD_FETCH_START,
+    hard-fail on any missing/gapped universe ticker, effective start clipped to
+    latest ETF inception + lookback. Extracted verbatim from the sector sleeve
+    runner so paper reuses it."""
+    warnings: list[str] = []
+    fetch_tickers = list(strategy.universe) + [
+        t for t in strategy.signal_tickers if t != config.BENCHMARK_TICKER
+    ]
+    price_data, _ = data.get_price_data(
+        fetch_tickers, BROAD_FETCH_START, end,
+        warmup_calendar_days=0, hard_fail_on_missing=True, force_refresh=refresh_cache,
+    )
+    spy_df = data.get_benchmark_data(BROAD_FETCH_START, end, force_refresh=refresh_cache)
+    if config.BENCHMARK_TICKER in strategy.signal_tickers:
+        price_data[config.BENCHMARK_TICKER] = spy_df.copy()
+
+    universe_frames = {t: price_data[t] for t in strategy.universe}
+    effective_start, first_dates = data.compute_sector_effective_start(
+        universe_frames, start, getattr(strategy, "lookback_months", config.SECTOR_LOOKBACK_MONTHS)
+    )
+    if effective_start > pd.Timestamp(start):
+        warnings.append(
+            f"Requested start {pd.Timestamp(start).date()} predates full sector history; "
+            f"clipped to effective start {effective_start.date()}."
+        )
+
+    full_calendar = data.build_canonical_calendar(spy_df, BROAD_FETCH_START, end)
+    full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
+    if excluded_today:
+        warnings.append("Excluded today's bar (not finalized at fetch time).")
+
+    calendar_in_range = full_calendar[
+        (full_calendar >= effective_start) & (full_calendar <= pd.Timestamp(end))
+    ]
+    for ticker, df in price_data.items():
+        gaps = data.find_gaps(df, calendar_in_range)
+        if len(gaps) > 0:
+            raise data.FetchError(
+                f"{strategy.name} requires a complete history for {ticker}, but found "
+                f"{len(gaps)} gap day(s) in its active range (e.g. {gaps[0].date()})."
+            )
+
+    return PreparedSleeveData(
+        clean_price_data=price_data,
+        full_calendar=full_calendar,
+        effective_start=effective_start,
+        spy_df=spy_df,
+        pre_drops=[],
+        warnings=warnings,
+        cache_summary=(
+            f"{len(price_data)} tickers used, first available dates: "
+            + ", ".join(f"{t}={d.date()}" for t, d in first_dates.items())
+        ),
+        first_dates=first_dates,
+    )
+
+
 # --- Generic sleeve runner ------------------------------------------------------
 
 def run_tournament_sleeve(
@@ -257,141 +422,39 @@ def _run_stock_plan(
     spec, strategy, start, end, capital, cost_bps, fractional_shares, refresh_cache,
     warmup_override, warnings,
 ):
-    warmup_days = warmup_override if warmup_override is not None else spec.warmup_calendar_days
-    original_universe_size = len(strategy.universe)
+    prepared = prepare_stock_plan(spec, strategy, start, end, refresh_cache, warmup_override)
+    warnings.extend(prepared.warnings)
 
-    fetch_tickers = list(strategy.universe) + [
-        t for t in strategy.signal_tickers if t != config.BENCHMARK_TICKER
-    ]
-    price_data, fetch_dropped = data.get_price_data(
-        fetch_tickers, start, end,
-        warmup_calendar_days=warmup_days,
-        hard_fail_on_missing=False, force_refresh=refresh_cache,
-    )
-    fetch_start = pd.Timestamp(start) - pd.Timedelta(days=warmup_days)
-    spy_df = data.get_benchmark_data(fetch_start, end, force_refresh=refresh_cache)
-    # The benchmark frame doubles as the regime-signal frame when the signal
-    # ticker IS the benchmark (SPY, the only case today) -- one fetch, and
-    # get_benchmark_data's own hard-fail guarantees make it strictly safer
-    # than a droppable get_price_data fetch for a required signal input.
-    if config.BENCHMARK_TICKER in strategy.signal_tickers:
-        price_data[config.BENCHMARK_TICKER] = spy_df.copy()
-
-    full_calendar = data.build_canonical_calendar(spy_df, fetch_start, end)
-    full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
-    if excluded_today:
-        warnings.append("Excluded today's bar (not finalized at fetch time).")
-
-    # Per-window, per-strategy listing-history filter: exclude universe
-    # tickers that lack enough history to warm up THIS strategy's indicators
-    # for THIS window (e.g. a current-$50B name that IPO'd after the window
-    # start). Applied to the tradable universe only -- signal tickers (SPY)
-    # go through their own required-history/gap path below. Fetch-failed
-    # tickers keep their own `fetch_dropped` reason; this adds the
-    # partial-history exclusions on top, so nothing missing-history is
-    # silently treated as valid.
-    present_universe = [t for t in strategy.universe if t in price_data]
-    _hist_kept, history_excluded = data.filter_by_sufficient_history(
-        price_data, present_universe, start, warmup_days
-    )
-    for t, _reason in history_excluded:
-        price_data.pop(t, None)
-
-    calendar_in_range = full_calendar[
-        (full_calendar >= pd.Timestamp(start)) & (full_calendar <= pd.Timestamp(end))
-    ]
-    gap_dropped: list[tuple[str, str]] = []
-    clean_price_data = {}
-    for ticker, df in price_data.items():
-        gaps = data.find_gaps(df, calendar_in_range)
-        if len(gaps) > 0:
-            if ticker in strategy.signal_tickers:
-                raise data.FetchError(
-                    f"Signal ticker {ticker} (required by {strategy.name}) has "
-                    f"{len(gaps)} gap day(s) in the active range (e.g. {gaps[0].date()}); "
-                    f"refusing to run with a degraded regime signal."
-                )
-            gap_dropped.append((ticker, f"{len(gaps)} gap day(s) in active range, e.g. {gaps[0].date()}"))
-            continue
-        clean_price_data[ticker] = df
-
-    strategy.universe = [t for t in strategy.universe if t in clean_price_data]
-    pre_drops = list(fetch_dropped) + history_excluded + gap_dropped
-
-    min_required = max(1, int(original_universe_size * config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION))
-    if len(strategy.universe) < min_required:
-        raise data.FetchError(
-            f"Only {len(strategy.universe)}/{original_universe_size} {strategy.name} tickers have "
-            f"usable data (minimum required: {min_required}, "
-            f"{config.MIN_MEAN_REVERSION_UNIVERSE_FRACTION:.0%} of configured universe). Refusing "
-            f"to run on a degraded universe. Dropped: {pre_drops}"
-        )
-
-    effective_end = full_calendar[-1] if len(full_calendar) else pd.Timestamp(end)
+    effective_end = prepared.full_calendar[-1] if len(prepared.full_calendar) else pd.Timestamp(end)
     result = run_backtest(
-        strategy, clean_price_data, full_calendar, start, effective_end, capital, cost_bps, fractional_shares
+        strategy, prepared.clean_price_data, prepared.full_calendar, start, effective_end,
+        capital, cost_bps, fractional_shares,
     )
-    result.dropped_tickers = pre_drops + list(result.dropped_tickers)
+    result.dropped_tickers = prepared.pre_drops + list(result.dropped_tickers)
 
-    metrics = compute_all_metrics(result, benchmark_close=spy_df["Close"])
+    metrics = compute_all_metrics(result, benchmark_close=prepared.spy_df["Close"])
     run_config = _base_run_config(strategy, result, start, end, capital, cost_bps, fractional_shares, warnings)
-    run_config["cache_summary"] = f"{len(clean_price_data)} tickers used, {len(pre_drops)} dropped"
-    run_config["num_history_excluded"] = len(history_excluded)
-    run_config["num_universe_window_excluded"] = len(pre_drops)
+    run_config["cache_summary"] = prepared.cache_summary
+    run_config["num_history_excluded"] = len(prepared.history_excluded)
+    run_config["num_universe_window_excluded"] = len(prepared.pre_drops)
     run_config["universe_window_excluded"] = [
-        {"ticker": t, "reason": r} for t, r in pre_drops
+        {"ticker": t, "reason": r} for t, r in prepared.pre_drops
     ]
     return result, metrics, run_config
 
 
 def _run_sector_plan(spec, strategy, start, end, capital, cost_bps, fractional_shares, refresh_cache, warnings):
-    fetch_tickers = list(strategy.universe) + [
-        t for t in strategy.signal_tickers if t != config.BENCHMARK_TICKER
-    ]
-    price_data, _ = data.get_price_data(
-        fetch_tickers, BROAD_FETCH_START, end,
-        warmup_calendar_days=0, hard_fail_on_missing=True, force_refresh=refresh_cache,
-    )
-    spy_df = data.get_benchmark_data(BROAD_FETCH_START, end, force_refresh=refresh_cache)
-    if config.BENCHMARK_TICKER in strategy.signal_tickers:
-        price_data[config.BENCHMARK_TICKER] = spy_df.copy()
+    prepared = prepare_sector_plan(strategy, start, end, refresh_cache)
+    warnings.extend(prepared.warnings)
 
-    universe_frames = {t: price_data[t] for t in strategy.universe}
-    effective_start, first_dates = data.compute_sector_effective_start(
-        universe_frames, start, getattr(strategy, "lookback_months", config.SECTOR_LOOKBACK_MONTHS)
-    )
-    if effective_start > pd.Timestamp(start):
-        warnings.append(
-            f"Requested start {pd.Timestamp(start).date()} predates full sector history; "
-            f"clipped to effective start {effective_start.date()}."
-        )
-
-    full_calendar = data.build_canonical_calendar(spy_df, BROAD_FETCH_START, end)
-    full_calendar, excluded_today = data.exclude_unfinalized_today(full_calendar)
-    if excluded_today:
-        warnings.append("Excluded today's bar (not finalized at fetch time).")
-
-    calendar_in_range = full_calendar[
-        (full_calendar >= effective_start) & (full_calendar <= pd.Timestamp(end))
-    ]
-    for ticker, df in price_data.items():
-        gaps = data.find_gaps(df, calendar_in_range)
-        if len(gaps) > 0:
-            raise data.FetchError(
-                f"{strategy.name} requires a complete history for {ticker}, but found "
-                f"{len(gaps)} gap day(s) in its active range (e.g. {gaps[0].date()})."
-            )
-
-    effective_end = full_calendar[-1] if len(full_calendar) else pd.Timestamp(end)
+    effective_end = prepared.full_calendar[-1] if len(prepared.full_calendar) else pd.Timestamp(end)
     result = run_backtest(
-        strategy, price_data, full_calendar, effective_start, effective_end, capital, cost_bps, fractional_shares
+        strategy, prepared.clean_price_data, prepared.full_calendar, prepared.effective_start,
+        effective_end, capital, cost_bps, fractional_shares,
     )
-    metrics = compute_all_metrics(result, benchmark_close=spy_df["Close"])
+    metrics = compute_all_metrics(result, benchmark_close=prepared.spy_df["Close"])
     run_config = _base_run_config(strategy, result, start, end, capital, cost_bps, fractional_shares, warnings)
-    run_config["cache_summary"] = (
-        f"{len(price_data)} tickers used, first available dates: "
-        + ", ".join(f"{t}={d.date()}" for t, d in first_dates.items())
-    )
+    run_config["cache_summary"] = prepared.cache_summary
     return result, metrics, run_config
 
 
