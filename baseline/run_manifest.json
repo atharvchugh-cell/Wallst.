@@ -1,0 +1,509 @@
+{
+  "schema_version": 1,
+  "run_kind": "baseline",
+  "generated_at": "2026-07-12T15:44:52.495746",
+  "git_sha": "11a9d733f3ff3bfabcd02ee1469ce3dc5cc005fc",
+  "versions": {
+    "python": "3.9.6",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "pandas": "2.2.0",
+    "numpy": "1.26.0",
+    "matplotlib": "3.8.0",
+    "yfinance": "1.2.0"
+  },
+  "lab_config": {
+    "trace": true,
+    "vol_target": {
+      "enabled": false,
+      "target_annual_vol": 0.12,
+      "lookback_days": 63,
+      "min_exposure": 0.4,
+      "max_exposure": 1.0,
+      "smoothing_days": 5,
+      "adjustment_band": 0.05,
+      "evaluate": "weekly"
+    },
+    "drawdown_throttle": {
+      "enabled": false,
+      "levels": [
+        [
+          -0.08,
+          0.75
+        ],
+        [
+          -0.15,
+          0.5
+        ]
+      ],
+      "recovery_margin": 0.03,
+      "cooldown_days": 10,
+      "evaluate": "daily"
+    },
+    "allocation": {
+      "enabled": false,
+      "method": "inverse_vol",
+      "lookback_days": 126,
+      "min_interval_months": 3,
+      "no_trade_threshold": 0.05,
+      "bounds": {
+        "momentum": [
+          0.4,
+          0.75
+        ],
+        "sector_rotation": [
+          0.15,
+          0.5
+        ],
+        "regime_switch": [
+          0.05,
+          0.25
+        ]
+      }
+    },
+    "no_trade_band": {
+      "enabled": false,
+      "min_weight_change": 0.01,
+      "min_notional": 25.0,
+      "monthly_turnover_budget_pct": null
+    },
+    "cash_yield": {
+      "enabled": false,
+      "annual_rate": 0.0,
+      "rate_series_csv": null
+    },
+    "concentration": {
+      "enabled": false,
+      "max_ticker_weight": 0.25
+    },
+    "sleeve_variants": {}
+  },
+  "lab_config_hash": "10c5cb77346c0df2",
+  "portfolio": {
+    "weights": {
+      "momentum": 0.6,
+      "sector_rotation": 0.35,
+      "regime_switch": 0.05
+    },
+    "capital": 15000.0,
+    "cost_bps": 5.0,
+    "fractional_shares": true,
+    "start": "2019-01-01",
+    "end": "2024-12-31",
+    "benchmark": "SPY",
+    "execution_lag": "signal at close of T, fill at close of next trading day (T+1)",
+    "fill_price": "adjusted close (auto_adjust=True)",
+    "cash_yield_annual": 0.0
+  },
+  "universe": {
+    "mode": "default",
+    "tickers": [
+      "AAPL",
+      "AMZN",
+      "BA",
+      "BAC",
+      "CAT",
+      "COST",
+      "CVX",
+      "DIS",
+      "GOOGL",
+      "HD",
+      "JNJ",
+      "JPM",
+      "KO",
+      "MA",
+      "MCD",
+      "META",
+      "MSFT",
+      "NFLX",
+      "NVDA",
+      "PEP",
+      "PFE",
+      "UNH",
+      "V",
+      "WMT",
+      "XLB",
+      "XLC",
+      "XLE",
+      "XLF",
+      "XLI",
+      "XLK",
+      "XLP",
+      "XLRE",
+      "XLU",
+      "XLV",
+      "XLY",
+      "XOM"
+    ],
+    "snapshot_info": {
+      "mode": "default",
+      "num_selected": 25,
+      "num_candidates": null,
+      "num_dropped_lookup_failed": null,
+      "num_excluded_not_listed": null,
+      "num_excluded_non_common": null,
+      "num_excluded_identity_mismatch": null,
+      "num_excluded_no_price_data": null,
+      "num_duplicate_companies_collapsed": null,
+      "min_market_cap": null,
+      "max_market_cap": null,
+      "cache_file": null,
+      "snapshot_date": null,
+      "price_data_validated_start": null,
+      "price_data_validated_end": null
+    },
+    "survivorship_note": "Stock universes are CURRENT-snapshot, survivorship-biased lists, not point-in-time constituents. See docs/RED_TEAM.md A1."
+  },
+  "strategy_params": {
+    "momentum": {
+      "name": "momentum",
+      "family": "momentum",
+      "universe_size": 25,
+      "signal_tickers": [],
+      "params": {
+        "lookback_trading_days": 126,
+        "top_k": 5,
+        "trend_sma_period": 200,
+        "rebalance": "monthly (last trading day of month)"
+      },
+      "assumptions": [
+        "Universe is survivorship-biased (today's large caps) -- momentum results on such a list are upward-biased, since past winners that later died are absent.",
+        "6-month lookback and 200-day SMA are canonical literature conventions, not tuned on this data; sensitivity variants are reported, never auto-selected.",
+        "No intramonth exits or stops -- a crash between month-ends is ridden until the next rebalance.",
+        "Cash earns 0% during defensive fallback (conservative; no T-bill yield)."
+      ]
+    },
+    "sector_rotation": {
+      "name": "sector_rotation",
+      "family": "momentum",
+      "universe_size": 11,
+      "signal_tickers": [],
+      "params": {
+        "lookback_months": 3,
+        "top_k": 2
+      },
+      "assumptions": [
+        "Always fully invested in the top-K sectors, even in a broad bear market (ranks 'least bad' sectors rather than de-risking).",
+        "top_k=2 was re-tuned mid-development (see config.py comments) -- treat single-window results as in-sample.",
+        "Universe is the 11 fixed SPDR sector ETFs; earliest usable start is bounded by XLC's 2018 inception + the lookback."
+      ]
+    },
+    "regime_switch": {
+      "name": "regime_switch",
+      "family": "regime_switch",
+      "universe_size": 11,
+      "signal_tickers": [
+        "SPY"
+      ],
+      "params": {
+        "lookback_months": 3,
+        "top_k": 2,
+        "regime_ticker": "SPY",
+        "regime_sma_period": 200,
+        "risk_off_allocation": "100% cash (earns 0%)"
+      },
+      "assumptions": [
+        "Risk-on behavior is EXACTLY sector rotation (inherited code path, same lookback/top-K); differences vs. sector rotation isolate the regime filter.",
+        "The 200-day SMA regime filter exits after crashes start and re-enters after recoveries start -- it will look bad around V-bottoms (2020) and good in sustained bears (2022). Judge it across BOTH window types.",
+        "Cash earns 0% while risk-off (no T-bill yield credited -- conservative).",
+        "Regime is checked only at month-end signal dates (no intramonth de-risking)."
+      ]
+    }
+  },
+  "warmup_calendar_days": {
+    "momentum": 500,
+    "sector_rotation": 0,
+    "regime_switch": 0
+  },
+  "seeds": {},
+  "data_cache": {
+    "cache_dir": "data_cache",
+    "num_tickers": 37,
+    "digest": "7e4a459823ae4a4e",
+    "entries": [
+      {
+        "ticker": "AAPL",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:57.570294+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "AMZN",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:58.070119+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "BA",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:04.075583+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "BAC",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:59.348560+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "CAT",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:03.775515+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "COST",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:03.549316+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "CVX",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:01.472539+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "DIS",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:02.339942+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "GOOGL",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:58.265326+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "HD",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:01.777574+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "JNJ",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:59.996558+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "JPM",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:59.097192+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "KO",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:02.621608+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "MA",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:59.795862+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "MCD",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:02.038156+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "META",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:58.438151+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "MSFT",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:57.835286+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "NFLX",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:04.361684+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "NVDA",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:58.801422+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "PEP",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:02.924587+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "PFE",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:00.584156+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "SPY",
+        "cached_start": "1993-01-29 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.294082+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "UNH",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:00.308811+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "V",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:32:59.581079+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "WMT",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:03.191096+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLB",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.206054+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLC",
+        "cached_start": "2018-06-19 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.272636+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLE",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:50.911788+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLF",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:50.864225+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLI",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.159694+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLK",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:50.815633+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLP",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.052647+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLRE",
+        "cached_start": "2015-10-08 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.251791+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLU",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.112316+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLV",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:50.958791+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XLY",
+        "cached_start": "1998-12-22 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-12T19:44:51.005227+00:00",
+        "yfinance_version": "1.2.0"
+      },
+      {
+        "ticker": "XOM",
+        "cached_start": "2014-01-31 00:00:00",
+        "cached_end": "2024-12-31 00:00:00",
+        "last_full_refresh": "2026-07-10T01:33:01.146136+00:00",
+        "yfinance_version": "1.2.0"
+      }
+    ]
+  },
+  "holdout": {
+    "declared": null,
+    "first_evaluated_at": null
+  },
+  "artifact_hashes": {
+    "baseline_snapshot.json": "3cb34812d31537289a04f551721175ecdc5d9280eb52e11aae41cd6dc4f494c8",
+    "decision_summary.json": "dcc44ee4428f3c0cae0d3150f7d9bed02a70d11701eff42e5cfbe415dbd69adc",
+    "decision_trace.csv": "f43f5ba48176fa27527d4f4befebec6f61f41ff8db0076239e40869c9155f1f3",
+    "decision_trace.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "order_trace.csv": "74afa562260aed399b2d53a2f16fd7cb20226d59e97fd7b04e65d15a32a14f11",
+    "portfolio.json": "2b028322137d8f6aaf6a9743cc3d5949713174291c49b6678e25a00ddc66a0c5",
+    "portfolio_equity.csv": "e92f4105c42f57c0de790235d364a465be5331a9685528d6c1b22b39f602749e",
+    "portfolio_equity.png": "d11ef89788da7b1aab5a1c4475e80db1eb055a7fc7f6a55f8c63c7b35c90ca90",
+    "portfolio_report.txt": "ac0755e367627f4d1e0cdd85047a93026b7324e474f0d3f5758f422b2d04e88c",
+    "portfolio_sleeves.csv": "e54fe67e328d15286b2077bc98c48c09a5c77f5a01ce08b26fdd684e7d0f1c1f",
+    "portfolio_summary.csv": "facdce927211c66966aa0b5075642586f42229e21d317e985b5dceec50c1ac8d",
+    "portfolio_trace.csv": "a708f830aee82531217d2cc8b24c71ad192e7f37e29d9720c95011821692b421",
+    "reason_code_summary.csv": "2df5c8b046effb1a22c706474ab19f2bd8a956356daefd7b4a25c752708cc890",
+    "selection_funnel.csv": "2b55dcc0fa8bde6e5e170d7a09a81adf7356c7de8108028bc90b82511c46f474"
+  },
+  "portfolio_result_summary": {
+    "final_equity": 52495.08794280118,
+    "common_start": "2019-01-02",
+    "common_end": "2024-12-31"
+  }
+}

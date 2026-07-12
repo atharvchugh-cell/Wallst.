@@ -21,6 +21,7 @@ from .reporting import (
     write_run_artifacts, write_comparison_report, compute_sleeve_contribution, write_robustness_report,
     write_tournament_report, write_portfolio_report, write_walk_forward_report,
 )
+from .lab.cli import add_lab_arguments
 from .robustness import ALLOCATION_MIXES, DEFAULT_ROBUSTNESS_WINDOWS, blend_metrics
 from .strategies.mean_reversion import MeanReversionStrategy
 from .strategies.sector_rotation import SectorRotationStrategy
@@ -37,7 +38,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--strategy",
         choices=[
             "mean_reversion", "sector_rotation", "both", "compare", "robustness",
-            "tournament", "portfolio", "walk_forward",
+            "tournament", "portfolio", "walk_forward", "strategy_lab",
         ],
         required=True,
     )
@@ -162,6 +163,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "failing. NOT the default -- Nasdaq Trader is normally a REQUIRED eligibility gate on "
         "screener results, since the screener alone can return non-US-listed/non-tradable symbols.",
     )
+    add_lab_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -849,6 +851,11 @@ def main(argv=None) -> int:
 
     if args.strategy == "walk_forward":
         return run_walk_forward(args)
+
+    if args.strategy == "strategy_lab":
+        from .lab.cli import run_strategy_lab
+
+        return run_strategy_lab(args)
 
     fractional_shares = not args.no_fractional_shares
     mr_result = sr_result = None
