@@ -90,6 +90,28 @@ class SectorRotationStrategy(Strategy):
                 returns[ticker] = val
         ranked = sorted(returns.items(), key=lambda kv: kv[1], reverse=True)
         top_k_tickers = {t for t, _ in ranked[: self.top_k]}
+        rank_of = {t: i + 1 for i, (t, _v) in enumerate(ranked)}
+        num_ranked = len(ranked)
+
+        if self.recorder is not None:
+            for ticker in self.universe:
+                if ticker not in returns:
+                    self._trace(
+                        decision_date=signal_date, ticker=ticker, reason_code="INSUFFICIENT_HISTORY",
+                        eligible=False, selected=False, top_k=self.top_k, num_ranked=num_ranked,
+                        signal_date=signal_date, fill_date=fill_date,
+                    )
+                    continue
+                is_selected = ticker in top_k_tickers
+                self._trace(
+                    decision_date=signal_date, ticker=ticker,
+                    reason_code="SELECTED_TOP_K" if is_selected else "RANK_BELOW_CUTOFF",
+                    eligible=True, selected=is_selected, rank_score=returns[ticker],
+                    rank=rank_of.get(ticker), num_ranked=num_ranked, top_k=self.top_k,
+                    lookback_days=self.lookback_months, target_weight=(1.0 / self.top_k) if is_selected else 0.0,
+                    signal_date=signal_date, fill_date=fill_date,
+                )
+
         events = []
         for ticker in self.universe:
             if ticker not in returns:

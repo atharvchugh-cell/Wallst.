@@ -451,6 +451,71 @@ def selection_funnel(trace: DecisionTrace) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["decision_date", "sleeve"], kind="mergesort").reset_index(drop=True)
 
 
+def build_decision_report(trace: DecisionTrace) -> str:
+    """Human-readable decision-audit report answering the decision-level
+    questions from the mission (selection funnel, which rule rejects the most,
+    how often cash is held). Deeper P&L attribution lives in the attribution
+    artifacts (sleeve_attribution.csv / ticker_attribution.csv). Every number
+    here is counted from the trace -- nothing is recomputed from prices."""
+    dec = decisions_frame(trace)
+    lines: list[str] = []
+    lines.append("=== Decision Audit Report ===")
+    lines.append("")
+    lines.append("** RESEARCH / EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. **")
+    lines.append(f"Lab config hash: {trace.lab_config_hash}")
+    win = ""
+    if trace.common_start is not None:
+        win = f"{trace.common_start.date()} to {trace.common_end.date()}"
+    lines.append(f"Window: {win}")
+    lines.append(f"Sleeves: {', '.join(trace.sleeve_names)}")
+    lines.append(f"Total decisions recorded: {len(dec)}")
+    lines.append("")
+
+    if dec.empty:
+        lines.append("(No decisions were recorded.)")
+        return "\n".join(lines) + "\n"
+
+    # Which rule rejected the most candidates?
+    lines.append("--- Which rule rejected the most candidates? ---")
+    rejection_codes = {
+        "RANK_BELOW_CUTOFF", "NEGATIVE_TRAILING_RETURN", "BELOW_TREND_FILTER",
+        "INSUFFICIENT_HISTORY", "MISSING_SIGNAL_DATA", "RSI_NOT_OVERSOLD",
+        "NO_FREE_SLOT", "ENTRY_FILTER_BLOCKED", "REGIME_RISK_OFF",
+    }
+    rej = dec[dec["reason_code"].isin(rejection_codes)]
+    for code, n in rej["reason_code"].value_counts().items():
+        lines.append(f"  {code}: {n}")
+    lines.append("")
+
+    # Selection funnel per sleeve (totals).
+    lines.append("--- Selection funnel (totals across all rebalances) ---")
+    funnel = selection_funnel(trace)
+    if not funnel.empty:
+        agg = funnel.groupby("sleeve")[["considered", "had_data", "eligible", "selected"]].sum()
+        for sleeve, row in agg.iterrows():
+            lines.append(f"  {sleeve}: considered {int(row['considered'])} -> had_data "
+                         f"{int(row['had_data'])} -> eligible {int(row['eligible'])} -> selected "
+                         f"{int(row['selected'])}")
+    lines.append("")
+
+    # How often was cash held (momentum fallback / regime risk-off)?
+    lines.append("--- Cash / de-risking events ---")
+    cash_fallback = int((dec["reason_code"] == "CASH_FALLBACK").sum())
+    risk_off_days = dec[dec["reason_code"] == "REGIME_RISK_OFF"]["decision_date"].nunique()
+    lines.append(f"  Momentum cash-fallback rebalances (fewer than top_k eligible): {cash_fallback}")
+    lines.append(f"  Regime-switch risk-off signal dates: {risk_off_days}")
+    lines.append("")
+
+    # Reason-code totals.
+    lines.append("--- Reason-code totals ---")
+    for code, n in dec["reason_code"].value_counts().items():
+        lines.append(f"  {code}: {n}")
+    lines.append("")
+    lines.append("For per-name and per-sleeve P&L attribution see sleeve_attribution.csv, "
+                 "ticker_attribution.csv, and rule_attribution.csv.")
+    return "\n".join(lines) + "\n"
+
+
 def write_trace_artifacts(trace: DecisionTrace, run_dir, benchmark_close: pd.Series | None = None) -> None:
     """Write the deterministic trace artifact set into `run_dir`. If
     `benchmark_close` is not passed, SPY is loaded from the cache over the
@@ -499,6 +564,7 @@ def write_trace_artifacts(trace: DecisionTrace, run_dir, benchmark_close: pd.Ser
             if trace.decisions else {}
         ),
     }
-    from .manifest import atomic_write_json
+    from .manifest import atomic_write_json, atomic_write_text
 
     atomic_write_json(run_dir / "decision_summary.json", summary)
+    atomic_write_text(run_dir / "decision_report.txt", build_decision_report(trace))

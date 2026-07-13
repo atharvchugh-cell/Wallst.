@@ -83,18 +83,38 @@ class RegimeSwitchStrategy(SectorRotationStrategy):
         enriched[self.regime_ticker] = regime_df
         return enriched
 
-    def _risk_on(self, signal_date: pd.Timestamp, market: MarketDataView) -> bool:
+    def _regime_state(
+        self, signal_date: pd.Timestamp, market: MarketDataView
+    ) -> tuple[bool, float | None, float | None]:
+        """Return (is_risk_on, regime_close, regime_sma). Reads the regime
+        ticker's close/SMA once; callers (and the trace) reuse the values so
+        there is never a duplicate read. Conservative default: if the regime
+        signal is unavailable, treat it as risk-off (values None)."""
         if not market.has_data(self.regime_ticker, signal_date):
-            return False  # can't confirm risk-on -> stay/go defensive (conservative)
+            return False, None, None
         regime_sma = market.indicator(self.regime_ticker, "RegimeSMA", signal_date)
         if pd.isna(regime_sma):
-            return False
-        return market.close(self.regime_ticker, signal_date) > regime_sma
+            return False, None, None
+        regime_close = market.close(self.regime_ticker, signal_date)
+        return (regime_close > regime_sma), regime_close, regime_sma
+
+    def _risk_on(self, signal_date: pd.Timestamp, market: MarketDataView) -> bool:
+        return self._regime_state(signal_date, market)[0]
 
     def _rebalance_events(
         self, signal_date: pd.Timestamp, market: MarketDataView, fill_date: pd.Timestamp | None
     ) -> list[TargetEvent]:
-        if self._risk_on(signal_date, market):
+        is_on, regime_close, regime_sma = self._regime_state(signal_date, market)
+        if self.recorder is not None:
+            self._trace(
+                decision_date=signal_date, ticker=self.regime_ticker, tradable=False,
+                reason_code="REGIME_RISK_ON" if is_on else "REGIME_RISK_OFF",
+                regime_state="risk_on" if is_on else "risk_off", eligible=None, selected=None,
+                regime_ticker=self.regime_ticker, regime_close=regime_close, regime_sma=regime_sma,
+                regime_sma_period=self.regime_sma_period, close=regime_close,
+                signal_date=signal_date, fill_date=fill_date,
+            )
+        if is_on:
             return super()._rebalance_events(signal_date, market, fill_date)
         # Risk-off: everything to cash. Emitting zero-weight targets for all
         # ETFs (rather than only held ones) is safe -- the engine treats a
@@ -105,6 +125,12 @@ class RegimeSwitchStrategy(SectorRotationStrategy):
         for ticker in self.universe:
             if not market.has_data(ticker, signal_date):
                 continue
+            if self.recorder is not None:
+                self._trace(
+                    decision_date=signal_date, ticker=ticker, reason_code="REGIME_RISK_OFF",
+                    regime_state="risk_off", eligible=False, selected=False, target_weight=0.0,
+                    signal_date=signal_date, fill_date=fill_date,
+                )
             events.append(
                 TargetEvent(
                     strategy=self.name, ticker=ticker, signal_date=signal_date, fill_date=fill_date,

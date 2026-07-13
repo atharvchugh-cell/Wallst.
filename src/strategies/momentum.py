@@ -125,19 +125,68 @@ class MomentumStrategy(Strategy):
     def _rebalance_events(
         self, signal_date: pd.Timestamp, market: MarketDataView, fill_date: pd.Timestamp | None
     ) -> list[TargetEvent]:
+        # First pass: read each ticker's indicators ONCE and classify its
+        # ineligibility reason. `evaluated` retains the read values so the
+        # trace pass reuses them (no second market read -- keeps the
+        # no-recorder path byte-identical).
+        evaluated: list[tuple[str, dict]] = []
         eligible: list[tuple[float, str]] = []
         for ticker in self.universe:
             if not market.has_data(ticker, signal_date):
+                evaluated.append((ticker, {"reject": "MISSING_SIGNAL_DATA", "eligible": False}))
                 continue
             mom = market.indicator(ticker, "MomentumReturn", signal_date)
             trend = market.indicator(ticker, "TrendSMA", signal_date)
             close = market.close(ticker, signal_date)
+            info: dict = {"close": close, "mom": mom, "trend": trend}
             if pd.isna(mom) or pd.isna(trend):
-                continue
-            if mom > 0 and close > trend:
+                info.update({"reject": "INSUFFICIENT_HISTORY", "eligible": False})
+            elif not (mom > 0):
+                info.update({"reject": "NEGATIVE_TRAILING_RETURN", "eligible": False})
+            elif not (close > trend):
+                info.update({"reject": "BELOW_TREND_FILTER", "eligible": False})
+            else:
+                info["eligible"] = True
                 eligible.append((mom, ticker))
+            evaluated.append((ticker, info))
         eligible.sort(key=lambda pair: pair[0], reverse=True)
         selected = {t for _mom, t in eligible[: self.top_k]}
+        rank_of = {t: i + 1 for i, (_mom, t) in enumerate(eligible)}
+        num_ranked = len(eligible)
+
+        # Trace one record per universe ticker (selected AND rejected), using
+        # action-oriented codes for held names and filter codes for the rest.
+        # No-op when no recorder is attached.
+        if self.recorder is not None:
+            for ticker, info in evaluated:
+                was_held = ticker in self._held
+                is_selected = ticker in selected
+                detail = None
+                if is_selected:
+                    code = "POSITION_RETAINED" if was_held else "SELECTED_TOP_K"
+                elif was_held:
+                    code = "POSITION_EXITED"
+                    detail = info.get("reject", "RANK_BELOW_CUTOFF")
+                elif info.get("eligible"):
+                    code = "RANK_BELOW_CUTOFF"
+                else:
+                    code = info["reject"]
+                self._trace(
+                    decision_date=signal_date, ticker=ticker, reason_code=code,
+                    reason_detail=detail, eligible=info.get("eligible", False),
+                    selected=is_selected, close=info.get("close"),
+                    lookback_return=info.get("mom"), lookback_days=self.lookback_trading_days,
+                    trend_sma=info.get("trend"), trend_sma_period=self.trend_sma_period,
+                    rank_score=info.get("mom"), rank=rank_of.get(ticker), num_ranked=num_ranked,
+                    top_k=self.top_k, target_weight=(1.0 / self.top_k) if is_selected else 0.0,
+                    signal_date=signal_date, fill_date=fill_date, was_held=was_held,
+                )
+            if len(selected) < self.top_k:
+                self._trace(
+                    decision_date=signal_date, ticker="CASH", reason_code="CASH_FALLBACK",
+                    tradable=False, eligible=None, selected=None, num_selected=len(selected),
+                    top_k=self.top_k, signal_date=signal_date, fill_date=fill_date,
+                )
 
         events: list[TargetEvent] = []
         # Weight is ALWAYS 1/top_k per selected name, never 1/len(selected):

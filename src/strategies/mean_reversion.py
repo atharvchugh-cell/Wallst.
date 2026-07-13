@@ -143,6 +143,11 @@ class MeanReversionStrategy(Strategy):
             if st.status == "open" and st.entry_fill_date is not None and st.entry_fill_date < day:
                 st.days_held += 1
 
+        _EXIT_CODE = {
+            "exit_stop_loss": "EXIT_STOP_LOSS", "exit_timeout": "EXIT_TIMEOUT",
+            "exit_sma": "EXIT_SMA", "exit_rsi": "EXIT_RSI",
+        }
+
         # 3. Exit decision (priority order: stop-loss, timeout, SMA, RSI).
         for ticker in self.universe:
             st = self._state[ticker]
@@ -150,6 +155,8 @@ class MeanReversionStrategy(Strategy):
                 continue
             close = market.close(ticker, day)
             reason = None
+            sma_val = None
+            rsi_val = None
             if close <= st.entry_fill_price * (1.0 + self.stop_loss_pct):
                 reason = "exit_stop_loss"
             elif st.days_held >= self.max_holding_days:
@@ -172,6 +179,15 @@ class MeanReversionStrategy(Strategy):
                         target_weight=0.0, sizing_price=close, reason=reason,
                     )
                 )
+                if self.recorder is not None:
+                    self._trace(
+                        decision_date=day, ticker=ticker, reason_code=_EXIT_CODE[reason],
+                        eligible=None, selected=False, close=close, rsi=rsi_val, sma=sma_val,
+                        days_held=st.days_held, max_holding_days=self.max_holding_days,
+                        stop_loss_pct=self.stop_loss_pct, rsi_exit=self.rsi_exit,
+                        position_return=(close / st.entry_fill_price - 1.0) if st.entry_fill_price else None,
+                        target_weight=0.0, signal_date=day, fill_date=fill_date,
+                    )
                 st.status = "pending_exit"
                 st.pending_fill_date = fill_date
 
@@ -179,16 +195,36 @@ class MeanReversionStrategy(Strategy):
         occupied = sum(1 for st in self._state.values() if st.status in ("open", "pending_entry", "pending_exit"))
         free_slots = self.max_concurrent_positions - occupied
         if free_slots > 0:
+            trace_fill = market.next_trading_day(day) if self.recorder is not None else None
             candidates = []
             for ticker in self.universe:
                 st = self._state[ticker]
                 if st.status != "flat" or not market.has_data(ticker, day):
                     continue
                 rsi_val = market.indicator(ticker, "RSI_14", day)
-                if pd.notna(rsi_val) and rsi_val < self.rsi_entry and self._entry_allowed(ticker, day, market):
-                    candidates.append((rsi_val, ticker))
+                if pd.isna(rsi_val) or rsi_val >= self.rsi_entry:
+                    continue  # not an oversold candidate -- uninformative, not traced
+                if not self._entry_allowed(ticker, day, market):
+                    if self.recorder is not None:
+                        self._trace(
+                            decision_date=day, ticker=ticker, reason_code="ENTRY_FILTER_BLOCKED",
+                            eligible=False, selected=False, rsi=rsi_val, rsi_entry=self.rsi_entry,
+                            signal_date=day, fill_date=trace_fill,
+                        )
+                    continue
+                candidates.append((rsi_val, ticker))
             candidates.sort(key=lambda pair: pair[0])  # lowest RSI (most oversold) first
-            for rsi_val, ticker in candidates[:free_slots]:
+            for i, (rsi_val, ticker) in enumerate(candidates):
+                filled_slot = i < free_slots
+                if not filled_slot:
+                    # Oversold and eligible, but no slot left this day.
+                    if self.recorder is not None:
+                        self._trace(
+                            decision_date=day, ticker=ticker, reason_code="NO_FREE_SLOT",
+                            eligible=True, selected=False, rsi=rsi_val, rsi_entry=self.rsi_entry,
+                            max_positions=self.max_concurrent_positions, signal_date=day, fill_date=trace_fill,
+                        )
+                    continue
                 st = self._state[ticker]  # re-fetch: `st` from the loop above is stale here
                 fill_date = market.next_trading_day(day)
                 if fill_date is None:
@@ -201,6 +237,12 @@ class MeanReversionStrategy(Strategy):
                         target_weight=weight, sizing_price=close, reason="entry_rsi",
                     )
                 )
+                if self.recorder is not None:
+                    self._trace(
+                        decision_date=day, ticker=ticker, reason_code="ENTRY_RSI_OVERSOLD",
+                        eligible=True, selected=True, rsi=rsi_val, rsi_entry=self.rsi_entry,
+                        target_weight=weight, signal_date=day, fill_date=fill_date,
+                    )
                 st.status = "pending_entry"
                 st.pending_fill_date = fill_date
 

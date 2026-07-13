@@ -48,6 +48,12 @@ class Strategy(abc.ABC):
     # these with `universe`; they are structurally untradable because every
     # entry/exit loop iterates `self.universe` only, and these are not in it.
     signal_tickers: list[str] = []
+    # Optional decision recorder attached by the lab engine (src/lab). Purely
+    # observational: strategies forward decision branches to it via _trace()
+    # but never read it back or let it alter control flow. Default None (the
+    # production path), where _trace() is a no-op. See the behavior-neutrality
+    # contract in src/lab/trace.py.
+    recorder = None
 
     def __init__(self) -> None:
         self.dropped_tickers: list[tuple[str, str]] = []
@@ -98,3 +104,18 @@ class Strategy(abc.ABC):
         `market` to read anything dated after `day` -- structurally enforced,
         since MarketDataView raises LookaheadError on such reads."""
         raise NotImplementedError
+
+    def _trace(self, **fields) -> None:
+        """Forward one decision branch to the attached recorder, if any.
+
+        Behavior-neutrality contract: this is a no-op unless a recorder is
+        attached, and callers MUST pass only already-computed local values --
+        never a fresh `market.close(...)`/`market.indicator(...)` read
+        embedded in an argument -- so the production (no-recorder) path does
+        exactly zero extra work and the traced path only reads what the
+        decision logic already read. The recorder only appends records; it
+        cannot change the events a strategy returns."""
+        rec = self.recorder
+        if rec is None:
+            return
+        rec.record_decision(sleeve=self.name, **fields)
