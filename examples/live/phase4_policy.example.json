@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "system_id": "paper-60-35-5-v1",
+  "mode": "observe",
+  "publisher_identity": "supervised-phase4-publisher",
+  "require_signing": true,
+  "signing_key_id": "phase4-local-v1",
+  "snapshot_ttl_seconds": 604800,
+  "max_quote_spread_bps": "50",
+  "max_price_deviation_bps": "200",
+  "max_snapshot_age_seconds": 604800,
+  "max_open_order_age_seconds": 1800,
+  "min_trade_notional": "25",
+  "max_cash_deployment_pct": "1.00",
+  "max_aggregate_ticker_weight": "0.25",
+  "dirty_worktree_policy": "reject",
+  "automatic_backup_directory": "phase4_backups",
+  "backup_retention": 30,
+  "critical_alert_escalation_seconds": 900
+}

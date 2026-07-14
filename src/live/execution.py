@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 from .broker import Broker
 from .deployment import (
@@ -81,6 +81,8 @@ class PaperExecutionService:
         targets: SleeveTargetSnapshot,
         *,
         confirm_new_equity_session: bool,
+        plan_validator: Callable[[ExecutionPlan, dict[str, Any]], None] | None = None,
+        phase4_link: tuple[str, str, bool] | None = None,
     ) -> tuple[ExecutionPlan, bool]:
         self.ledger.assert_account_binding(deployment.account_id)
         local_control = self.ledger.get_control_state(deployment.account_id)
@@ -152,14 +154,26 @@ class PaperExecutionService:
                 account.account_id, session.trading_date
             ),
         )
-        _row, created = self.ledger.create_execution_batch(plan)
+        if plan_validator is not None:
+            plan_validator(plan, quotes)
+        _row, created = self.ledger.create_execution_batch(plan, phase4_link=phase4_link)
         return plan, created
 
-    def execute(self, batch_id: str, *, operator: str, reason: str) -> BatchExecutionResult:
+    def execute(
+        self,
+        batch_id: str,
+        *,
+        operator: str,
+        reason: str,
+        phase4_authorizer: Callable[[str], None] | None = None,
+    ) -> BatchExecutionResult:
         if not operator.strip() or not reason.strip():
             raise ValueError("Execution requires an operator and reason")
         with self.ledger.batch_execution_guard():
-            return self._execute_under_guard(batch_id, operator=operator, reason=reason)
+            return self._execute_under_guard(
+                batch_id, operator=operator, reason=reason,
+                phase4_authorizer=phase4_authorizer,
+            )
 
     def settle(self, batch_id: str, *, operator: str, reason: str) -> BatchExecutionResult:
         """Synchronize an already-started batch without submitting new orders."""
@@ -240,12 +254,32 @@ class PaperExecutionService:
             return BatchExecutionResult(batch_id, row["status"], (), report.clean)
 
     def _execute_under_guard(
-        self, batch_id: str, *, operator: str, reason: str
+        self,
+        batch_id: str,
+        *,
+        operator: str,
+        reason: str,
+        phase4_authorizer: Callable[[str], None] | None,
     ) -> BatchExecutionResult:
         row = self.ledger.get_execution_batch(batch_id)
         if row is None:
             raise ExecutionBlocked(f"Unknown execution batch: {batch_id}")
         plan = self.ledger.load_execution_plan(batch_id)
+        phase4_link = self.ledger.conn.execute(
+            "SELECT * FROM phase4_plan_links WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if phase4_link is not None and not bool(phase4_link["paper_submission_allowed"]):
+            raise ExecutionBlocked(
+                f"Phase-4 {phase4_link['operation_mode']} plan is permanently non-submitting"
+            )
+        if phase4_link is not None:
+            if phase4_authorizer is None:
+                raise ExecutionBlocked(
+                    "Phase-4 linked batches must execute through Phase4Supervisor"
+                )
+            # Run inside the same cross-process batch guard as submission so a
+            # legacy Phase-3 call cannot race or bypass current Phase-4 gates.
+            phase4_authorizer(batch_id)
         local_control = self.ledger.get_control_state(plan.account_id)
         if local_control["armed"]:
             self.ledger.set_control_state(

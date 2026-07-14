@@ -31,6 +31,11 @@ class Broker(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_recent_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        """Return recent orders in every status, including terminal orders."""
+        raise NotImplementedError
+
+    @abstractmethod
     def get_order_by_client_id(self, client_order_id: str) -> BrokerOrder | None:
         raise NotImplementedError
 

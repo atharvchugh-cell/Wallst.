@@ -60,7 +60,7 @@ class AlpacaPaperMarketData(MarketDataProvider):
         self.config = config
         self._uses_default_session = session is None
         self.session = session if session is not None else requests.Session()
-        if self._uses_default_session:
+        if hasattr(self.session, "trust_env"):
             self.session.trust_env = False
         self.clock = clock
         self._request_ids: list[str] = []

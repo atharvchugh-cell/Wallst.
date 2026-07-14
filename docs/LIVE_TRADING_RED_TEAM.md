@@ -1,9 +1,9 @@
-# Phase 1–3 Adversarial Review
+# Phase 1–4 Adversarial Review
 
 ## Verdict
 
 Reviewed and hardened on 2026-07-14. The result is suitable for offline OMS
-testing and a manually supervised, exact-hash-approved Alpaca paper pilot.
+testing and a supervised, signed-target, exact-hash-approved Alpaca paper pilot.
 No credentialed paper request or order was made during implementation. It is
 **not bulletproof**, is not ready for unattended operation, and is not
 authorized for live money.
@@ -57,13 +57,59 @@ turnover failure, open-order preview, price-collar movement, partial-batch stop,
 crash-after-acceptance resumption, terminal settlement truthfulness, CLI
 confirmation separation, and concurrent batch execution.
 
+## Phase 4 additions — 2026-07-14
+
+Phase 4 was attacked across strategy equivalence, lookahead, signing,
+scheduling, quote sizing, mode bypass, restart boundaries, stream replay,
+reconciliation, endpoint/credential injection, backups, and operator recovery.
+
+| Severity | Attack | Resolution |
+|---|---|---|
+| Critical | An automatic publisher could quietly reimplement or drift from the researched formulas. | Publication instantiates the registered strategy classes and calls their existing `prepare`/`initial_events` paths. It verifies the exact 60/35/5 weights, strategy parameters, event session, output shape, and no mean-reversion sleeve. |
+| Critical | A normal SHA-256 digest could be presented as authenticity. | Canonical content hashing is separate from an operator-controlled signing interface. The shipped signer uses a mode-0600, non-symlink local HMAC key; required-signature policy blocks unsigned, wrong-key, malformed, changed, or expired snapshots. |
+| Critical | A signed target could be executed after code, policy, deployment, input data, universe, account, or broker asset identity changed. | Execution rechecks git SHA/dirty entries, policy/deployment hashes, absolute input hashes, registered parameters/universe, account fingerprint, and current broker asset metadata/IDs before plan creation and again before submission. |
+| Critical | An automatically approved shadow plan could be submitted through the older Phase-3 CLI. | The plan-to-snapshot mode link is inserted atomically with the execution batch and is immutable. `PaperExecutionService.execute` refuses every linked non-submitting plan, regardless of caller. |
+| Critical | A restart between plan persistence and mode linkage could leave an unclassified executable plan. | Phase-4 link insertion occurs in the same SQLite transaction as batch creation; replay cross-checks the stored policy tuple. |
+| High | A duplicate or late scheduler process could publish twice or treat a guessed weekday as month-end. | Bounded authenticated-calendar queries find the final actual session and next regular session. Decision session is unique in the ledger; published runs cannot be rewritten; post-next-open catch-up requires explicit confirmation. |
+| High | A current-session/early-close signal could use an unfinished daily bar. | Publication requires current time after the official authenticated close, the data cutoff exactly at that session, complete SPY/reference calendar, exact symbol coverage, finite OHLCV, and no stale final row. Early close comes from the calendar, never a hard-coded time. |
+| High | Adjusted research closes could be mistaken for executable quotes. | Snapshot semantics label adjusted closes non-executable. Quantity freeze uses fresh paper bid/ask, then checks age, spread, deviation, collar, turnover, concentration, order count, cash deployment, minimum notional, and Phase-3/OMS limits. |
+| High | Stream duplicates, regressions, multiple partials, or a fill while cancel was pending could corrupt local state. | Event IDs and payload hashes are durable; changed replays conflict; sequence/time regressions block submission and require REST recovery; cumulative partials are idempotent fills; active pending-cancel states can still fill. |
+| High | Reconnect could resume submission from in-memory stream state. | Every connect/reconnect disarms, marks recovery active, fetches account/positions/open orders/fills/known client IDs, recovers unresolved orders, and reconciles. Only a clean durable result clears the recovery block. |
+| High | External broker activity could be silently adopted or deleted. | Unknown orders, fills, positions, cash differences, missing orders, and duplicate identifiers remain reconciliation issues, create critical alerts, and require explicit resolution. |
+| High | Backups made by copying a live WAL database could be inconsistent or contain credentials. | The online SQLite backup API creates a standalone copy; quick/foreign-key checks and hashes are verified. Only credential-scanned JSON configs are copied. Restore re-verifies all content and requires explicit replacement confirmation. |
+| Medium | Repeated alerts could flood operators or disappear after acknowledgement. | Alerts persist in SQLite with unresolved deduplication, occurrence counts, acknowledgement separate from resolution, and durable critical escalation. Sink failure creates another durable alert. |
+| Critical | A snapshot could verify in memory but fail after a cold-process JSON reload because the config loader changed JSON numbers to `Decimal` before hashing. | Signed snapshots use a strict duplicate-key loader that preserves native JSON number types. File round-trip and cold-process tests verify the identical envelope and signature. |
+| Critical | A websocket process could mark itself connected before authentication, or leave a timeless healthy flag after crashing. | Readiness is persisted only after paper-stream auth/subscription and REST recovery. A quiet-stream heartbeat renews a 45-second durable lease; stale state blocks execution and health. |
+| High | Finalized shadow approvals stayed active and prevented the next month's equity session, encouraging unsafe manual cleanup. | Shadow plans are exact-hash approved, then finalized as `voided`; the immutable non-submit link remains an independent bypass guard. A three-process/two-month replay test proves rollover and zero orders. |
+| High | A two-day snapshot/signal age failed legitimate Friday-to-Monday month ends, while an unbounded catch-up could publish after the execution opportunity was gone. | Age is bounded at seven calendar days to cover weekends/holidays, execution is pinned to the signed immediately-next session, and catch-up is refused after that session closes. |
+| High | Code/input drift checks could be skipped when replaying an existing plan or immediately before paper execution. | Publisher provenance is revalidated at persistence, plan replay, approval, and submission; current broker asset identity is also rechecked before planning and submission. |
+| High | A rewritten backup manifest could use path traversal, or restore could replace a symlink/open SQLite path. | Verification enforces an exact manifest schema, fixed ledger basename, safe config basenames, regular non-symlink files, and hashes. Restore rejects symlink targets and the CLI closes SQLite before atomic replacement. |
+| Critical | A Phase-4 manual/supervised plan could be passed directly to the legacy Phase-3 execution service, bypassing current signature, provenance, stream, reconciliation, and alert gates. | Every Phase-4-linked batch now requires a supervisor reauthorization callback inside the cross-process batch guard. Direct Phase-3 execution is rejected both before and after approval; the supervisor rechecks the complete boundary immediately before OMS use. |
+| High | A same-day unfinished cache, a short/NaN indicator window, or a silently dropped momentum ticker could publish an artificial cash/risk-off target. | Publication forces a post-close refresh, requires at least 200 complete finite positive OHLCV sessions with valid geometry, rejects repeated final bars, and validates every registered universe member and decision indicator after strategy preparation. |
+| High | `allow_labelled` froze only porcelain path/status lines, so edited dirty-file bytes could change after signing without changing git status. | Labelled dirty snapshots now freeze path, state, size, and SHA-256 for every modified, staged, deleted, and untracked file. Persistence, replay, approval, health, and submission re-enumerate and compare exact bytes. |
+| High | Reconciliation looked only at open orders and fills; an externally created terminal order could disappear from current broker state. | The broker-neutral contract now fetches recent orders in every status. Reconciliation flags unseen system/external terminal orders and duplicate all-status IDs, and persists each incident as a durable critical latch at the reconciliation boundary. |
+| High | A process crash after persisting a stream event but before applying it made its replay look idempotently complete. | Applicable events persist as `pending`, become `applied` only after ledger synchronization and clean reconciliation, and force disarm/REST recovery on pending replay. Clean recovery explicitly marks the event `recovered`. |
+| High | A clean reconnect could erase the operational significance of a disconnect/reconciliation incident. | Critical incident alerts are never auto-resolved. Both manual and supervised paper submission block on every unresolved critical alert; CLI resolution requires a later clean reconciliation plus recovered stream or clear kill state where applicable. |
+| High | Backup creation could chmod an arbitrary existing root, delete similarly named directories, copy config bytes different from those scanned, or install a changed source after restore verification. | Roots must be dedicated/private/separate, retention accepts only strict IDs, configs are read once via no-follow descriptors and those bytes are copied, restored temporary bytes are rehashed immediately before replacement, and files/directories are fsynced before success. |
+| Medium | Quiet websocket periods renewed a lease without rechecking broker truth, and an arbitrarily old clean reconciliation could appear ready. | Heartbeats run all-status reconciliation at least every 60 seconds; health and submission require a clean reconciliation no older than 120 seconds as well as a fresh 45-second stream lease. |
+| Medium | Alert repeats flooded sinks, `info` could not upgrade to `warning`, and the webhook accepted private/DNS-rebound targets. | Severity now upgrades across all levels, duplicate occurrences update durable counts without redelivery, and webhook use requires a hostname allowlist plus public literal/resolved IP validation, redirect/proxy disabling, and bounded timeouts. |
+| Medium | Backup manifests were described too strongly despite colocated unkeyed hashes. | Runbooks now state that the hashes prove consistency/corruption detection, not hostile authenticity; signed/MACed off-host digests and host hardening remain explicit deployment work. |
+
+Combined mocked lifecycle/adversarial coverage includes publish, immutable
+persistence, plan freeze, approval, OMS submission, multiple partial fills,
+stream interruption, restart/REST recovery, terminal reconciliation,
+backup/restore, and soak reporting. A separate cold-process simulation runs two
+authentic monthly shadow rebalances plus a duplicate replay and produces zero
+orders. No test opens a real socket or submits a real paper order.
+
 ## Residual risks and prohibited assumptions
 
 - The Alpaca contract tests are mocked. A credentialed paper soak test has not
   yet validated real latency, rate limits, pagination volume, account resets,
   or long-running session behavior.
-- Phase 3 polls REST state. It does not yet consume and supervise streaming
-  trade updates, trade corrections, trade busts, or corporate-action events.
+- Phase 3 by itself still polls REST. Phase 4 supervises Alpaca paper
+  `trade_updates` and REST recovery, but trade corrections/busts and every
+  possible future broker event shape still require soak validation.
 - Non-fill cash changes—including dividends, transfers, fees, and paper-account
   resets—cause reconciliation failure and require operator review; they are not
   automatically adopted.
@@ -78,15 +124,15 @@ confirmation separation, and concurrent batch execution.
 - The execution fence protects cooperating processes using the same ledger and
   lock path. Code that bypasses the OMS and calls a broker adapter directly is
   outside that protection.
-- Aggregation is deterministic but consumes an operator-provided snapshot.
-  There is no signed automated strategy publisher or shadow-parity proof that
-  the artifact exactly matches a fresh research run.
-- The checked-in three-symbol files are schema illustrations, not a complete
-  deployment for the repository's candidate 60/35/5 portfolio. Phase 4 must
-  build and validate the full managed universe and strategy publisher.
+- Phase 4's publisher is signed and runs the registered strategy code, but the
+  current stock universe remains survivorship-biased and Yahoo adjusted daily
+  data is not an institutional point-in-time source.
+- The older three-symbol Phase-3 files remain schema illustrations. Phase 4
+  adds a separate complete 36-symbol deployment example.
 - The required allocation policy explicitly rebalances to deployment weights;
   it does not reproduce `portfolio.py`'s static-start, drifting independent
-  sleeve capital. A virtual-sleeve ledger and parity study remain Phase 4 work.
+  sleeve capital. A virtual-sleeve ledger and parity study remain possible
+  future research work beyond this phase.
 - Same-day daily-close signals are rejected, but the allowed next-session
   regular-hours market order is still not the backtest's next-day-close fill.
   Execution-timing parity remains unproven.
@@ -95,19 +141,21 @@ confirmation separation, and concurrent batch execution.
 - Multi-order execution is not atomic. A failure can leave a legitimate partial
   portfolio that requires operator review; the system stops later items but
   cannot roll back fills.
-- There is no scheduler, process supervisor, backup/restore drill, alert
-  delivery, signed off-host audit, or shadow-parity report yet.
+- Phase 4 adds a one-shot durable scheduler, stream supervisor, local alerts,
+  backup/restore, and soak reports. Production host supervision, off-host
+  signed audit export, external secrets management, and completed operator
+  drills remain deployment responsibilities.
 - Alpaca paper fills are simulated and cannot establish real queue position,
   market impact, latency slippage, fees, or live operational behavior.
 
-## Gate to Phase 4
+## Gate beyond Phase 4
 
-Phase 4 must remain paper-only: use a fresh dedicated paper ledger, supported
-OpenSSL runtime, zero unexplained reconciliation issues, and operator-reviewed
-limits. It must add credentialed soak/shadow evidence, streaming/recovery
-supervision, alerts, backup restore, and repeated incident drills. Nothing in
-this review authorizes a live endpoint; micro-live remains a separately
-approved Phase 5 decision.
+Phase 4 remains paper-only: use a fresh dedicated paper ledger, supported
+OpenSSL runtime, zero unexplained reconciliation issues, operator-reviewed
+limits, and the graduation criteria in `PHASE4_SOAK_GRADUATION.md`. Real
+credentialed paper soak, repeated incident drills, and restore evidence are
+still required. Nothing in this review authorizes a live endpoint; Phase 5 is
+unimplemented and would require a separate design and explicit authorization.
 
 ## Primary broker references
 
@@ -121,5 +169,7 @@ approved Phase 5 decision.
   https://docs.alpaca.markets/us/docs/paper-trading
 - Alpaca trading calendar and early-close sessions:
   https://docs.alpaca.markets/us/v1.1/reference/getcalendar-1
+- Alpaca paper websocket authorization and `trade_updates` subscription:
+  https://docs.alpaca.markets/us/v1.4.2/docs/websocket-streaming
 - urllib3 TLS runtime requirements:
   https://urllib3.readthedocs.io/en/latest/v2-migration-guide.html

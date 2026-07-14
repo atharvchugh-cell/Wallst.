@@ -60,6 +60,9 @@ _OPEN_STATUS_MAP = {
     "rejected": OrderStatus.REJECTED,
     "suspended": OrderStatus.REJECTED,
 }
+# Shared by the paper websocket parser; kept as an immutable-by-convention
+# module mapping so REST and stream status semantics cannot drift.
+ALPACA_ORDER_STATUS = _OPEN_STATUS_MAP
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,12 @@ class AlpacaAsset:
     asset_class: str
     status: str
     tradable: bool
+    exchange: str = ""
+    fractionable: bool = False
+    shortable: bool = False
+    easy_to_borrow: bool = False
+    marginable: bool = False
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,18 @@ class AlpacaPaperConfig:
 
     @classmethod
     def from_env(cls) -> "AlpacaPaperConfig":
+        live_style = [
+            name for name in (
+                "ALPACA_API_KEY", "ALPACA_API_SECRET", "APCA_API_KEY_ID",
+                "APCA_API_SECRET_KEY", "APCA_API_BASE_URL", "ALPACA_BASE_URL",
+            )
+            if os.getenv(name)
+        ]
+        if live_style:
+            raise ValueError(
+                "Live-style credential variables are forbidden for Phase 4; "
+                "use only ALPACA_PAPER_API_KEY and ALPACA_PAPER_API_SECRET"
+            )
         key = os.getenv("ALPACA_PAPER_API_KEY", "")
         secret = os.getenv("ALPACA_PAPER_API_SECRET", "")
         if not key or not secret:
@@ -128,7 +149,7 @@ class AlpacaPaperBroker(Broker):
         self.config = config
         self._uses_default_session = session is None
         self.session = session if session is not None else requests.Session()
-        if self._uses_default_session:
+        if hasattr(self.session, "trust_env"):
             self.session.trust_env = False
         self.clock = clock
         self._order_cache: dict[str, BrokerOrder] = {}
@@ -246,6 +267,14 @@ class AlpacaPaperBroker(Broker):
                 asset_class=str(payload["class"]).strip().lower(),
                 status=str(payload["status"]).strip().lower(),
                 tradable=_strict_bool(payload["tradable"], "tradable"),
+                exchange=str(payload.get("exchange", "")).strip().upper(),
+                fractionable=_strict_bool(payload.get("fractionable", False), "fractionable"),
+                shortable=_strict_bool(payload.get("shortable", False), "shortable"),
+                easy_to_borrow=_strict_bool(
+                    payload.get("easy_to_borrow", False), "easy_to_borrow"
+                ),
+                marginable=_strict_bool(payload.get("marginable", False), "marginable"),
+                name=str(payload.get("name", "")).strip()[:200],
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BrokerError("Malformed Alpaca paper asset response") from exc
@@ -300,6 +329,26 @@ class AlpacaPaperBroker(Broker):
         client_ids = [order.client_order_id for order in orders]
         if len(broker_ids) != len(set(broker_ids)) or len(client_ids) != len(set(client_ids)):
             raise BrokerError("Alpaca paper returned duplicate open-order identifiers")
+        return orders
+
+    def get_recent_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        params = {
+            "status": "all", "direction": "asc", "nested": "false", "limit": "500",
+        }
+        if since is not None:
+            params["after"] = _alpaca_time(since)
+        payload = self._json("GET", "/v2/orders", params=params)
+        if not isinstance(payload, list):
+            raise BrokerError("Alpaca paper recent-orders response was not a list")
+        if len(payload) >= 500:
+            raise BrokerError(
+                "Alpaca paper returned the all-status order page limit; fail-closed reconciliation requires a narrower watermark"
+            )
+        orders = [self._parse_order(row) for row in payload]
+        broker_ids = [order.broker_order_id for order in orders]
+        client_ids = [order.client_order_id for order in orders]
+        if len(broker_ids) != len(set(broker_ids)) or len(client_ids) != len(set(client_ids)):
+            raise BrokerError("Alpaca paper returned duplicate recent-order identifiers")
         return orders
 
     def get_order_by_client_id(self, client_order_id: str) -> BrokerOrder | None:

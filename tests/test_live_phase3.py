@@ -762,7 +762,7 @@ def test_v2_ledger_migrates_without_inventing_equity_or_approval(tmp_path):
     with Ledger(path) as ledger:
         assert ledger.conn.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == "4"
         assert ledger.get_equity_guardrails("PAPER") is None
         assert ledger.list_execution_batches("PAPER") == []
 

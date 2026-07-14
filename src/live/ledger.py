@@ -42,7 +42,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class LedgerError(RuntimeError):
@@ -64,7 +64,13 @@ def _ledger_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 class Ledger:
     def __init__(self, path: str | Path = ":memory:", *, clock=utc_now) -> None:
-        self.path = str(Path(path).expanduser()) if str(path) != ":memory:" else ":memory:"
+        if str(path) == ":memory:":
+            self.path = ":memory:"
+        else:
+            raw_path = Path(path).expanduser()
+            if raw_path.is_symlink():
+                raise LedgerError("Execution ledger path may not be a symbolic link")
+            self.path = str(raw_path.resolve())
         self.clock = clock
         self._execution_rlock = threading.RLock()
         self._batch_rlock = threading.RLock()
@@ -277,6 +283,107 @@ class Ledger:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS target_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL UNIQUE,
+                decision_session TEXT NOT NULL,
+                expected_execution_session TEXT NOT NULL,
+                account_fingerprint TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                signed INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_target_snapshot_decision_session
+              ON target_snapshots(decision_session);
+
+            CREATE TABLE IF NOT EXISTS scheduler_runs (
+                run_id TEXT PRIMARY KEY,
+                decision_session TEXT NOT NULL UNIQUE,
+                expected_execution_session TEXT,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                snapshot_id TEXT REFERENCES target_snapshots(snapshot_id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS phase4_plan_links (
+                batch_id TEXT PRIMARY KEY REFERENCES execution_batches(batch_id),
+                snapshot_id TEXT NOT NULL REFERENCES target_snapshots(snapshot_id),
+                operation_mode TEXT NOT NULL,
+                paper_submission_allowed INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_phase4_plan_snapshot
+              ON phase4_plan_links(snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS alerts (
+                alert_id TEXT PRIMARY KEY,
+                dedupe_key TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                message TEXT NOT NULL,
+                entity_id TEXT NOT NULL DEFAULT '',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                acknowledged_at TEXT,
+                acknowledged_by TEXT,
+                acknowledgement_note TEXT,
+                resolved_at TEXT,
+                escalation_count INTEGER NOT NULL DEFAULT 0,
+                last_escalated_at TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_unresolved_alert_dedupe
+              ON alerts(dedupe_key) WHERE resolved_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS backups (
+                backup_id TEXT PRIMARY KEY,
+                ledger_hash TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                backup_path TEXT NOT NULL,
+                verified INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stream_events (
+                event_id TEXT PRIMARY KEY,
+                stream_sequence INTEGER,
+                client_order_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                broker_updated_at TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                disposition TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stream_state (
+                stream_name TEXT PRIMARY KEY,
+                connected INTEGER NOT NULL DEFAULT 0,
+                recovering INTEGER NOT NULL DEFAULT 1,
+                last_sequence INTEGER,
+                last_event_at TEXT,
+                last_recovery_at TEXT,
+                disconnect_count INTEGER NOT NULL DEFAULT 0,
+                recovery_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS soak_observations (
+                observation_id TEXT PRIMARY KEY,
+                trading_date TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                value TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_intents_status ON intents(status);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_fills_occurred ON fills(occurred_at);
@@ -296,6 +403,30 @@ class Ledger:
               BEFORE DELETE ON audit_events
               BEGIN
                 SELECT RAISE(ABORT, 'audit events are append-only');
+              END;
+
+            CREATE TRIGGER IF NOT EXISTS target_snapshots_no_update
+              BEFORE UPDATE ON target_snapshots
+              BEGIN
+                SELECT RAISE(ABORT, 'target snapshots are immutable');
+              END;
+
+            CREATE TRIGGER IF NOT EXISTS target_snapshots_no_delete
+              BEFORE DELETE ON target_snapshots
+              BEGIN
+                SELECT RAISE(ABORT, 'target snapshots are immutable');
+              END;
+
+            CREATE TRIGGER IF NOT EXISTS phase4_plan_links_no_update
+              BEFORE UPDATE ON phase4_plan_links
+              BEGIN
+                SELECT RAISE(ABORT, 'phase4 plan links are immutable');
+              END;
+
+            CREATE TRIGGER IF NOT EXISTS phase4_plan_links_no_delete
+              BEFORE DELETE ON phase4_plan_links
+              BEGIN
+                SELECT RAISE(ABORT, 'phase4 plan links are immutable');
               END;
             """
         )
@@ -321,6 +452,11 @@ class Ledger:
                     "UPDATE execution_batches SET source_hash = ? WHERE batch_id = ?",
                     (source_hash, row["batch_id"]),
                 )
+        alert_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(alerts)")
+        }
+        if "last_escalated_at" not in alert_columns:
+            self.conn.execute("ALTER TABLE alerts ADD COLUMN last_escalated_at TEXT")
         try:
             self.conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_batch_source
@@ -333,7 +469,7 @@ class Ledger:
         existing = self.conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if existing is not None and int(existing["value"]) not in {1, 2, SCHEMA_VERSION}:
+        if existing is not None and int(existing["value"]) not in {1, 2, 3, SCHEMA_VERSION}:
             raise LedgerError(
                 f"Unsupported ledger schema {existing['value']}; expected {SCHEMA_VERSION}"
             )
@@ -342,10 +478,11 @@ class Ledger:
                 "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
-        elif int(existing["value"]) in {1, 2}:
-            # v2 added expected-cash reconciliation. v3 adds Phase-3 equity
-            # guardrails and immutable reviewed execution batches. Migration
-            # never invents an equity baseline or an operator approval.
+        elif int(existing["value"]) in {1, 2, 3}:
+            # v2 added expected-cash reconciliation, v3 added Phase-3 equity
+            # guardrails and reviewed execution batches, and v4 adds the
+            # immutable publisher/scheduler/alert/stream/backup records.
+            # Migration never invents a baseline, approval, or publication.
             self.conn.execute(
                 "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                 (str(SCHEMA_VERSION),),
@@ -1111,7 +1248,12 @@ class Ledger:
 
     # --- Phase-3 immutable preview and approval batches ---------------------
 
-    def create_execution_batch(self, plan: object) -> tuple[dict, bool]:
+    def create_execution_batch(
+        self,
+        plan: object,
+        *,
+        phase4_link: tuple[str, str, bool] | None = None,
+    ) -> tuple[dict, bool]:
         from .deployment import ExecutionPlan
 
         if not isinstance(plan, ExecutionPlan):
@@ -1146,6 +1288,25 @@ class Ledger:
                         "Target source/version belongs to a terminal batch; "
                         "publish a fresh target_version before creating another batch"
                     )
+                if phase4_link is not None:
+                    snapshot_id, operation_mode, allowed = phase4_link
+                    link = cur.execute(
+                        "SELECT * FROM phase4_plan_links WHERE batch_id=?", (plan.batch_id,)
+                    ).fetchone()
+                    if link is None:
+                        cur.execute(
+                            """INSERT INTO phase4_plan_links(
+                                   batch_id, snapshot_id, operation_mode,
+                                   paper_submission_allowed, created_at
+                               ) VALUES (?, ?, ?, ?, ?)""",
+                            (plan.batch_id, snapshot_id, operation_mode, int(allowed), now),
+                        )
+                    elif not (
+                        link["snapshot_id"] == snapshot_id
+                        and link["operation_mode"] == operation_mode
+                        and link["paper_submission_allowed"] == int(allowed)
+                    ):
+                        raise LedgerConflict("Existing execution batch has another Phase-4 policy")
                 return dict(existing), False
             cur.execute(
                 """INSERT INTO execution_batches(
@@ -1169,6 +1330,20 @@ class Ledger:
                     ),
                 },
             )
+            if phase4_link is not None:
+                snapshot_id, operation_mode, allowed = phase4_link
+                cur.execute(
+                    """INSERT INTO phase4_plan_links(
+                           batch_id, snapshot_id, operation_mode,
+                           paper_submission_allowed, created_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (plan.batch_id, snapshot_id, operation_mode, int(allowed), now),
+                )
+                self._audit(
+                    cur, "phase4_plan_linked", "execution_batch", plan.batch_id,
+                    {"snapshot_id": snapshot_id, "operation_mode": operation_mode,
+                     "paper_submission_allowed": allowed},
+                )
             return dict(cur.execute(
                 "SELECT * FROM execution_batches WHERE batch_id = ?", (plan.batch_id,)
             ).fetchone()), True

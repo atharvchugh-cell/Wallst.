@@ -52,7 +52,9 @@ def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def load_strict_json(path: str | Path) -> dict[str, Any]:
+def load_strict_json(
+    path: str | Path, *, parse_floats_as_decimal: bool = True
+) -> dict[str, Any]:
     """Load a small JSON object while rejecting duplicate object keys."""
     source = Path(path).expanduser()
     if source.is_symlink():
@@ -71,11 +73,10 @@ def load_strict_json(path: str | Path) -> dict[str, Any]:
             text = handle.read(MAX_CONFIG_BYTES + 1)
         if len(text.encode("utf-8")) > MAX_CONFIG_BYTES:
             raise DeploymentError("Deployment artifact changed while it was being read")
-        payload = json.loads(
-            text,
-            parse_float=Decimal,
-            object_pairs_hook=_pairs_no_duplicates,
-        )
+        parse_options: dict[str, Any] = {"object_pairs_hook": _pairs_no_duplicates}
+        if parse_floats_as_decimal:
+            parse_options["parse_float"] = Decimal
+        payload = json.loads(text, **parse_options)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise DeploymentError(f"Invalid JSON deployment artifact: {source}") from exc
     if not isinstance(payload, dict):

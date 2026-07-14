@@ -3,7 +3,9 @@
 Phase one provides the durable OMS and deterministic fake broker. Phase two
 adds an Alpaca paper-only adapter. Phase three adds reviewed aggregation,
 market data, immutable approval batches, and explicitly confirmed paper
-execution. No live-money broker endpoint is present.
+execution. Phase four adds authentic signed strategy publication, supervised
+scheduling, streaming recovery, alerts, backups, and soak evidence. No
+live-money broker endpoint is present.
 """
 
 from .alpaca_paper import (
@@ -21,6 +23,7 @@ from .models import TargetPositionIntent
 from .oms import OrderManagementSystem
 from .reconcile import Reconciler
 from .risk import PreTradeRiskEngine, RiskLimits
+from .phase4_models import OperationMode, Phase4Policy, PublishedTargetSnapshot
 
 __all__ = [
     "FakeBroker",
@@ -39,4 +42,7 @@ __all__ = [
     "Reconciler",
     "RiskLimits",
     "TargetPositionIntent",
+    "OperationMode",
+    "Phase4Policy",
+    "PublishedTargetSnapshot",
 ]

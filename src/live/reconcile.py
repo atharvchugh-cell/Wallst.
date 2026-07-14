@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from .broker import Broker
@@ -14,6 +15,7 @@ from .models import (
     IntentStatus,
     OrderStatus,
     ZERO,
+    ensure_aware,
     json_safe,
     utc_now,
 )
@@ -108,6 +110,40 @@ class Reconciler:
             if order["account_id"] == account.account_id
         ]
         local_by_client = {o["client_order_id"]: o for o in local_orders}
+
+        latest_run = self.ledger.latest_reconciliation(account.account_id)
+        recent_since = (
+            ensure_aware(
+                datetime.fromisoformat(latest_run["completed_at"]),
+                "reconciliation watermark",
+            )
+            if latest_run is not None
+            else ensure_aware(started, "reconciliation start") - timedelta(days=7)
+        )
+        recent_orders = self.broker.get_recent_orders(recent_since)
+        recent_broker_ids = [order.broker_order_id for order in recent_orders]
+        recent_client_ids = [order.client_order_id for order in recent_orders]
+        if (
+            len(recent_broker_ids) != len(set(recent_broker_ids))
+            or len(recent_client_ids) != len(set(recent_client_ids))
+        ):
+            issues.append(ReconciliationIssue(
+                "DUPLICATE_BROKER_RECENT_ORDER",
+                "Broker returned duplicate all-status order identifiers",
+                account.account_id,
+            ))
+        for broker_order in recent_orders:
+            if broker_order.client_order_id not in local_by_client:
+                code = (
+                    "UNTRACKED_SYSTEM_ORDER"
+                    if broker_order.client_order_id.startswith(self.client_id_prefix)
+                    else "EXTERNAL_RECENT_ORDER"
+                )
+                issues.append(ReconciliationIssue(
+                    code,
+                    "Broker has a recent order in any status that is absent from the local ledger",
+                    broker_order.client_order_id,
+                ))
 
         if not self.ledger.positions_bootstrapped(account.account_id):
             issues.append(ReconciliationIssue(
@@ -267,6 +303,28 @@ class Reconciler:
             issue_payload,
         )
         if issues:
+            # Persist every reconciliation incident at the reconciliation
+            # boundary itself. Callers may abort or be restarted, so alert
+            # latching cannot depend on an outer CLI/stream wrapper.
+            from .phase4_store import Phase4Store
+
+            store = Phase4Store(self.ledger)
+            for issue in issues:
+                entity_id = issue.entity_id or run_id
+                category = {
+                    "CASH_MISMATCH": "cash_mismatch",
+                    "POSITION_MISMATCH": "unexpected_position",
+                    "EXTERNAL_OPEN_ORDER": "externally_created_order",
+                    "EXTERNAL_RECENT_ORDER": "externally_created_order",
+                    "UNTRACKED_SYSTEM_ORDER": "duplicate_or_untracked_intent",
+                    "DUPLICATE_BROKER_OPEN_ORDER": "duplicate_intent",
+                    "DUPLICATE_BROKER_RECENT_ORDER": "duplicate_intent",
+                }.get(issue.code, "reconciliation_mismatch")
+                store.emit_alert(
+                    "critical", category, issue.message,
+                    entity_id=entity_id,
+                    dedupe_key=f"reconcile:{issue.code}:{entity_id}",
+                )
             control = self.ledger.get_control_state(account.account_id)
             self.ledger.set_control_state(
                 account.account_id,

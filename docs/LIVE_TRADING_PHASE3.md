@@ -127,13 +127,13 @@ The repository's intended default research portfolio is:
   this sleeve in cash. If it selects the same ETF as sector rotation, the
   account-level weights add.
 
-That 60/35/5 mix is the candidate for Phase 4 shadow publishing; it is not
-silently assumed by Phase 3. The illustrative target file currently aggregates
+That 60/35/5 mix is now published by the separate Phase 4 workflow; it is not
+silently assumed by Phase 3. The illustrative Phase 3 target file aggregates
 to AAPL 15%, XLF 17.5%, and SPY 0.5%—33% invested and 67% cash—because it
 contains illustrative sleeve weights of 25%, 50%, and 10%. Those are not the
-latest strategy selections. A real publisher must emit every current sleeve
-holding, include the union of all potentially traded symbols in
-`managed_symbols`, and prove research-to-paper parity before unattended use.
+latest strategy selections. See `LIVE_TRADING_PHASE4.md` for the authentic
+full-universe signed publisher; the older file remains only a Phase 3 schema
+example.
 
 The deployment must explicitly state
 `"allocation_policy": "rebalance_to_deployment_weights"`. Under that policy,
@@ -142,7 +142,7 @@ combining the sleeve targets. This is intentionally explicit because it is not
 the same as `src/portfolio.py`'s historical static-start allocation, where
 sleeve weights drift and cash is never transferred between sleeves. Do not use
 paper results as a parity claim for that backtest. A future drift-preserving
-virtual-sleeve ledger and shadow comparison belong to Phase 4.
+virtual-sleeve ledger and parity study remain outside the current Phase 4.
 
 It must also state
 `"execution_policy": "next_session_regular_hours_market"`. The existing

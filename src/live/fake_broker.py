@@ -117,6 +117,12 @@ class FakeBroker(Broker):
     def get_open_orders(self) -> list[BrokerOrder]:
         return [o for o in self._orders_by_client.values() if o.status in ACTIVE_ORDER_STATUSES]
 
+    def get_recent_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        orders = list(self._orders_by_client.values())
+        if since is not None:
+            orders = [order for order in orders if order.updated_at >= since]
+        return sorted(orders, key=lambda order: (order.updated_at, order.broker_order_id))
+
     def get_order_by_client_id(self, client_order_id: str) -> BrokerOrder | None:
         return self._orders_by_client.get(client_order_id)
 

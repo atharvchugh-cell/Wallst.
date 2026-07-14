@@ -20,13 +20,16 @@ operating boundaries are documented in
 aggregation and execution are in
 [`docs/LIVE_TRADING_PHASE3.md`](docs/LIVE_TRADING_PHASE3.md). The adversarial
 review and residual-risk register are in
-[`docs/LIVE_TRADING_RED_TEAM.md`](docs/LIVE_TRADING_RED_TEAM.md). Phase three
-accepts a strict, operator-reviewed full sleeve snapshot; it does not directly
-send raw research `TargetEvent` rows, automatically choose a strategy, or
-authorize real-money trading. The intended research mix is 60% momentum, 35%
-sector rotation, and 5% regime switch, but wiring a signed target publisher and
-proving paper parity remain Phase 4 work; the checked-in three-symbol live
-files are schema illustrations only.
+[`docs/LIVE_TRADING_RED_TEAM.md`](docs/LIVE_TRADING_RED_TEAM.md). Supervised
+paper automation is documented in
+[`docs/LIVE_TRADING_PHASE4.md`](docs/LIVE_TRADING_PHASE4.md). Phase 4 runs the
+registered fixed 60% momentum / 35% sector rotation / 5% regime-switch mix,
+publishes signed immutable targets, schedules against the exchange calendar,
+recovers paper order streams through the same OMS/ledger, alerts, backs up, and
+produces soak evidence. It remains Alpaca paper only. Observe is the default;
+shadow plans are durably non-submitting; paper submission still requires the
+reviewed approval and risk/reconciliation controls. Phase 5/live money is not
+implemented.
 
 ## Setup
 
@@ -288,4 +291,10 @@ This is disclosed here deliberately because tuning parameters to fit one specifi
 pytest tests/
 ```
 
-418 tests across indicator math, the look-ahead-prevention accessor, both strategies' decision logic (including explicit "does the decision change if I mutate any future date" checks), the engine's cash/lot accounting (including net-of-cost P&L and trading-day holding periods), cost/turnover metrics, the data/caching layer (including the yfinance end-date-inclusivity fix, the widened-delta-fetch fix, and stale-cache-fallback warnings), the CLI's minimum-usable-universe guard, the `--strategy compare` diagnostics report (annual returns, sleeve contribution, and a full end-to-end CLI run), the `--strategy robustness` allocation-blending math (raw-equity-curve blending that preserves first-day cost drag rather than normalizing it away, cost/turnover weighting, ranking/beats-SPY analysis, and a full end-to-end CLI run), and the `--universe us_50b` universe builder (bulk screener pagination/progress/failure-handling, symbol-directory name-pattern filtering, ticker normalization, market-cap threshold filtering, the Nasdaq Trader eligibility gate excluding screener results not in the candidate set, the default hard-fail vs. `allow_screener_only` opt-in fallback when Nasdaq Trader is unreachable, the identity-mismatch guard excluding screener results whose name doesn't match their Nasdaq Trader listing, price-data validation against the actual requested backtest window (not just a fixed recent lookback) excluding non-tradable/out-of-range selected tickers, company-level deduplication of multiple share classes using real live-shape Nasdaq Trader names (`GOOGL`/`GOOG`, `BRK-A`/`BRK-B`), cache read/write, cache re-validation when a requested window isn't covered by what the cache was previously checked against (and skipping re-validation when it already is), robustness mode validating the shared universe against the union of all its windows, and confirmation that omitting `--universe` leaves the default universe byte-for-byte unchanged), plus the tournament layer (the three new strategies' decision logic with mutate-all-future-dates no-lookahead checks, filter semantics — established-crash knife guard, risk-off-to-cash, exits never gated by entry filters, a regression test that the baseline mean-reversion event stream is byte-identical after the entry-hook refactor, generic-runner equivalence with both incumbent sleeve runners, robustness-score math, tournament report content including the cost-sign-flip and parameter-fragility warnings, and CLI end-to-end tournament runs with flag validation and a guard that every pre-existing mode/default is unchanged), plus the hardening layer (robustness scoring proven not to let a strategy that fails/disappears in hard windows outrank a full-coverage peer; the per-window listing-history filter proven to keep full-history tickers, exclude IPO'd-after-window and no-data names with reasons, no-op for a universe that predates the window, and drive a real us_50b-shaped per-window tournament exclusion end-to-end rather than a mocked happy path), plus the portfolio-combination layer (weight parsing/validation — rejecting sums ≠ 1, negative, duplicate, and unknown-strategy weights; proportional capital allocation; proof that a 100%-of-one-strategy portfolio is byte-identical to that strategy standalone; the 60/35/5 split allocating exactly $9,000/$5,250/$750 of $15,000; the combined equity curve equalling the plain sum of sleeve curves on the common intersection; proof that each sleeve behaves exactly as an independent run of its own slice — no shared cash or double-counted capital; a mutate-future-prices no-lookahead check at the portfolio level; and CLI end-to-end artifact/validation runs), plus the walk-forward layer (fold generation with training windows proven to end before test windows begin, expanding vs. rolling geometry, incomplete-trailing-test-year dropping; capital carry-forward proven to compound exactly across folds with the stitched final equalling the last fold's final; the stitched out-of-sample curve proven to contain test-period dates only; transaction costs proven included and aggregated; fixed mode proven to perform no parameter selection — the selection routine is asserted never to run; optimize mode proven to freeze a per-sleeve variant chosen on the training window; a mutate-future-prices check proving later data cannot change an earlier fold's results or its selection; and CLI end-to-end artifact/validation runs), plus the Phase 1–3 execution layer (paper-host pinning, strict aggregation/config parsing, persistent equity and approvals, OMS/risk/reconciliation, acknowledgement-loss recovery, concurrent execution fencing, exact-hash CLI confirmations, and mocked market-data/broker failures). CI runs this suite on every push via GitHub Actions.
+The suite covers indicator/strategy/backtest behavior, no-lookahead invariants,
+data/universe integrity, portfolio and walk-forward equivalence, and the Phase
+1–4 execution path. Phase 4 coverage includes signed snapshots, strategy and
+universe parity, calendar scheduling, mode isolation, quote/risk gates,
+idempotent stream events and partial fills, REST recovery, alerts, backup and
+restore integrity, soak evidence, endpoint pinning, and preservation of every
+existing non-live strategy mode. CI runs the full suite on every push.
