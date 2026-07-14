@@ -47,6 +47,8 @@ class MomentumStrategy(Strategy):
         lookback_trading_days: int = config.MOMENTUM_LOOKBACK_TRADING_DAYS,
         top_k: int = config.MOMENTUM_TOP_K,
         trend_sma_period: int = config.MOMENTUM_TREND_SMA_PERIOD,
+        use_trend_filter: bool = True,
+        use_absolute_momentum: bool = True,
     ):
         super().__init__()
         if lookback_trading_days <= 0:
@@ -59,6 +61,11 @@ class MomentumStrategy(Strategy):
         self.lookback_trading_days = lookback_trading_days
         self.top_k = top_k
         self.trend_sma_period = trend_sma_period
+        # Counterfactual toggles (both default True = shipped baseline behavior,
+        # proven byte-identical in tests). Used only by rule-attribution
+        # counterfactuals to isolate each eligibility rule's contribution.
+        self.use_trend_filter = use_trend_filter
+        self.use_absolute_momentum = use_absolute_momentum
         self._last_rebalance_month: tuple[int, int] | None = None
         # Tickers currently held (or pending) at a nonzero target -- tracked so
         # a rebalance can zero out holdings that fell out of the top-K without
@@ -76,6 +83,8 @@ class MomentumStrategy(Strategy):
             "lookback_trading_days": self.lookback_trading_days,
             "top_k": self.top_k,
             "trend_sma_period": self.trend_sma_period,
+            "use_trend_filter": self.use_trend_filter,
+            "use_absolute_momentum": self.use_absolute_momentum,
             "rebalance": "monthly (last trading day of month)",
         }
         info["assumptions"] = [
@@ -139,11 +148,16 @@ class MomentumStrategy(Strategy):
             trend = market.indicator(ticker, "TrendSMA", signal_date)
             close = market.close(ticker, signal_date)
             info: dict = {"close": close, "mom": mom, "trend": trend}
+            # Each eligibility rule is applied only when its toggle is on;
+            # with both toggles at their default True this is exactly the
+            # shipped filter (mom > 0 AND close > SMA).
+            abs_ok = (not self.use_absolute_momentum) or (mom > 0)
+            trend_ok = (not self.use_trend_filter) or (close > trend)
             if pd.isna(mom) or pd.isna(trend):
                 info.update({"reject": "INSUFFICIENT_HISTORY", "eligible": False})
-            elif not (mom > 0):
+            elif not abs_ok:
                 info.update({"reject": "NEGATIVE_TRAILING_RETURN", "eligible": False})
-            elif not (close > trend):
+            elif not trend_ok:
                 info.update({"reject": "BELOW_TREND_FILTER", "eligible": False})
             else:
                 info["eligible"] = True
