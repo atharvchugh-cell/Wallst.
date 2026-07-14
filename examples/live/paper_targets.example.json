@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "signal_at": "2026-07-13T16:05:00-04:00",
+  "target_version": "illustrative-only-replace-with-publisher-output",
+  "sleeves": {
+    "momentum": {
+      "AAPL": "0.25"
+    },
+    "regime_switch": {
+      "SPY": "0.10"
+    },
+    "sector_rotation": {
+      "XLF": "0.50"
+    }
+  }
+}

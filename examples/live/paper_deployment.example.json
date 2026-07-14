@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "deployment_id": "paper-60-35-5-v1",
+  "account_id": "REPLACE_WITH_PAPER_ACCOUNT_ID",
+  "allocation_policy": "rebalance_to_deployment_weights",
+  "execution_policy": "next_session_regular_hours_market",
+  "managed_symbols": [
+    "AAPL",
+    "SPY",
+    "XLF"
+  ],
+  "sleeve_weights": {
+    "momentum": "0.60",
+    "regime_switch": "0.05",
+    "sector_rotation": "0.35"
+  },
+  "risk_limits": {
+    "max_order_notional": "5000",
+    "max_gross_exposure_pct": "0.80",
+    "max_symbol_exposure_pct": "0.25",
+    "max_daily_turnover_pct": "0.50",
+    "max_daily_loss_pct": "0.02",
+    "max_drawdown_pct": "0.10",
+    "max_open_orders": 5,
+    "min_cash_buffer": "500",
+    "quote_max_age_seconds": 30,
+    "account_max_age_seconds": 30,
+    "max_signal_age_seconds": 345600,
+    "price_collar_bps": "100",
+    "allow_fractional_shares": false,
+    "require_market_open": true
+  },
+  "max_batch_orders": 3
+}
