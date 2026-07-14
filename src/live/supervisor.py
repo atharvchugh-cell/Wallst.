@@ -210,9 +210,9 @@ class Phase4Supervisor:
                 self.deployment,
                 targets,
                 confirm_new_equity_session=confirm_new_equity_session,
-                plan_validator=lambda value, quotes: self._validate_phase4_plan(
+                plan_validator=lambda value, quotes, current_account: self._validate_phase4_plan(
                     value,
-                    Decimal(str(snapshot.content["account_equity_used_for_sizing"])),
+                    current_account.equity,
                     str(snapshot.content["expected_execution_session"]),
                     quotes,
                 ),
@@ -222,7 +222,7 @@ class Phase4Supervisor:
                 approval_reason = "automatic shadow approval; permanently non-submitting plan"
                 row = self.ledger.get_execution_batch(plan.batch_id)
                 if row["status"] == "previewed":
-                    row = self.ledger.approve_execution_batch(
+                    row = self.ledger.approve_phase4_execution_batch(
                         plan.batch_id, plan.plan_hash,
                         approved_by=self.policy.publisher_identity,
                         reason=approval_reason,
@@ -257,7 +257,7 @@ class Phase4Supervisor:
     def _validate_phase4_plan(
         self,
         plan: ExecutionPlan,
-        snapshot_equity: Decimal,
+        current_equity: Decimal,
         expected_execution_session: str,
         quotes: dict[str, Quote],
     ) -> None:
@@ -268,7 +268,9 @@ class Phase4Supervisor:
         deployed = sum(
             (item.target_quantity * quotes[item.symbol].ask for item in plan.items), ZERO
         )
-        if deployed / snapshot_equity > self.policy.max_cash_deployment_pct:
+        if current_equity <= ZERO:
+            raise Phase4Error("Positive current account equity is required")
+        if deployed / current_equity > self.policy.max_cash_deployment_pct:
             raise Phase4Error("Execution plan exceeds max_cash_deployment_pct")
         for item in plan.items:
             if item.delta_quantity == ZERO:
@@ -303,7 +305,7 @@ class Phase4Supervisor:
         snapshot = self.store.load_snapshot(link["snapshot_id"])
         snapshot.verify(self.policy, self.signer, now=ensure_aware(self.clock(), "approval time"))
         self.publisher.to_execution_targets(snapshot)
-        return self.ledger.approve_execution_batch(
+        return self.ledger.approve_phase4_execution_batch(
             batch_id, plan_hash, approved_by=operator, reason=reason
         )
 
@@ -368,6 +370,13 @@ class Phase4Supervisor:
             result = service.execute(
                 batch_id, operator=operator, reason=reason,
                 phase4_authorizer=self._authorize_linked_submission,
+                phase4_submit_authorizer=self._authorize_submit_fence,
+                phase4_plan_validator=(
+                    lambda plan, quotes, account: self._validate_phase4_plan(
+                        plan, account.equity,
+                        str(snapshot.content["expected_execution_session"]), quotes,
+                    )
+                ),
             )
             if self.alerts:
                 for item in result.results:
@@ -394,7 +403,32 @@ class Phase4Supervisor:
             raise
 
     def _authorize_linked_submission(self, batch_id: str) -> None:
-        """Revalidate every Phase-4 authority boundary immediately before OMS use."""
+        """Run expensive broker/code checks, then re-read durable authority."""
+        link = self.store.execution_plan_link(batch_id)
+        if link is None:
+            raise Phase4Error("Batch has no current Phase-4 paper-submission authority")
+        snapshot = self.store.load_snapshot(link["snapshot_id"])
+        if not hasattr(self.broker, "get_asset"):
+            raise Phase4Error("Phase-4 broker must provide current asset metadata")
+        self.publisher.validate_assets_for_execution(
+            snapshot,
+            collect_assets(self.broker, self.publisher.required_data_symbols()),
+        )
+        self.publisher.to_execution_targets(snapshot)
+        # Broker and filesystem checks above can take time. Durable submission
+        # state is deliberately checked last and is checked once more inside
+        # the OMS execution fence immediately before the broker POST.
+        self._authorize_durable_submission(batch_id, require_armed=False)
+
+    def _authorize_submit_fence(self, batch_id: str) -> None:
+        """Cheap final authority check called under the OMS submission lock."""
+        self._authorize_durable_submission(batch_id, require_armed=True)
+
+    def _authorize_durable_submission(
+        self, batch_id: str, *, require_armed: bool
+    ) -> None:
+        if self.ledger.execution_profile() != "phase4":
+            raise Phase4Error("Paper submission requires a Phase-4 execution ledger")
         if not self.policy.mode.can_submit_paper:
             raise Phase4Error(f"{self.policy.mode.value} mode can never submit paper orders")
         link = self.store.execution_plan_link(batch_id)
@@ -409,16 +443,9 @@ class Phase4Supervisor:
             self.policy, self.signer,
             now=ensure_aware(self.clock(), "submission authorization time"),
         )
-        if not hasattr(self.broker, "get_asset"):
-            raise Phase4Error("Phase-4 broker must provide current asset metadata")
-        self.publisher.validate_assets_for_execution(
-            snapshot,
-            collect_assets(self.broker, self.publisher.required_data_symbols()),
-        )
-        self.publisher.to_execution_targets(snapshot)
         control = self.ledger.get_control_state(self.deployment.account_id)
-        if control["kill_switch"]:
-            raise Phase4Error("Persistent kill switch is engaged")
+        if control["kill_switch"] or (require_armed and not control["armed"]):
+            raise Phase4Error("Persistent execution control does not authorize submission")
         latest = self.ledger.latest_reconciliation(self.deployment.account_id)
         if latest is None or not latest["clean"]:
             raise Phase4Error("Paper submission requires a clean reconciliation")

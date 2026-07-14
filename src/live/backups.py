@@ -285,35 +285,36 @@ class BackupManager:
         if (target.exists() or replacing_active) and not confirm_replace:
             raise Phase4Error("Replacing an existing/active ledger requires explicit confirmation")
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-        os.close(fd)
-        temp_path = Path(temp_name)
-        try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            source_descriptor = os.open(str(source), flags)
+        with Ledger.exclusive_restore_guard(target):
+            fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+            os.close(fd)
+            temp_path = Path(temp_name)
             try:
-                with os.fdopen(source_descriptor, "rb", closefd=False) as source_handle:
-                    with temp_path.open("wb") as target_handle:
-                        shutil.copyfileobj(source_handle, target_handle)
-                        target_handle.flush()
-                        os.fsync(target_handle.fileno())
-            finally:
-                os.close(source_descriptor)
-            os.chmod(temp_path, 0o600)
-            if _sha256(temp_path) != manifest["ledger_sha256"]:
-                raise Phase4Error("Restored temporary ledger hash verification failed")
-            self._verify_database(temp_path)
-            os.replace(temp_path, target)
-            os.chmod(target, 0o600)
-            _fsync_file(target)
-            _fsync_directory(target.parent)
-            return target
-        except Exception:
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-            raise
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                source_descriptor = os.open(str(source), flags)
+                try:
+                    with os.fdopen(source_descriptor, "rb", closefd=False) as source_handle:
+                        with temp_path.open("wb") as target_handle:
+                            shutil.copyfileobj(source_handle, target_handle)
+                            target_handle.flush()
+                            os.fsync(target_handle.fileno())
+                finally:
+                    os.close(source_descriptor)
+                os.chmod(temp_path, 0o600)
+                if _sha256(temp_path) != manifest["ledger_sha256"]:
+                    raise Phase4Error("Restored temporary ledger hash verification failed")
+                self._verify_database(temp_path)
+                os.replace(temp_path, target)
+                os.chmod(target, 0o600)
+                _fsync_file(target)
+                _fsync_directory(target.parent)
+                return target
+            except Exception:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                raise
 
     def _enforce_retention(self) -> None:
         directories = sorted(

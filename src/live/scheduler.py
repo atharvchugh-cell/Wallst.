@@ -8,10 +8,13 @@ from datetime import date, datetime, timedelta
 from typing import Protocol
 
 from .alerts import AlertManager
-from .market_data import MarketCalendarDay
+from .market_data import NEW_YORK, MarketCalendarDay
 from .models import ensure_aware
 from .phase4_models import Phase4Error
 from .phase4_store import Phase4Store
+
+
+MAX_RESTART_CATCH_UP_MONTHS = 24
 
 
 class ExchangeCalendarSource(Protocol):
@@ -77,16 +80,96 @@ class SupervisedMonthlyScheduler:
 
     def latest_due(self, *, now: datetime | None = None) -> ScheduledDecision:
         current = ensure_aware(now or self.clock(), "scheduler time")
-        candidates = [(current.year, current.month)]
-        previous = (date(current.year, current.month, 1) - timedelta(days=1))
-        candidates.append((previous.year, previous.month))
+        exchange_day = current.astimezone(NEW_YORK).date()
+        runs = self.store.list_schedule_runs()
+        latest_recorded: date | None = None
+        latest_recorded_row: dict | None = None
+        outstanding = next((
+            row for row in runs if row["status"] not in {"published", "skipped"}
+        ), None)
+        if outstanding is not None:
+            try:
+                pending = date.fromisoformat(outstanding["decision_session"])
+            except (TypeError, ValueError) as exc:
+                raise Phase4Error("Stored scheduler decision session is invalid") from exc
+            return self.for_month(pending.year, pending.month, now=current)
+
+        if runs:
+            try:
+                dated_runs = sorted(
+                    (
+                        date.fromisoformat(row["decision_session"]),
+                        row,
+                    )
+                    for row in runs
+                )
+            except (TypeError, ValueError) as exc:
+                raise Phase4Error("Stored scheduler decision session is invalid") from exc
+            latest_recorded, latest_recorded_row = dated_runs[-1]
+            candidate = self._following_month(
+                latest_recorded.year, latest_recorded.month
+            )
+            # A later terminal row must not hide a hole between two recorded
+            # months. Walk adjacent durable months and select the earliest gap
+            # after the ledger's defensible scheduler inception.
+            for (left, _left_row), (right, _right_row) in zip(
+                dated_runs, dated_runs[1:]
+            ):
+                distance = (right.year - left.year) * 12 + right.month - left.month
+                if distance > 1:
+                    if distance - 1 > MAX_RESTART_CATCH_UP_MONTHS:
+                        raise Phase4Error(
+                            "Scheduler history gap exceeds the bounded monthly catch-up scan; "
+                            "resolve the missing history explicitly"
+                        )
+                    candidate = self._following_month(left.year, left.month)
+                    break
+            distance_to_current = (
+                (exchange_day.year - candidate[0]) * 12
+                + exchange_day.month
+                - candidate[1]
+            )
+            if distance_to_current >= MAX_RESTART_CATCH_UP_MONTHS:
+                raise Phase4Error(
+                    "Scheduler downtime exceeds the bounded monthly catch-up scan; "
+                    "resolve the missing history explicitly"
+                )
+            candidates = []
+            if candidate <= (exchange_day.year, exchange_day.month):
+                candidates.append(candidate)
+        else:
+            # With no durable scheduling history there is no defensible system
+            # inception date. Preserve the fresh-ledger behavior: consider only
+            # this exchange-local month and the immediately preceding month.
+            candidates = [(exchange_day.year, exchange_day.month)]
+            previous = date(exchange_day.year, exchange_day.month, 1) - timedelta(days=1)
+            candidates.append((previous.year, previous.month))
         for year, month in candidates:
             try:
                 return self.for_month(year, month, now=current)
             except Phase4Error as exc:
                 if "not due" not in str(exc):
                     raise
+        if (
+            latest_recorded is not None
+            and latest_recorded_row is not None
+            and latest_recorded_row["status"] == "published"
+        ):
+            # Preserve duplicate-publication detection when every month after
+            # the latest terminal run is still in the future. claim_due() will
+            # re-read that durable row and report "already published".
+            try:
+                return self.for_month(
+                    latest_recorded.year, latest_recorded.month, now=current
+                )
+            except Phase4Error as exc:
+                if "not due" not in str(exc):
+                    raise
         raise Phase4Error("No completed monthly decision session is due")
+
+    @staticmethod
+    def _following_month(year: int, month: int) -> tuple[int, int]:
+        return (year + 1, 1) if month == 12 else (year, month + 1)
 
     def claim_due(
         self, *, confirm_manual_catch_up: bool = False, now: datetime | None = None
@@ -111,6 +194,10 @@ class SupervisedMonthlyScheduler:
         )
         if row["status"] == "published":
             raise Phase4Error(f"Decision session already published as {row['snapshot_id']}")
+        if row["status"] == "skipped":
+            raise Phase4Error(
+                f"Decision session was terminally skipped as {row['run_id']}"
+            )
         if execution_window_missed:
             if row["status"] != "failed":
                 row = self.store.update_schedule(row["run_id"], "failed", detail=detail)
@@ -159,7 +246,61 @@ class SupervisedMonthlyScheduler:
 
     def next_expected_action(self, *, now: datetime | None = None) -> dict:
         current = ensure_aware(now or self.clock(), "scheduler time")
-        year, month = current.year, current.month
+        # A durable due/delayed/failed run is an operator action until it is
+        # explicitly published or skipped. Do not hide it behind a later
+        # month's calendar date after a restart.
+        outstanding = next((
+            row for row in self.store.list_schedule_runs()
+            if row["status"] not in {"published", "skipped"}
+        ), None)
+        if outstanding is not None:
+            try:
+                decision_date = date.fromisoformat(outstanding["decision_session"])
+                execution_date = date.fromisoformat(
+                    outstanding["expected_execution_session"]
+                )
+                decision_rows = self._range(decision_date, decision_date)
+                execution_rows = self._range(execution_date, execution_date)
+                if len(decision_rows) != 1 or len(execution_rows) != 1:
+                    raise Phase4Error("Stored schedule sessions are absent from the exchange calendar")
+                due = ScheduledDecision(
+                    decision_day=decision_rows[0],
+                    execution_day=execution_rows[0],
+                    catch_up_required=current >= execution_rows[0].open_at,
+                    delay_seconds=(current - decision_rows[0].close_at).total_seconds(),
+                )
+            except (TypeError, ValueError, Phase4Error):
+                return {
+                    "action": "calendar_error",
+                    "at": None,
+                    "decision_session": outstanding["decision_session"],
+                    "scheduler_status": outstanding["status"],
+                }
+            return self._due_action(due, current, outstanding["status"])
+
+        due = None
+        try:
+            due = self.latest_due(now=current)
+        except Phase4Error as exc:
+            if "No completed monthly decision session is due" not in str(exc):
+                raise
+        if due is not None:
+            decision_session = due.decision_day.trading_date.isoformat()
+            run = next((
+                row for row in self.store.list_schedule_runs()
+                if row["decision_session"] == decision_session
+            ), None)
+            if run is None:
+                return self._due_action(due, current, None)
+
+        exchange_day = current.astimezone(NEW_YORK).date()
+        year, month = exchange_day.year, exchange_day.month
+        if (
+            due is not None
+            and (due.decision_day.trading_date.year, due.decision_day.trading_date.month)
+            == (year, month)
+        ):
+            year, month = self._following_month(year, month)
         last_day = month_calendar.monthrange(year, month)[1]
         sessions = self._range(date(year, month, 1), date(year, month, last_day))
         if not sessions:
@@ -169,4 +310,24 @@ class SupervisedMonthlyScheduler:
             "action": "publish_monthly_targets_after_official_close",
             "decision_session": decision.trading_date.isoformat(),
             "at": decision.close_at.isoformat(),
+        }
+
+    @staticmethod
+    def _due_action(
+        due: ScheduledDecision, current: datetime, scheduler_status: str | None
+    ) -> dict:
+        if current >= due.execution_day.close_at:
+            action = "investigate_missed_monthly_run"
+        elif scheduler_status == "failed":
+            action = "retry_failed_monthly_publication"
+        elif current >= due.execution_day.open_at or scheduler_status == "delayed":
+            action = "confirm_manual_catch_up_and_publish"
+        else:
+            action = "publish_monthly_targets_after_official_close"
+        return {
+            "action": action,
+            "decision_session": due.decision_day.trading_date.isoformat(),
+            "expected_execution_session": due.execution_day.trading_date.isoformat(),
+            "scheduler_status": scheduler_status or "unclaimed",
+            "at": due.decision_day.close_at.isoformat(),
         }

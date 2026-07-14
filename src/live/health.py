@@ -7,7 +7,7 @@ from typing import Any
 
 from .ledger import Ledger
 from .alerts import AlertManager
-from .models import ensure_aware
+from .models import ZERO, ensure_aware
 from .phase4_models import Phase4Policy, SnapshotSigner
 from .phase4_store import (
     RECONCILIATION_READY_SECONDS,
@@ -63,7 +63,27 @@ class HealthReporter:
         if self.broker is not None:
             try:
                 account = self.broker.get_account()
-                broker_connected = account.account_id == account_id
+                max_account_age = None
+                deployment = getattr(self.publisher, "deployment", None)
+                risk_limits = getattr(deployment, "risk_limits", None)
+                if risk_limits is not None:
+                    max_account_age = risk_limits.account_max_age_seconds
+                account_age = (now - account.as_of).total_seconds()
+                broker_connected = (
+                    account.account_id == account_id
+                    and account.status == "ACTIVE"
+                    and account.currency == "USD"
+                    and not account.trading_blocked
+                    and not account.account_blocked
+                    and not account.trade_suspended_by_user
+                    and account.cash >= ZERO
+                    and account.equity > ZERO
+                    and account.buying_power >= ZERO
+                    and account_age >= -2
+                    and (max_account_age is None or account_age <= max_account_age)
+                )
+                if not broker_connected:
+                    broker_error = "AccountNotReady"
             except Exception as exc:
                 broker_connected = False
                 broker_error = type(exc).__name__
@@ -105,6 +125,8 @@ class HealthReporter:
             except Exception as exc:
                 next_action = {"action": "calendar_error", "error": type(exc).__name__}
         blockers = []
+        if not self.policy.mode.can_submit_paper:
+            blockers.append("operating_mode_non_submitting")
         if not integrity:
             blockers.append("database_integrity")
         if control["kill_switch"]:
@@ -126,8 +148,11 @@ class HealthReporter:
             or not stream_lease_fresh
         ):
             blockers.append("stream_recovery")
-        if self.broker is not None and not broker_connected:
-            blockers.append("broker_connectivity")
+        if self.policy.mode.can_submit_paper:
+            if self.broker is None:
+                blockers.append("broker_connectivity_unchecked")
+            elif not broker_connected:
+                blockers.append("broker_connectivity")
         report = {
             "as_of": now.isoformat(),
             "operating_mode": self.policy.mode.value,
@@ -195,24 +220,28 @@ class HealthReporter:
                 "high", category, "Paper order exceeded maximum open-order age",
                 entity_id=order["order_id"], dedupe_key=f"overdue:{order['order_id']}",
             )
-        stream = report["stream_state"]
-        if (
-            stream is None or not stream["connected"] or stream["recovering"]
-            or not report["stream_lease_fresh"]
-        ):
-            self.alerts.emit(
-                "critical", "broker_disconnection",
-                "Order stream is disconnected, stale, or awaiting REST recovery",
-                entity_id="alpaca-paper-trade-updates", dedupe_key="health-stream-blocked",
-            )
-        reconciliation = report["latest_reconciliation"]
-        if (
-            reconciliation is None
-            or not reconciliation["clean"]
-            or not report["reconciliation_fresh"]
-        ):
-            self.alerts.emit(
-                "critical", "reconciliation_mismatch",
-                "No recent clean paper reconciliation",
-                dedupe_key="health-reconciliation-blocked",
-            )
+        # Observe/shadow intentionally have no paper submission channel. Do
+        # not create durable critical incidents merely because those modes do
+        # not run a broker stream or continuous paper reconciliation.
+        if self.policy.mode.can_submit_paper:
+            stream = report["stream_state"]
+            if (
+                stream is None or not stream["connected"] or stream["recovering"]
+                or not report["stream_lease_fresh"]
+            ):
+                self.alerts.emit(
+                    "critical", "broker_disconnection",
+                    "Order stream is disconnected, stale, or awaiting REST recovery",
+                    entity_id="alpaca-paper-trade-updates", dedupe_key="health-stream-blocked",
+                )
+            reconciliation = report["latest_reconciliation"]
+            if (
+                reconciliation is None
+                or not reconciliation["clean"]
+                or not report["reconciliation_fresh"]
+            ):
+                self.alerts.emit(
+                    "critical", "reconciliation_mismatch",
+                    "No recent clean paper reconciliation",
+                    dedupe_key="health-reconciliation-blocked",
+                )

@@ -546,10 +546,34 @@ class StrategyTargetPublisher:
         active_calendar = bundle.calendar[-200:]
         for symbol in sorted(required):
             frame = bundle.frames[symbol]
-            if frame.empty or not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
-                raise Phase4Error(f"{symbol} history is empty, unsorted, or duplicated")
+            if (
+                frame.empty
+                or not isinstance(frame.index, pd.DatetimeIndex)
+                or not frame.index.is_monotonic_increasing
+                or frame.index.has_duplicates
+                or any(value != value.normalize() for value in frame.index)
+            ):
+                raise Phase4Error(
+                    f"{symbol} session index is empty, non-daily, unsorted, or duplicated"
+                )
             if frame.index.max().normalize() != decision or any(frame.index > decision):
                 raise Phase4Error(f"{symbol} is stale or extends beyond the decision session")
+            # Indicators operate on the complete frame, not only on rows selected
+            # below for validation. Requiring exact SPY-calendar equality keeps
+            # an extra weekend/intraday/vendor row from shifting rolling windows
+            # while still passing canonical-session coverage checks.
+            if not frame.index.equals(bundle.calendar):
+                missing_sessions = bundle.calendar.difference(frame.index)
+                unexpected_sessions = frame.index.difference(bundle.calendar)
+                detail = []
+                if len(missing_sessions):
+                    detail.append(f"missing {missing_sessions[0]}")
+                if len(unexpected_sessions):
+                    detail.append(f"unexpected {unexpected_sessions[0]}")
+                raise Phase4Error(
+                    f"{symbol} session index differs from the canonical SPY calendar"
+                    + (f" ({'; '.join(detail)})" if detail else "")
+                )
             missing = active_calendar.difference(frame.index)
             if len(missing):
                 raise Phase4Error(f"{symbol} has missing finalized sessions, including {missing[0].date()}")
@@ -574,7 +598,7 @@ class StrategyTargetPublisher:
                 prior = frame.iloc[-2]
                 if all(
                     float(tail[c]) == float(prior[c])
-                    for c in ("Open", "High", "Low", "Close", "Volume")
+                    for c in ("Open", "High", "Low", "Close")
                 ):
                     raise Phase4Error(f"{symbol} appears to contain a carried-forward final bar")
             if tail["Volume"] <= 0:

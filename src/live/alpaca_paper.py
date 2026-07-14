@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import os
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Any
@@ -92,8 +92,8 @@ class AlpacaAsset:
 class AlpacaPaperConfig:
     """Credentials for a paper account only; never write these to the ledger."""
 
-    api_key: str
-    api_secret: str
+    api_key: str = field(repr=False)
+    api_secret: str = field(repr=False)
     base_url: str = PAPER_BASE_URL
     timeout_seconds: float = 10.0
 

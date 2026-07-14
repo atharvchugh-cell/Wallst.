@@ -40,6 +40,30 @@ from .risk import PreTradeRiskEngine
 
 ALPACA_PAPER_STREAM_URL = "wss://paper-api.alpaca.markets/stream"
 STREAM_NAME = PHASE4_STREAM_NAME
+# Events whose order snapshots can be represented by the append-only OMS.
+# Alpaca also documents trade_bust/trade_correct; those require reversal
+# accounting that this long-only ledger deliberately doesn't implement, so
+# they fail closed into REST reconciliation rather than being misapplied.
+ALPACA_TRADE_UPDATE_EVENTS = frozenset({
+    "accepted",
+    "calculated",
+    "canceled",
+    "done_for_day",
+    "expired",
+    "fill",
+    "held",
+    "new",
+    "order_cancel_rejected",
+    "order_replace_rejected",
+    "partial_fill",
+    "pending_cancel",
+    "pending_new",
+    "pending_replace",
+    "rejected",
+    "replaced",
+    "stopped",
+    "suspended",
+})
 
 
 @dataclass(frozen=True)
@@ -146,6 +170,7 @@ class OrderStreamSupervisor:
             broker_updated_at=event.broker_order.updated_at.isoformat(),
             payload=event.payload(),
             disposition=disposition,
+            recovery_stream_name=STREAM_NAME,
         )
         if not created:
             recorded = self.store.stream_event(event.event_id)
@@ -204,13 +229,14 @@ class OrderStreamSupervisor:
             account = self.broker.get_account()
             self.ledger.assert_account_binding(account.account_id)
             # Required recovery order: account above, then positions/open
-            # orders, then local client IDs/recent fills through OMS and
-            # reconciler. The fetched snapshots are deliberately not trusted
-            # in memory; reconciliation fetches again and persists the result.
+            # orders, then bounded recent all-status orders, local client IDs,
+            # and fills through OMS/reconciler. Do not prefetch all lifetime
+            # orders here: Alpaca caps that endpoint at 500 and the reconciler
+            # owns the overlap-safe submission-time watermark. The fetched
+            # snapshots are deliberately not trusted in memory; reconciliation
+            # fetches again and persists the result.
             self.broker.get_positions()
             self.broker.get_open_orders()
-            self.broker.get_recent_orders()
-            self.broker.get_fills()
             pre_recovery = Reconciler(
                 self.ledger, self.broker, clock=self.clock
             ).reconcile()
@@ -420,9 +446,17 @@ class AlpacaPaperTradeUpdateStream:
     def _parse(self, raw: str | bytes) -> OrderStreamEvent:
         try:
             envelope = json.loads(raw)
+            if not isinstance(envelope, dict) or envelope.get("stream") != "trade_updates":
+                raise ValueError("unexpected stream envelope")
             data_row = envelope["data"]
-            event_type = str(data_row["event"])
+            if not isinstance(data_row, dict):
+                raise TypeError("trade-update data must be an object")
+            event_type = data_row["event"]
+            if not isinstance(event_type, str) or event_type not in ALPACA_TRADE_UPDATE_EVENTS:
+                raise ValueError("unsupported trade-update event")
             row = data_row["order"]
+            if not isinstance(row, dict) or row.get("asset_class", "us_equity") != "us_equity":
+                raise ValueError("trade-update order must be a US equity")
             status = ALPACA_ORDER_STATUS[str(row["status"]).lower()]
             submitted = ensure_aware(
                 datetime.fromisoformat(str(row["submitted_at"]).replace("Z", "+00:00")),

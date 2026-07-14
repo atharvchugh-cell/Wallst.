@@ -3,8 +3,13 @@
 Reconciliation compares broker cash, buying power, positions, whole-share
 quantities, open orders, recent orders in every status (so unseen terminal
 orders cannot hide), cumulative fills, statuses, client IDs, and local ledger
-state. Every issue is latched as a durable critical alert at the reconciliation
-boundary even if its caller crashes.
+state. Recent order/fill retrieval is bounded and starts from the previous
+reconciliation's start time minus overlap, preventing both lifetime pagination
+deadlocks and activity-during-reconciliation gaps. A dedicated cross-process
+fence serializes complete reconciliation snapshots, so an older clean run
+cannot pause and commit after a newer dirty run. Every issue is latched as a
+durable critical alert at the reconciliation boundary even if its caller
+crashes.
 
 1. Engage the kill switch for any unexplained mismatch if it is not already
    active. Preserve broker and ledger evidence.

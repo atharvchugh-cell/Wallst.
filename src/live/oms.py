@@ -5,22 +5,27 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Callable
 
-from .broker import Broker, BrokerError
-from .ledger import Ledger
+from .broker import BROKER_ACTIVITY_WATERMARK_OVERLAP, Broker, BrokerError
+from .ledger import Ledger, LedgerError
 from .models import (
     ACTIVE_ORDER_STATUSES,
+    AccountSnapshot,
+    BrokerOrder,
     IntentStatus,
     OMSResult,
     OrderRequest,
     OrderStatus,
     OrderType,
+    Position,
     Quote,
     RiskViolation,
     Side,
     TargetPositionIntent,
     TimeInForce,
     ZERO,
+    ensure_aware,
     utc_now,
 )
 from .risk import PreTradeRiskEngine
@@ -48,6 +53,7 @@ class OrderManagementSystem:
         client_id_namespace: str = "wslab",
         arm_max_age_seconds: int = 900,
         clock=utc_now,
+        submission_authorizer: Callable[[], None] | None = None,
     ) -> None:
         if not client_id_namespace or not all(c.isalnum() or c in "-_" for c in client_id_namespace):
             raise ValueError("client_id_namespace may contain only letters, numbers, '-' and '_'")
@@ -59,8 +65,11 @@ class OrderManagementSystem:
         self.client_id_namespace = client_id_namespace
         if arm_max_age_seconds <= 0:
             raise ValueError("arm_max_age_seconds must be positive")
+        if submission_authorizer is not None and not callable(submission_authorizer):
+            raise TypeError("submission_authorizer must be callable")
         self.arm_max_age_seconds = arm_max_age_seconds
         self.clock = clock
+        self.submission_authorizer = submission_authorizer
 
     @property
     def account_id(self) -> str:
@@ -73,33 +82,22 @@ class OrderManagementSystem:
         if not reason.strip():
             raise ValueError("An operator reason is required to arm execution")
         account_id = self.account_id
-        self.ledger.assert_account_binding(account_id)
-        if not self.ledger.positions_bootstrapped(account_id):
-            raise ReconciliationRequired("Position ledger must be bootstrapped before arming")
-        control = self.ledger.get_control_state(account_id)
-        if control["kill_switch"]:
-            raise ExecutionBlocked("Reset the kill switch explicitly before arming")
-        latest = self.ledger.latest_reconciliation(account_id)
-        if latest is None or not bool(latest["clean"]):
-            raise ReconciliationRequired("A clean reconciliation is required before arming")
-        completed = datetime.fromisoformat(latest["completed_at"])
-        if completed.tzinfo is None:
-            completed = completed.replace(tzinfo=timezone.utc)
-        if not self.ledger.reconciliation_follows_last_control_change(
-            account_id, latest["run_id"]
-        ):
-            raise ReconciliationRequired(
-                "A clean reconciliation newer than the last control change is required"
-            )
-        age = (self.clock() - completed.astimezone(timezone.utc)).total_seconds()
-        if age < 0 or age > max_reconciliation_age_seconds:
-            raise ReconciliationRequired("The latest clean reconciliation is stale")
-        self.ledger.set_control_state(
-            account_id, armed=True, kill_switch=False, reason=reason
+        blocker = self.ledger.arm_after_clean_reconciliation(
+            account_id,
+            reason=reason,
+            max_reconciliation_age_seconds=max_reconciliation_age_seconds,
         )
+        if blocker is None:
+            return
+        code, message = blocker
+        if code == "KILL_SWITCH":
+            raise ExecutionBlocked(message)
+        raise ReconciliationRequired(message)
 
     def disarm(self, reason: str) -> None:
-        account_id = self.account_id
+        # A local emergency stop must remain effective even when credentials
+        # are unavailable or now authenticate a different broker account.
+        account_id = self.ledger.bound_account_id() or self.account_id
         control = self.ledger.get_control_state(account_id)
         self.ledger.set_control_state(
             account_id,
@@ -110,8 +108,9 @@ class OrderManagementSystem:
 
     def reset_kill_switch(self, reason: str) -> None:
         """Clear a kill only into the disarmed state; arming remains separate."""
+        account_id = self.ledger.bound_account_id() or self.account_id
         self.ledger.set_control_state(
-            self.account_id, armed=False, kill_switch=False, reason=reason
+            account_id, armed=False, kill_switch=False, reason=reason
         )
 
     def engage_kill_switch(self, reason: str, *, cancel_open_orders: bool = True) -> None:
@@ -211,20 +210,37 @@ class OrderManagementSystem:
         high_water_equity: Decimal,
         trading_date: str | None = None,
     ) -> OMSResult:
-        try:
-            return self._process_intent(
-                intent,
-                quote=quote,
-                market_open=market_open,
-                day_start_equity=day_start_equity,
-                high_water_equity=high_water_equity,
-                trading_date=trading_date,
-            )
-        except BrokerError as exc:
-            self._fail_closed_accounts(
-                (intent.account_id,), "broker error during intent processing", exc
-            )
-            raise
+        # This is an account-wide risk reservation fence, not merely a POST
+        # mutex. Every competing process must observe both the preceding
+        # process's durable order/fill state and any fail-closed disarm before
+        # constructing its own snapshot and risk decision.
+        with self.ledger.execution_guard():
+            try:
+                return self._process_intent(
+                    intent,
+                    quote=quote,
+                    market_open=market_open,
+                    day_start_equity=day_start_equity,
+                    high_water_equity=high_water_equity,
+                    trading_date=trading_date,
+                )
+            except BrokerError as exc:
+                self._attempt_fail_closed(
+                    (intent.account_id,), "broker error during intent processing", exc
+                )
+                raise
+            except LedgerError as exc:
+                self._attempt_fail_closed(
+                    (intent.account_id,), "ledger integrity error during intent processing", exc
+                )
+                raise
+            except ExecutionBlocked:
+                raise
+            except Exception as exc:
+                self._attempt_fail_closed(
+                    (intent.account_id,), "unexpected error during intent processing", exc
+                )
+                raise
 
     def _process_intent(
         self,
@@ -238,7 +254,13 @@ class OrderManagementSystem:
     ) -> OMSResult:
         account = self.broker.get_account()
         if intent.account_id != account.account_id:
-            raise ExecutionBlocked("Intent account does not match broker account")
+            exc = ExecutionBlocked("Intent account does not match broker account")
+            self._attempt_fail_closed(
+                (self.ledger.bound_account_id() or intent.account_id,),
+                "broker account identity changed during intent processing",
+                exc,
+            )
+            raise exc
         self.ledger.assert_account_binding(account.account_id)
         row, created = self.ledger.create_intent(intent)
         intent_id = row["intent_id"]
@@ -257,17 +279,17 @@ class OrderManagementSystem:
         order = self.ledger.get_order_for_intent(intent_id)
         order_was_newly_planned = False
         if order is None:
-            self._assert_account_alignment(account.account_id)
+            positions, broker_open_orders, active_orders = self._assert_account_alignment(
+                account.account_id, account=account
+            )
             active_for_symbol = [
-                existing for existing in self.ledger.list_orders(active_only=True)
-                if existing["account_id"] == account.account_id
-                and existing["symbol"] == intent.symbol
+                existing for existing in active_orders
+                if existing["symbol"] == intent.symbol
             ]
             if active_for_symbol:
                 raise ExecutionBlocked(
                     f"An active order already exists for {intent.symbol}; reconcile or cancel it first"
                 )
-            positions = self.broker.get_positions()
             current_qty = next(
                 (p.quantity for p in positions if p.symbol == intent.symbol), ZERO
             )
@@ -304,12 +326,15 @@ class OrderManagementSystem:
                         reason="arming session expired before pre-trade risk",
                     )
                     control = self.ledger.get_control_state(account.account_id)
+            reserved_buy_values, reserved_turnover = self._active_order_reservations(
+                active_orders
+            )
             decision = self.risk_engine.evaluate(
                 request,
                 quote=quote,
                 account=account,
                 positions=positions,
-                open_order_count=len(self.broker.get_open_orders()),
+                open_order_count=len(broker_open_orders),
                 daily_turnover=self.ledger.daily_turnover(
                     account.account_id, trading_date or self.clock().date().isoformat()
                 ),
@@ -320,6 +345,8 @@ class OrderManagementSystem:
                 market_open=market_open,
                 signal_at=intent.signal_at,
                 now=self.clock(),
+                reserved_buy_values=reserved_buy_values,
+                reserved_turnover=reserved_turnover,
             )
             if not decision.allowed:
                 circuit_breakers = {"DAILY_LOSS", "DRAWDOWN"}
@@ -346,7 +373,10 @@ class OrderManagementSystem:
                     },
                 )
                 return self._result(intent_id, duplicate=not created)
-            order, order_was_newly_planned = self.ledger.plan_order_with_created(request)
+            order, order_was_newly_planned = self.ledger.plan_order_with_created(
+                request,
+                risk_price=decision.order_notional / request.quantity,
+            )
             self.ledger.set_intent_status(
                 intent_id, IntentStatus.ORDER_PENDING, "risk approved; durable order planned"
             )
@@ -367,9 +397,11 @@ class OrderManagementSystem:
         for order in self.ledger.list_orders(active_only=True):
             try:
                 self._submit_or_synchronize(order, allow_submit=False)
-            except BrokerError as exc:
-                self._fail_closed_accounts(
-                    (order["account_id"],), "broker error during pending-order recovery", exc
+            except Exception as exc:
+                self._attempt_fail_closed(
+                    (order["account_id"],),
+                    "broker or ledger integrity error during pending-order recovery",
+                    exc,
                 )
                 raise
             results.append(self._result(order["intent_id"], duplicate=True))
@@ -386,15 +418,23 @@ class OrderManagementSystem:
             raise ExecutionBlocked("Only an active order can be canceled")
         try:
             broker_order = self.broker.get_order_by_client_id(order["client_order_id"])
-        except BrokerError as exc:
-            self._fail_closed_accounts(
-                (order["account_id"],), "broker error during tracked-order cancellation", exc
+        except Exception as exc:
+            self._attempt_fail_closed(
+                (order["account_id"],),
+                "broker or ledger error during tracked-order cancellation",
+                exc,
             )
             raise
         if broker_order is None:
-            raise ReconciliationRequired(
+            exc = ReconciliationRequired(
                 "Broker cannot find this active order; reconcile and resolve it explicitly"
             )
+            self._attempt_fail_closed(
+                (order["account_id"],),
+                "active local order missing during tracked-order cancellation",
+                exc,
+            )
+            raise exc
         self.ledger.record_audit(
             "operator_cancel_requested",
             "order",
@@ -404,9 +444,11 @@ class OrderManagementSystem:
         try:
             self.broker.cancel_order(broker_order.broker_order_id)
             self._submit_or_synchronize(order, allow_submit=False)
-        except BrokerError as exc:
-            self._fail_closed_accounts(
-                (order["account_id"],), "broker error during tracked-order cancellation", exc
+        except Exception as exc:
+            self._attempt_fail_closed(
+                (order["account_id"],),
+                "broker or ledger error during tracked-order cancellation",
+                exc,
             )
             raise
         return self._result(order["intent_id"], duplicate=True)
@@ -474,6 +516,19 @@ class OrderManagementSystem:
                 broker_order = self.broker.get_order_by_client_id(order["client_order_id"])
                 if broker_order is None:
                     request = self._request_from_row(order)
+                    if self.submission_authorizer is not None:
+                        # Phase-4's policy/stream/alert checks run at the final
+                        # irreversible boundary, after duplicate discovery and
+                        # while the same execution fence is still held.
+                        try:
+                            self.submission_authorizer()
+                        except Exception as exc:
+                            self._attempt_fail_closed(
+                                (order["account_id"],),
+                                "final submission authorization failed",
+                                exc,
+                            )
+                            raise
                     try:
                         broker_order = self.broker.submit_order(request)
                     except BrokerError as exc:
@@ -489,7 +544,7 @@ class OrderManagementSystem:
 
         if not acknowledged_under_guard:
             self.ledger.acknowledge_order(order["order_id"], broker_order)
-        for fill in self.broker.get_fills():
+        for fill in self.broker.get_fills(self._fill_recovery_since(broker_order)):
             if fill.client_order_id == order["client_order_id"]:
                 self.ledger.record_fill(order["order_id"], fill)
 
@@ -513,6 +568,18 @@ class OrderManagementSystem:
             self.ledger.set_intent_status(
                 order["intent_id"], IntentStatus.ORDER_SUBMITTED, broker_order.status.value
             )
+
+    def _fill_recovery_since(self, broker_order: BrokerOrder) -> datetime:
+        """Bound a fill query without skipping post-reconciliation activity."""
+        since = broker_order.submitted_at - BROKER_ACTIVITY_WATERMARK_OVERLAP
+        latest = self.ledger.latest_reconciliation(broker_order.account_id)
+        if latest is not None and bool(latest["clean"]):
+            reconciled_since = ensure_aware(
+                datetime.fromisoformat(latest["started_at"]),
+                "reconciliation fill watermark",
+            ) - BROKER_ACTIVITY_WATERMARK_OVERLAP
+            since = max(since, reconciled_since)
+        return since
 
     def _control_age_seconds(self, control: dict) -> float | None:
         if control["updated_at"] is None:
@@ -542,26 +609,114 @@ class OrderManagementSystem:
                 {"operation": reason, "error_type": type(exc).__name__, "error": str(exc)},
             )
 
-    def _assert_account_alignment(self, account_id: str) -> None:
+    def _attempt_fail_closed(
+        self, account_ids: tuple[str, ...], reason: str, exc: Exception
+    ) -> None:
+        """Best-effort disarm without replacing the triggering exception."""
+        try:
+            try:
+                bound = self.ledger.bound_account_id()
+            except Exception:
+                bound = None
+            targets = ((bound,) if bound else ()) + account_ids
+            self._fail_closed_accounts(targets, reason, exc)
+        except Exception as fail_closed_exc:  # pragma: no cover - storage failure path
+            if hasattr(exc, "add_note"):
+                exc.add_note(
+                    "Fail-closed persistence also failed: "
+                    f"{type(fail_closed_exc).__name__}: {fail_closed_exc}"
+                )
+
+    @staticmethod
+    def _active_order_reservations(
+        active_orders: list[dict],
+    ) -> tuple[dict[str, Decimal], Decimal]:
+        """Reserve every unfilled active order against aggregate risk limits."""
+        buy_values: dict[str, Decimal] = {}
+        turnover = ZERO
+        for order in active_orders:
+            quantity = Decimal(order["quantity"])
+            filled = Decimal(order["filled_quantity"])
+            remaining = quantity - filled
+            if remaining < ZERO:
+                raise LedgerError(
+                    f"Active order {order['order_id']} has negative remaining quantity"
+                )
+            if remaining == ZERO:
+                continue
+            risk_price = Decimal(order["risk_price"])
+            if risk_price <= ZERO:
+                raise LedgerError(
+                    f"Active order {order['order_id']} has no positive risk reservation price"
+                )
+            value = remaining * risk_price
+            turnover += value
+            if Side(order["side"]) == Side.BUY:
+                buy_values[order["symbol"]] = buy_values.get(order["symbol"], ZERO) + value
+        return buy_values, turnover
+
+    def _assert_account_alignment(
+        self, account_id: str, *, account: AccountSnapshot
+    ) -> tuple[list[Position], list[BrokerOrder], list[dict]]:
         local = {p.symbol: p.quantity for p in self.ledger.list_positions(account_id)}
         broker_rows = self.broker.get_positions()
         broker = {p.symbol: p.quantity for p in broker_rows}
         expected_cash = self.ledger.expected_cash(account_id)
-        broker_cash = self.broker.get_account().cash
-        local_open = {
-            order["client_order_id"] for order in self.ledger.list_orders(active_only=True)
+        broker_cash = account.cash
+        local_open_rows = [
+            order for order in self.ledger.list_orders(active_only=True)
             if order["account_id"] == account_id
+        ]
+        local_open_by_client = {
+            order["client_order_id"]: order for order in local_open_rows
         }
+        local_open = set(local_open_by_client)
         broker_open_rows = self.broker.get_open_orders()
-        broker_open = {order.client_order_id for order in broker_open_rows}
+        broker_open_by_client = {
+            order.client_order_id: order for order in broker_open_rows
+        }
+        broker_open = set(broker_open_by_client)
         broker_order_ids = {order.broker_order_id for order in broker_open_rows}
         duplicate_broker_orders = (
             len(broker_open) != len(broker_open_rows)
             or len(broker_order_ids) != len(broker_open_rows)
         )
+        order_detail_mismatches: list[str] = []
+        for client_order_id in sorted(local_open & broker_open):
+            local_order = local_open_by_client[client_order_id]
+            broker_order = broker_open_by_client[client_order_id]
+            expected = {
+                "account_id": local_order["account_id"],
+                "symbol": local_order["symbol"],
+                "side": local_order["side"],
+                "quantity": Decimal(local_order["quantity"]),
+                "filled_quantity": Decimal(local_order["filled_quantity"]),
+                "order_type": local_order["order_type"],
+                "time_in_force": local_order["time_in_force"],
+                "limit_price": (
+                    Decimal(local_order["limit_price"])
+                    if local_order["limit_price"] is not None else None
+                ),
+            }
+            actual = {
+                "account_id": broker_order.account_id,
+                "symbol": broker_order.symbol,
+                "side": broker_order.side.value,
+                "quantity": broker_order.quantity,
+                "filled_quantity": broker_order.filled_quantity,
+                "order_type": broker_order.order_type.value,
+                "time_in_force": broker_order.time_in_force.value,
+                "limit_price": broker_order.limit_price,
+            }
+            changed = sorted(key for key in expected if expected[key] != actual[key])
+            if changed:
+                order_detail_mismatches.append(
+                    f"{client_order_id}: {', '.join(changed)}"
+                )
         if (
             len(broker) != len(broker_rows)
             or duplicate_broker_orders
+            or order_detail_mismatches
             or local != broker
             or expected_cash is None
             or expected_cash != broker_cash
@@ -581,11 +736,13 @@ class OrderManagementSystem:
                     "ledger_open_order_ids": sorted(local_open),
                     "broker_open_order_ids": sorted(broker_open),
                     "duplicate_broker_open_order_ids": duplicate_broker_orders,
+                    "broker_open_order_detail_mismatches": order_detail_mismatches,
                 },
             )
             raise ReconciliationRequired(
                 "Broker and ledger account state differ; execution was disarmed"
             )
+        return broker_rows, broker_open_rows, local_open_rows
 
     @staticmethod
     def _request_from_row(order: dict) -> OrderRequest:

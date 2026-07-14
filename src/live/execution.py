@@ -81,9 +81,16 @@ class PaperExecutionService:
         targets: SleeveTargetSnapshot,
         *,
         confirm_new_equity_session: bool,
-        plan_validator: Callable[[ExecutionPlan, dict[str, Any]], None] | None = None,
+        plan_validator: Callable[[ExecutionPlan, dict[str, Any], Any], None] | None = None,
         phase4_link: tuple[str, str, bool] | None = None,
     ) -> tuple[ExecutionPlan, bool]:
+        profile = self.ledger.execution_profile()
+        if phase4_link is None and profile == "phase4":
+            raise ExecutionBlocked(
+                "Legacy Phase-3 preview is forbidden in a Phase-4 execution ledger"
+            )
+        if phase4_link is not None and profile == "phase3":
+            raise ExecutionBlocked("Phase-4 preview is forbidden in a Phase-3 execution ledger")
         self.ledger.assert_account_binding(deployment.account_id)
         local_control = self.ledger.get_control_state(deployment.account_id)
         if local_control["armed"]:
@@ -155,7 +162,10 @@ class PaperExecutionService:
             ),
         )
         if plan_validator is not None:
-            plan_validator(plan, quotes)
+            # Pass the exact account snapshot used by build_execution_plan so
+            # downstream policy checks cannot accidentally divide by stale
+            # publication-time equity.
+            plan_validator(plan, quotes, account)
         _row, created = self.ledger.create_execution_batch(plan, phase4_link=phase4_link)
         return plan, created
 
@@ -166,6 +176,8 @@ class PaperExecutionService:
         operator: str,
         reason: str,
         phase4_authorizer: Callable[[str], None] | None = None,
+        phase4_submit_authorizer: Callable[[str], None] | None = None,
+        phase4_plan_validator: Callable[[ExecutionPlan, dict[str, Any], Any], None] | None = None,
     ) -> BatchExecutionResult:
         if not operator.strip() or not reason.strip():
             raise ValueError("Execution requires an operator and reason")
@@ -173,6 +185,8 @@ class PaperExecutionService:
             return self._execute_under_guard(
                 batch_id, operator=operator, reason=reason,
                 phase4_authorizer=phase4_authorizer,
+                phase4_submit_authorizer=phase4_submit_authorizer,
+                phase4_plan_validator=phase4_plan_validator,
             )
 
     def settle(self, batch_id: str, *, operator: str, reason: str) -> BatchExecutionResult:
@@ -260,6 +274,8 @@ class PaperExecutionService:
         operator: str,
         reason: str,
         phase4_authorizer: Callable[[str], None] | None,
+        phase4_submit_authorizer: Callable[[str], None] | None,
+        phase4_plan_validator: Callable[[ExecutionPlan, dict[str, Any], Any], None] | None,
     ) -> BatchExecutionResult:
         row = self.ledger.get_execution_batch(batch_id)
         if row is None:
@@ -268,12 +284,23 @@ class PaperExecutionService:
         phase4_link = self.ledger.conn.execute(
             "SELECT * FROM phase4_plan_links WHERE batch_id = ?", (batch_id,)
         ).fetchone()
+        profile = self.ledger.execution_profile()
+        if profile == "phase4" and phase4_link is None:
+            raise ExecutionBlocked(
+                "Unlinked legacy batches cannot execute in a Phase-4 ledger"
+            )
+        if phase4_link is not None and profile != "phase4":
+            raise ExecutionBlocked("Phase-4 batch is not in a Phase-4 execution ledger")
         if phase4_link is not None and not bool(phase4_link["paper_submission_allowed"]):
             raise ExecutionBlocked(
                 f"Phase-4 {phase4_link['operation_mode']} plan is permanently non-submitting"
             )
         if phase4_link is not None:
-            if phase4_authorizer is None:
+            if (
+                phase4_authorizer is None
+                or phase4_submit_authorizer is None
+                or phase4_plan_validator is None
+            ):
                 raise ExecutionBlocked(
                     "Phase-4 linked batches must execute through Phase4Supervisor"
                 )
@@ -326,9 +353,23 @@ class PaperExecutionService:
         equity = self.ledger.observe_equity(
             account, session.trading_date, allow_new_session=False
         )
+        if phase4_link is not None:
+            # Phase-4 policy limits are independent of the Phase-3 risk
+            # envelope and must be rechecked against execution-time account
+            # equity and quotes, not only at preview.
+            phase4_plan_validator(plan, quotes, account)
 
         risk = PreTradeRiskEngine(plan.risk_limits, clock=self.clock)
-        oms = OrderManagementSystem(self.ledger, self.broker, risk, clock=self.clock)
+        oms = OrderManagementSystem(
+            self.ledger,
+            self.broker,
+            risk,
+            clock=self.clock,
+            submission_authorizer=(
+                (lambda: phase4_submit_authorizer(batch_id))
+                if phase4_link is not None else None
+            ),
+        )
         reconciler = Reconciler(self.ledger, self.broker, clock=self.clock)
         results: list[OMSResult] = []
         began = False

@@ -1,13 +1,15 @@
 """OMS lifecycle, idempotency, restart, partial-fill, and kill-switch tests."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import threading
 
 import pytest
 
 from src.live.broker import BrokerError
 from src.live.fake_broker import FakeBroker
-from src.live.ledger import Ledger
+from src.live.ledger import Ledger, LedgerConflict
 from src.live.models import IntentStatus, OrderRequest, Side, TargetPositionIntent
 from src.live.oms import (
     ExecutionBlocked,
@@ -16,7 +18,7 @@ from src.live.oms import (
     ReconciliationRequired,
 )
 from src.live.reconcile import Reconciler
-from src.live.risk import PreTradeRiskEngine
+from src.live.risk import PreTradeRiskEngine, RiskLimits
 
 
 class ManualClock:
@@ -121,6 +123,34 @@ def test_lost_acknowledgement_recovers_by_same_client_id_without_duplicate():
     assert recovered.duplicate_intent is True
     assert broker.submission_count == 1
     assert ledger.list_positions("TEST")[0].quantity == Decimal("10")
+
+
+def test_lost_ack_recovery_never_scans_lifetime_fill_history():
+    class BoundedFillBroker(FakeBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fill_queries = []
+
+        def get_fills(self, since=None):
+            if since is None:
+                raise BrokerError("lifetime fill scans are forbidden")
+            self.fill_queries.append(since)
+            return super().get_fills(since)
+
+    clock, broker, quote, ledger, _reconciler, oms = armed_stack(
+        broker_class=BoundedFillBroker
+    )
+    broker.raise_after_submit_once = True
+    target = intent(clock)
+    with pytest.raises(BrokerError, match="acknowledgement loss"):
+        submit(oms, target, quote)
+
+    recovered = submit(oms, target, quote)
+    assert recovered.intent_status == IntentStatus.FILLED
+    assert broker.submission_count == 1
+    assert ledger.list_positions("TEST")[0].quantity == Decimal("10")
+    assert broker.fill_queries
+    assert all(since is not None for since in broker.fill_queries)
 
 
 def test_recovery_never_resubmits_a_missing_order_after_disarm_and_allows_audited_abandon():
@@ -374,3 +404,224 @@ def test_arming_requires_baseline_and_clean_reconciliation():
     Reconciler(ledger, broker, clock=clock).bootstrap_positions()
     with pytest.raises(ReconciliationRequired, match="clean reconciliation"):
         oms.arm("still unsafe")
+
+
+def test_active_buy_orders_reserve_gross_exposure_before_they_fill():
+    clock = ManualClock()
+    broker = FakeBroker("TEST", "100000", auto_fill=False, clock=clock)
+    quotes = {
+        symbol: broker.set_quote(symbol, "100", spread_bps="0", as_of=clock())
+        for symbol in ("AAPL", "MSFT")
+    }
+    ledger = Ledger(":memory:", clock=clock)
+    reconciler = Reconciler(ledger, broker, clock=clock)
+    reconciler.bootstrap_positions()
+    assert reconciler.reconcile().clean
+    limits = RiskLimits(
+        max_order_notional=Decimal("20000"),
+        max_gross_exposure_pct=Decimal("0.15"),
+        max_symbol_exposure_pct=Decimal("0.15"),
+        max_daily_turnover_pct=Decimal("1"),
+    )
+    oms = OrderManagementSystem(
+        ledger, broker, PreTradeRiskEngine(limits, clock=clock), clock=clock
+    )
+    oms.arm("reservation test")
+
+    def target(symbol):
+        return TargetPositionIntent(
+            "TEST", "aggregated-portfolio", symbol, Decimal("100"),
+            clock(), "v1", Decimal("100"), "reservation test",
+        )
+
+    first = submit(oms, target("AAPL"), quotes["AAPL"])
+    second = submit(oms, target("MSFT"), quotes["MSFT"])
+    assert first.intent_status == IntentStatus.ORDER_SUBMITTED
+    assert second.intent_status == IntentStatus.RISK_REJECTED
+    assert "GROSS_EXPOSURE" in {v.code for v in second.risk_violations}
+    assert broker.submission_count == 1
+
+
+def test_active_orders_reserve_buying_power_cash_and_turnover():
+    clock = ManualClock()
+    broker = FakeBroker("TEST", "100000", auto_fill=False, clock=clock)
+    quotes = {
+        symbol: broker.set_quote(symbol, "100", spread_bps="0", as_of=clock())
+        for symbol in ("AAPL", "MSFT")
+    }
+    ledger = Ledger(":memory:", clock=clock)
+    reconciler = Reconciler(ledger, broker, clock=clock)
+    reconciler.bootstrap_positions()
+    assert reconciler.reconcile().clean
+    limits = RiskLimits(
+        max_order_notional=Decimal("70000"),
+        max_gross_exposure_pct=Decimal("2"),
+        max_symbol_exposure_pct=Decimal("1"),
+        max_daily_turnover_pct=Decimal("1"),
+    )
+    oms = OrderManagementSystem(
+        ledger, broker, PreTradeRiskEngine(limits, clock=clock), clock=clock
+    )
+    oms.arm("reservation test")
+    for symbol in ("AAPL", "MSFT"):
+        target = TargetPositionIntent(
+            "TEST", "aggregated-portfolio", symbol, Decimal("600"),
+            clock(), "v1", Decimal("100"), "reservation test",
+        )
+        result = submit(oms, target, quotes[symbol])
+        if symbol == "AAPL":
+            assert result.intent_status == IntentStatus.ORDER_SUBMITTED
+        else:
+            assert result.intent_status == IntentStatus.RISK_REJECTED
+            assert {"BUYING_POWER", "CASH_BUFFER", "DAILY_TURNOVER"} <= {
+                violation.code for violation in result.risk_violations
+            }
+    assert broker.submission_count == 1
+
+
+def test_account_execution_fence_serializes_snapshot_risk_and_submit(tmp_path):
+    clock = ManualClock()
+    broker = FakeBroker("TEST", "100000", auto_fill=True, clock=clock)
+    quotes = {
+        symbol: broker.set_quote(symbol, "100", spread_bps="0", as_of=clock())
+        for symbol in ("AAPL", "MSFT")
+    }
+    path = tmp_path / "serialized-risk.sqlite3"
+    limits = RiskLimits(
+        max_order_notional=Decimal("20000"),
+        max_gross_exposure_pct=Decimal("0.15"),
+        max_symbol_exposure_pct=Decimal("0.15"),
+        max_daily_turnover_pct=Decimal("1"),
+    )
+    with Ledger(path, clock=clock) as ledger:
+        reconciler = Reconciler(ledger, broker, clock=clock)
+        reconciler.bootstrap_positions()
+        assert reconciler.reconcile().clean
+        OrderManagementSystem(
+            ledger, broker, PreTradeRiskEngine(limits, clock=clock), clock=clock
+        ).arm("concurrency test")
+
+    first_in_risk = threading.Event()
+    release_first = threading.Event()
+    second_in_risk = threading.Event()
+    results = {}
+    errors = []
+
+    class PausingRisk(PreTradeRiskEngine):
+        def evaluate(self, request, **kwargs):
+            decision = super().evaluate(request, **kwargs)
+            if request.symbol == "AAPL":
+                first_in_risk.set()
+                assert release_first.wait(timeout=3)
+            else:
+                second_in_risk.set()
+            return decision
+
+    def run(symbol):
+        try:
+            with Ledger(path, clock=clock) as ledger:
+                oms = OrderManagementSystem(
+                    ledger, broker, PausingRisk(limits, clock=clock), clock=clock
+                )
+                target = TargetPositionIntent(
+                    "TEST", "aggregated-portfolio", symbol, Decimal("100"),
+                    clock(), "v1", Decimal("100"), "concurrency test",
+                )
+                results[symbol] = submit(oms, target, quotes[symbol])
+        except Exception as exc:  # surfaced below
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=("AAPL",))
+    second = threading.Thread(target=run, args=("MSFT",))
+    first.start()
+    assert first_in_risk.wait(timeout=3)
+    second.start()
+    assert second_in_risk.wait(timeout=0.2) is False
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert errors == []
+    assert results["AAPL"].intent_status == IntentStatus.FILLED
+    assert results["MSFT"].intent_status == IntentStatus.RISK_REJECTED
+    assert broker.submission_count == 1
+
+
+def test_broker_acknowledgement_integrity_conflict_disarms():
+    class MismatchedAcknowledgementBroker(FakeBroker):
+        def submit_order(self, request):
+            return replace(super().submit_order(request), symbol="MSFT")
+
+    clock, _broker, quote, ledger, _reconciler, oms = armed_stack(
+        auto_fill=False, broker_class=MismatchedAcknowledgementBroker
+    )
+    with pytest.raises(LedgerConflict, match="mismatched: symbol"):
+        submit(oms, intent(clock), quote)
+    assert ledger.get_control_state("TEST")["armed"] is False
+
+
+def test_disarm_always_targets_the_ledger_bound_account():
+    clock, _broker, _quote, ledger, _reconciler, _oms = armed_stack()
+    wrong_broker = FakeBroker("OTHER-ACCOUNT", "10000", clock=clock)
+    wrong_oms = OrderManagementSystem(
+        ledger, wrong_broker, PreTradeRiskEngine(clock=clock), clock=clock
+    )
+    wrong_oms.disarm("credentials changed; local emergency stop")
+    assert ledger.get_control_state("TEST")["armed"] is False
+    assert ledger.get_control_state("OTHER-ACCOUNT")["updated_at"] is None
+
+
+def test_cancel_missing_active_order_disarms_before_resolution():
+    clock, broker, quote, ledger, _reconciler, oms = armed_stack(auto_fill=False)
+    result = submit(oms, intent(clock), quote)
+    broker._orders_by_client.clear()
+    broker._orders_by_broker.clear()
+    with pytest.raises(ReconciliationRequired, match="cannot find"):
+        oms.cancel_tracked_order(result.order_id, "operator cancel")
+    assert ledger.get_control_state("TEST")["armed"] is False
+
+
+def test_submission_authorizer_runs_inside_reentrant_execution_fence():
+    clock = ManualClock()
+    broker = FakeBroker("TEST", "10000", auto_fill=False, clock=clock)
+    quote = broker.set_quote("AAPL", "100", spread_bps="0", as_of=clock())
+    ledger = Ledger(":memory:", clock=clock)
+    reconciler = Reconciler(ledger, broker, clock=clock)
+    reconciler.bootstrap_positions()
+    assert reconciler.reconcile().clean
+    calls = []
+
+    def authorize():
+        calls.append(getattr(ledger._execution_guard_local, "depth", 0))
+
+    oms = OrderManagementSystem(
+        ledger, broker, PreTradeRiskEngine(clock=clock), clock=clock,
+        submission_authorizer=authorize,
+    )
+    oms.arm("authorizer test")
+    result = submit(oms, intent(clock), quote)
+    assert result.intent_status == IntentStatus.ORDER_SUBMITTED
+    assert len(calls) == 1 and calls[0] >= 1
+
+
+def test_submission_authorizer_failure_disarms_without_posting():
+    clock = ManualClock()
+    broker = FakeBroker("TEST", "10000", auto_fill=False, clock=clock)
+    quote = broker.set_quote("AAPL", "100", spread_bps="0", as_of=clock())
+    ledger = Ledger(":memory:", clock=clock)
+    reconciler = Reconciler(ledger, broker, clock=clock)
+    reconciler.bootstrap_positions()
+    assert reconciler.reconcile().clean
+
+    def reject_submission():
+        raise ExecutionBlocked("final policy changed")
+
+    oms = OrderManagementSystem(
+        ledger, broker, PreTradeRiskEngine(clock=clock), clock=clock,
+        submission_authorizer=reject_submission,
+    )
+    oms.arm("authorizer test")
+    with pytest.raises(ExecutionBlocked, match="policy changed"):
+        submit(oms, intent(clock), quote)
+    assert broker.submission_count == 0
+    assert ledger.get_control_state("TEST")["armed"] is False

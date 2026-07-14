@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import hmac
+import errno
 import os
 import sqlite3
+import stat
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterator
@@ -42,7 +44,8 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+EXECUTION_PROFILES = {"phase3", "phase4"}
 
 
 class LedgerError(RuntimeError):
@@ -51,6 +54,26 @@ class LedgerError(RuntimeError):
 
 class LedgerConflict(LedgerError):
     pass
+
+
+def _open_private_lock(path: str):
+    """Open an operator-owned regular lock file without following symlinks."""
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise LedgerError("Ledger lock path is not a regular file")
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise LedgerError("Ledger lock file is not owned by the current operator")
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "a+")
+    except Exception:
+        try:
+            os.close(descriptor)
+        except (NameError, OSError):
+            pass
+        raise
 
 
 def _ledger_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -73,29 +96,49 @@ class Ledger:
             self.path = str(raw_path.resolve())
         self.clock = clock
         self._execution_rlock = threading.RLock()
+        self._execution_guard_local = threading.local()
         self._batch_rlock = threading.RLock()
+        self._reconciliation_rlock = threading.RLock()
+        self._reconciliation_guard_local = threading.local()
+        self._lifetime_lock_file = None
+        self.conn = None
         if self.path != ":memory:":
             Path(self.path).resolve().parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30.0)
-        if self.path != ":memory:":
-            os.chmod(self.path, 0o600)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 30000")
-        if self.path != ":memory:":
-            self.conn.execute("PRAGMA journal_mode = WAL")
-            self.conn.execute("PRAGMA synchronous = FULL")
-        self._create_schema()
-        integrity = self.conn.execute("PRAGMA quick_check").fetchone()
-        if integrity is None or integrity[0] != "ok":
-            self.conn.close()
-            raise LedgerError("SQLite quick_check failed; execution ledger is not safe to use")
-        if self.conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            self.conn.close()
-            raise LedgerError("SQLite foreign_key_check failed; execution ledger is not safe to use")
+            if fcntl is None:
+                raise LedgerError("File-backed ledger lifetime fencing requires fcntl support")
+            self._lifetime_lock_file = _open_private_lock(f"{self.path}.active.lock")
+            fcntl.flock(self._lifetime_lock_file.fileno(), fcntl.LOCK_SH)
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=30.0)
+            if self.path != ":memory:":
+                os.chmod(self.path, 0o600)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("PRAGMA busy_timeout = 30000")
+            if self.path != ":memory:":
+                self.conn.execute("PRAGMA journal_mode = WAL")
+                self.conn.execute("PRAGMA synchronous = FULL")
+            self._create_schema()
+            integrity = self.conn.execute("PRAGMA quick_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                raise LedgerError("SQLite quick_check failed; execution ledger is not safe to use")
+            if self.conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise LedgerError("SQLite foreign_key_check failed; execution ledger is not safe to use")
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
-        self.conn.close()
+        try:
+            if self.conn is not None:
+                self.conn.close()
+                self.conn = None
+        finally:
+            if self._lifetime_lock_file is not None:
+                if fcntl is not None:
+                    fcntl.flock(self._lifetime_lock_file.fileno(), fcntl.LOCK_UN)
+                self._lifetime_lock_file.close()
+                self._lifetime_lock_file = None
 
     def __enter__(self) -> "Ledger":
         return self
@@ -120,19 +163,31 @@ class Ledger:
     def execution_guard(self) -> Iterator[None]:
         """Serialize broker submissions against arm/disarm/kill state changes."""
         with self._execution_rlock:
+            depth = getattr(self._execution_guard_local, "depth", 0)
+            if depth:
+                self._execution_guard_local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._execution_guard_local.depth = depth
+                return
             if self.path == ":memory:":
-                yield
+                self._execution_guard_local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._execution_guard_local.depth = 0
                 return
             if fcntl is None:
                 raise LedgerError("File-backed execution fencing requires fcntl support")
             lock_path = f"{self.path}.execution.lock"
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.chmod(lock_path, 0o600)
-            with os.fdopen(fd, "a+") as lock_file:
+            with _open_private_lock(lock_path) as lock_file:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._execution_guard_local.depth = 1
                 try:
                     yield
                 finally:
+                    self._execution_guard_local.depth = 0
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @contextmanager
@@ -145,14 +200,66 @@ class Ledger:
             if fcntl is None:
                 raise LedgerError("File-backed batch fencing requires fcntl support")
             lock_path = f"{self.path}.batch.lock"
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.chmod(lock_path, 0o600)
-            with os.fdopen(fd, "a+") as lock_file:
+            with _open_private_lock(lock_path) as lock_file:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 try:
                     yield
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def reconciliation_guard(self) -> Iterator[None]:
+        """Serialize full broker snapshots so stale clean runs cannot commit last."""
+        with self._reconciliation_rlock:
+            depth = getattr(self._reconciliation_guard_local, "depth", 0)
+            if depth:
+                self._reconciliation_guard_local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._reconciliation_guard_local.depth = depth
+                return
+            if self.path == ":memory:":
+                self._reconciliation_guard_local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._reconciliation_guard_local.depth = 0
+                return
+            if fcntl is None:
+                raise LedgerError("File-backed reconciliation fencing requires fcntl support")
+            lock_path = f"{self.path}.reconciliation.lock"
+            with _open_private_lock(lock_path) as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._reconciliation_guard_local.depth = 1
+                try:
+                    yield
+                finally:
+                    self._reconciliation_guard_local.depth = 0
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    @contextmanager
+    def exclusive_restore_guard(path: str | Path) -> Iterator[None]:
+        """Refuse replacement while any process has the target ledger open."""
+        target = Path(path).expanduser().resolve()
+        if fcntl is None:
+            raise LedgerError("Exclusive ledger restore fencing requires fcntl support")
+        with _open_private_lock(f"{target}.active.lock") as lock_file:
+            try:
+                fcntl.flock(
+                    lock_file.fileno(), fcntl.LOCK_EX | getattr(fcntl, "LOCK_NB", 0)
+                )
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise LedgerError(
+                        "Restore refused because the destination ledger is open in another process"
+                    ) from exc
+                raise
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _create_schema(self) -> None:
         self.conn.executescript(
@@ -198,6 +305,7 @@ class Ledger:
                 quantity TEXT NOT NULL,
                 filled_quantity TEXT NOT NULL DEFAULT '0',
                 reference_price TEXT NOT NULL,
+                risk_price TEXT NOT NULL,
                 order_type TEXT NOT NULL,
                 time_in_force TEXT NOT NULL,
                 limit_price TEXT,
@@ -428,6 +536,20 @@ class Ledger:
               BEGIN
                 SELECT RAISE(ABORT, 'phase4 plan links are immutable');
               END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_profile_no_update
+              BEFORE UPDATE ON metadata
+              WHEN OLD.key = 'execution_profile'
+              BEGIN
+                SELECT RAISE(ABORT, 'execution profile is immutable');
+              END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_profile_no_delete
+              BEFORE DELETE ON metadata
+              WHEN OLD.key = 'execution_profile'
+              BEGIN
+                SELECT RAISE(ABORT, 'execution profile is immutable');
+              END;
             """
         )
         batch_columns = {
@@ -457,6 +579,31 @@ class Ledger:
         }
         if "last_escalated_at" not in alert_columns:
             self.conn.execute("ALTER TABLE alerts ADD COLUMN last_escalated_at TEXT")
+        order_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(orders)")
+        }
+        if "risk_price" not in order_columns:
+            self.conn.execute(
+                "ALTER TABLE orders ADD COLUMN risk_price TEXT NOT NULL DEFAULT '0'"
+            )
+            self.conn.execute(
+                """UPDATE orders SET risk_price =
+                       CASE WHEN limit_price IS NOT NULL THEN limit_price ELSE reference_price END
+                   WHERE risk_price = '0'"""
+            )
+        for row in self.conn.execute(
+            "SELECT order_id, risk_price FROM orders"
+        ).fetchall():
+            try:
+                risk_price = as_decimal(row["risk_price"])
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                raise LedgerError(
+                    f"Order {row['order_id']} has an invalid risk reservation price"
+                ) from exc
+            if risk_price <= ZERO:
+                raise LedgerError(
+                    f"Order {row['order_id']} has a nonpositive risk reservation price"
+                )
         try:
             self.conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_batch_source
@@ -466,10 +613,42 @@ class Ledger:
             raise LedgerError(
                 "Ledger contains multiple previews for one target source/version"
             ) from exc
+        profile_row = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = 'execution_profile'"
+        ).fetchone()
+        profile = str(profile_row["value"]) if profile_row is not None else None
+        if profile is not None and profile not in EXECUTION_PROFILES:
+            raise LedgerError(f"Unsupported immutable execution profile: {profile}")
+        phase4_evidence = bool(self.conn.execute(
+            "SELECT 1 FROM target_snapshots LIMIT 1"
+        ).fetchone() or self.conn.execute(
+            "SELECT 1 FROM phase4_plan_links LIMIT 1"
+        ).fetchone())
+        unlinked_batch = self.conn.execute(
+            """SELECT 1 FROM execution_batches b
+               LEFT JOIN phase4_plan_links p ON p.batch_id=b.batch_id
+               WHERE p.batch_id IS NULL LIMIT 1"""
+        ).fetchone() is not None
+        if phase4_evidence and unlinked_batch:
+            raise LedgerError(
+                "Ledger contains mixed Phase-3 and Phase-4 execution artifacts"
+            )
+        inferred_profile = (
+            "phase4" if phase4_evidence else ("phase3" if unlinked_batch else None)
+        )
+        if profile is not None and inferred_profile is not None and profile != inferred_profile:
+            raise LedgerError(
+                "Immutable execution profile conflicts with existing execution artifacts"
+            )
+        if profile is None and inferred_profile is not None:
+            self.conn.execute(
+                "INSERT INTO metadata(key, value) VALUES('execution_profile', ?)",
+                (inferred_profile,),
+            )
         existing = self.conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if existing is not None and int(existing["value"]) not in {1, 2, 3, SCHEMA_VERSION}:
+        if existing is not None and int(existing["value"]) not in {1, 2, 3, 4, SCHEMA_VERSION}:
             raise LedgerError(
                 f"Unsupported ledger schema {existing['value']}; expected {SCHEMA_VERSION}"
             )
@@ -478,10 +657,11 @@ class Ledger:
                 "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
-        elif int(existing["value"]) in {1, 2, 3}:
+        elif int(existing["value"]) in {1, 2, 3, 4}:
             # v2 added expected-cash reconciliation, v3 added Phase-3 equity
             # guardrails and reviewed execution batches, and v4 adds the
-            # immutable publisher/scheduler/alert/stream/backup records.
+            # immutable publisher/scheduler/alert/stream/backup records. v5
+            # adds durable pre-trade risk reservation prices for active orders.
             # Migration never invents a baseline, approval, or publication.
             self.conn.execute(
                 "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
@@ -576,6 +756,124 @@ class Ledger:
                     {"armed": armed, "kill_switch": kill_switch, "reason": reason},
                 )
 
+    def arm_after_clean_reconciliation(
+        self,
+        account_id: str,
+        *,
+        reason: str,
+        max_reconciliation_age_seconds: int,
+    ) -> tuple[str, str] | None:
+        """Atomically validate the safety baseline and persist an armed state.
+
+        The eligibility reads and control write share one ``BEGIN IMMEDIATE``
+        transaction.  A reconciliation therefore cannot commit between the
+        clean-run check and the armed write, and a concurrent dirty run that
+        commits afterward will win by disarming the account.
+
+        ``None`` means the account was armed.  Otherwise the returned
+        ``(code, message)`` explains the fail-closed eligibility blocker.
+        Account-binding conflicts remain hard ledger errors.
+        """
+        account_id = account_id.strip()
+        reason = reason.strip()
+        if not account_id or not reason:
+            raise ValueError("Arming requires an account ID and operator reason")
+        if max_reconciliation_age_seconds <= 0:
+            raise ValueError("max_reconciliation_age_seconds must be positive")
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise LedgerConflict("Ledger clock must be timezone-aware before arming")
+        now = now.astimezone(timezone.utc)
+
+        with self.execution_guard():
+            with self._tx() as cur:
+                bound = cur.execute(
+                    "SELECT value FROM metadata WHERE key = 'bound_account_id'"
+                ).fetchone()
+                if bound is not None and bound["value"] != account_id:
+                    raise LedgerConflict(
+                        f"Ledger is bound to account {bound['value']}, not authenticated account {account_id}"
+                    )
+                baseline_key = f"positions_bootstrapped:{account_id}"
+                if cur.execute(
+                    "SELECT 1 FROM metadata WHERE key = ?", (baseline_key,)
+                ).fetchone() is None:
+                    return (
+                        "POSITION_BASELINE_MISSING",
+                        "Position ledger must be bootstrapped before arming",
+                    )
+
+                control = cur.execute(
+                    "SELECT * FROM control_state WHERE account_id = ?", (account_id,)
+                ).fetchone()
+                if control is not None and bool(control["kill_switch"]):
+                    return (
+                        "KILL_SWITCH",
+                        "Reset the kill switch explicitly before arming",
+                    )
+
+                latest = cur.execute(
+                    """SELECT rowid, * FROM reconciliation_runs
+                       WHERE account_id = ? ORDER BY rowid DESC LIMIT 1""",
+                    (account_id,),
+                ).fetchone()
+                if latest is None or not bool(latest["clean"]):
+                    return (
+                        "CLEAN_RECONCILIATION_REQUIRED",
+                        "A clean reconciliation is required before arming",
+                    )
+                completed = datetime.fromisoformat(latest["completed_at"])
+                if completed.tzinfo is None or completed.utcoffset() is None:
+                    completed = completed.replace(tzinfo=timezone.utc)
+                age = (now - completed.astimezone(timezone.utc)).total_seconds()
+                if age < 0 or age > max_reconciliation_age_seconds:
+                    return (
+                        "STALE_RECONCILIATION",
+                        "The latest clean reconciliation is stale",
+                    )
+
+                rec_audit = cur.execute(
+                    """SELECT sequence FROM audit_events
+                       WHERE event_type = 'reconciliation_completed' AND entity_id = ?
+                       ORDER BY sequence DESC LIMIT 1""",
+                    (latest["run_id"],),
+                ).fetchone()
+                control_audit = cur.execute(
+                    """SELECT sequence FROM audit_events
+                       WHERE event_type = 'control_state_changed' AND entity_id = ?
+                       ORDER BY sequence DESC LIMIT 1""",
+                    (account_id,),
+                ).fetchone()
+                if (
+                    rec_audit is None
+                    or (
+                        control_audit is not None
+                        and rec_audit["sequence"] <= control_audit["sequence"]
+                    )
+                ):
+                    return (
+                        "RECONCILIATION_PRECEDES_CONTROL_CHANGE",
+                        "A clean reconciliation newer than the last control change is required",
+                    )
+
+                timestamp = now.isoformat()
+                cur.execute(
+                    """INSERT INTO control_state(account_id, armed, kill_switch, reason, updated_at)
+                       VALUES (?, 1, 0, ?, ?)
+                       ON CONFLICT(account_id) DO UPDATE SET
+                         armed=1, kill_switch=0, reason=excluded.reason,
+                         updated_at=excluded.updated_at""",
+                    (account_id, reason, timestamp),
+                )
+                self._audit(
+                    cur,
+                    "control_state_changed",
+                    "account",
+                    account_id,
+                    {"armed": True, "kill_switch": False, "reason": reason},
+                )
+                return None
+
     def bound_account_id(self) -> str | None:
         row = self.conn.execute(
             "SELECT value FROM metadata WHERE key = 'bound_account_id'"
@@ -588,6 +886,62 @@ class Ledger:
         if len(inferred) > 1:
             raise LedgerConflict("Execution ledger contains more than one account baseline")
         return str(inferred[0]["account_id"]) if inferred else None
+
+    def execution_profile(self) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = 'execution_profile'"
+        ).fetchone()
+        if row is None:
+            return None
+        profile = str(row["value"])
+        if profile not in EXECUTION_PROFILES:
+            raise LedgerConflict(f"Unsupported immutable execution profile: {profile}")
+        return profile
+
+    def _bind_execution_profile_cur(self, cur: sqlite3.Cursor, profile: str) -> None:
+        if profile not in EXECUTION_PROFILES:
+            raise ValueError("execution profile must be phase3 or phase4")
+        existing = cur.execute(
+            "SELECT value FROM metadata WHERE key = 'execution_profile'"
+        ).fetchone()
+        if existing is not None:
+            if existing["value"] != profile:
+                raise LedgerConflict(
+                    f"Ledger is permanently bound to {existing['value']} execution"
+                )
+            return
+        if profile == "phase4":
+            incompatible = cur.execute(
+                """SELECT 1 FROM execution_batches b
+                   LEFT JOIN phase4_plan_links p ON p.batch_id=b.batch_id
+                   WHERE p.batch_id IS NULL LIMIT 1"""
+            ).fetchone()
+        else:
+            incompatible = cur.execute(
+                """SELECT 1 FROM target_snapshots LIMIT 1"""
+            ).fetchone() or cur.execute(
+                "SELECT 1 FROM phase4_plan_links LIMIT 1"
+            ).fetchone()
+        if incompatible is not None:
+            raise LedgerConflict(
+                f"Existing artifacts are incompatible with the {profile} execution profile"
+            )
+        cur.execute(
+            "INSERT INTO metadata(key, value) VALUES('execution_profile', ?)",
+            (profile,),
+        )
+        self._audit(
+            cur,
+            "execution_profile_bound",
+            "ledger",
+            profile,
+            {"execution_profile": profile},
+        )
+
+    def bind_execution_profile(self, profile: str) -> None:
+        """Irreversibly bind this ledger to one execution authorization model."""
+        with self._tx() as cur:
+            self._bind_execution_profile_cur(cur, profile)
 
     def assert_account_binding(self, account_id: str) -> None:
         bound = self.bound_account_id()
@@ -809,16 +1163,27 @@ class Ledger:
 
     # --- Orders and fills ----------------------------------------------------
 
-    def plan_order(self, request: OrderRequest) -> dict:
-        order, _created = self.plan_order_with_created(request)
+    def plan_order(
+        self, request: OrderRequest, *, risk_price: Decimal | None = None
+    ) -> dict:
+        order, _created = self.plan_order_with_created(request, risk_price=risk_price)
         return order
 
-    def plan_order_with_created(self, request: OrderRequest) -> tuple[dict, bool]:
+    def plan_order_with_created(
+        self, request: OrderRequest, *, risk_price: Decimal | None = None
+    ) -> tuple[dict, bool]:
         """Plan once and return whether this transaction inserted the order.
 
         The boolean is a submission capability: concurrent callers that find
         the already-planned order may synchronize it but must never POST it.
         """
+        reserved_price = as_decimal(
+            risk_price
+            if risk_price is not None
+            else (request.limit_price or request.reference_price)
+        )
+        if reserved_price <= ZERO:
+            raise ValueError("risk_price must be positive")
         order_id = f"ord-{request.client_order_id[-24:]}"
         now = self.clock().isoformat()
         with self._tx() as cur:
@@ -843,13 +1208,13 @@ class Ledger:
             cur.execute(
                 """INSERT INTO orders(
                        order_id, intent_id, account_id, client_order_id, symbol, side,
-                       quantity, reference_price, order_type, time_in_force, limit_price,
-                       status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       quantity, reference_price, risk_price, order_type, time_in_force,
+                       limit_price, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     order_id, request.intent_id, request.account_id, request.client_order_id,
                     request.symbol, request.side.value, str(request.quantity),
-                    str(request.reference_price), request.order_type.value,
+                    str(request.reference_price), str(reserved_price), request.order_type.value,
                     request.time_in_force.value,
                     str(request.limit_price) if request.limit_price is not None else None,
                     OrderStatus.PENDING_SUBMIT.value, now, now,
@@ -1267,6 +1632,9 @@ class Ledger:
         )
         now = self.clock().isoformat()
         with self._tx() as cur:
+            self._bind_execution_profile_cur(
+                cur, "phase4" if phase4_link is not None else "phase3"
+            )
             existing = cur.execute(
                 """SELECT * FROM execution_batches
                    WHERE batch_id = ? OR plan_hash = ?
@@ -1391,6 +1759,41 @@ class Ledger:
         return plan
 
     def approve_execution_batch(
+        self,
+        batch_id: str,
+        expected_plan_hash: str,
+        *,
+        approved_by: str,
+        reason: str,
+    ) -> dict:
+        if self.execution_profile() == "phase4":
+            raise LedgerConflict(
+                "Phase-4 ledgers require signed-snapshot approval through Phase4Supervisor"
+            )
+        return self._approve_execution_batch(
+            batch_id, expected_plan_hash, approved_by=approved_by, reason=reason
+        )
+
+    def approve_phase4_execution_batch(
+        self,
+        batch_id: str,
+        expected_plan_hash: str,
+        *,
+        approved_by: str,
+        reason: str,
+    ) -> dict:
+        if self.execution_profile() != "phase4":
+            raise LedgerConflict("Phase-4 approval requires a Phase-4 execution ledger")
+        link = self.conn.execute(
+            "SELECT 1 FROM phase4_plan_links WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if link is None:
+            raise LedgerConflict("Phase-4 approval requires an immutable snapshot link")
+        return self._approve_execution_batch(
+            batch_id, expected_plan_hash, approved_by=approved_by, reason=reason
+        )
+
+    def _approve_execution_batch(
         self,
         batch_id: str,
         expected_plan_hash: str,

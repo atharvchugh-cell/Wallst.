@@ -8,9 +8,15 @@ broker-specific objects do not leak into the OMS or risk engine.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .models import AccountSnapshot, BrokerOrder, Fill, OrderRequest, Position
+
+
+# Activity endpoints are submission critical but may be eventually consistent.
+# Every production caller uses a durable watermark with this overlap instead of
+# repeatedly scanning the account's lifetime fill history.
+BROKER_ACTIVITY_WATERMARK_OVERLAP = timedelta(minutes=5)
 
 
 class BrokerError(RuntimeError):

@@ -107,6 +107,12 @@ def test_adapter_rejects_every_nonpaper_endpoint_and_missing_credentials(monkeyp
         AlpacaPaperConfig.from_env()
 
 
+def test_paper_config_repr_never_exposes_credentials():
+    rendered = repr(AlpacaPaperConfig("paper-key", "paper-secret"))
+    assert "paper-key" not in rendered
+    assert "paper-secret" not in rendered
+
+
 def test_account_uses_paper_url_and_authenticated_headers_only():
     adapter = broker({
         ("GET", "/v2/account"): [Response(200, account_payload())],

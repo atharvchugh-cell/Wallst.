@@ -18,13 +18,14 @@ import pytest
 
 from src import config
 from src.live.alpaca_paper import AlpacaAsset, AlpacaPaperConfig
-from src.live.alerts import WebhookConfig
+from src.live.alerts import AlertManager, WebhookConfig
 from src.live.backups import BackupManager
+from src.live.broker import BrokerError
 from src.live.deployment import DeploymentConfig
 from src.live.execution import PaperExecutionService
 from src.live.fake_broker import FakeBroker
 from src.live.health import HealthReporter
-from src.live.ledger import Ledger, LedgerConflict
+from src.live.ledger import Ledger, LedgerConflict, LedgerError
 from src.live.market_data import NEW_YORK, MarketCalendarDay, MarketDataProvider
 from src.live.models import (
     BrokerOrder,
@@ -53,7 +54,12 @@ from src.live.publisher import HistoricalDataBundle, StrategyTargetPublisher
 from src.live.reconcile import Reconciler
 from src.live.scheduler import SupervisedMonthlyScheduler
 from src.live.soak import PaperSoakReporter
-from src.live.streaming import OrderStreamEvent, OrderStreamSupervisor, STREAM_NAME
+from src.live.streaming import (
+    AlpacaPaperTradeUpdateStream,
+    OrderStreamEvent,
+    OrderStreamSupervisor,
+    STREAM_NAME,
+)
 from src.live.supervisor import Phase4Supervisor
 
 
@@ -595,6 +601,99 @@ def test_scheduler_early_close_unexpected_closure_miss_and_duplicate(tmp_path):
         assert Phase4Store(ledger).list_schedule_runs()[0]["status"] == "failed"
 
 
+def test_publish_backup_failure_preserves_published_schedule_and_restart_safety(
+    monkeypatch, tmp_path
+):
+    deployment_value = deployment()
+    policy_value = policy(OperationMode.OBSERVE)
+    signer_value = signer(tmp_path / "key")
+    publisher = StrategyTargetPublisher(
+        deployment_value,
+        policy_value,
+        repo_root=Path.cwd(),
+        signer=signer_value,
+        clock=lambda: PUBLISH_TIME,
+    )
+    broker = Phase4FakeBroker("PAPER", "100000", clock=lambda: PUBLISH_TIME)
+    broker.drain_request_ids = lambda: ()
+    db = tmp_path / "publish-backup-failure.sqlite3"
+    deployment_path = tmp_path / "deployment.json"
+    policy_path = tmp_path / "policy.json"
+    deployment_path.write_text(
+        json.dumps(json_safe(deployment_value.to_payload())), encoding="utf-8"
+    )
+    policy_path.write_text(json.dumps(policy_value.to_payload()), encoding="utf-8")
+    with Ledger(db, clock=lambda: PUBLISH_TIME) as ledger:
+        Reconciler(ledger, broker, clock=lambda: PUBLISH_TIME).bootstrap_positions()
+
+    class PublishLedger(Ledger):
+        def __init__(self, path):
+            super().__init__(path, clock=lambda: PUBLISH_TIME)
+
+    class StaticHistory:
+        def __init__(self, **_kwargs):
+            pass
+
+        def load(self, symbols, decision_session):
+            assert symbols == publisher.required_data_symbols()
+            assert decision_session == DECISION
+            return market_bundle()
+
+    backup_rows = []
+
+    def backup_then_fail(ledger, _policy, args, _alerts):
+        schedule = ledger.conn.execute("SELECT * FROM scheduler_runs").fetchone()
+        assert schedule["status"] == "published"
+        assert schedule["snapshot_id"]
+        backup = BackupManager(ledger, tmp_path / "backups").create(
+            (args.deployment, args.policy)
+        )
+        backup_rows.append(backup)
+        raise Phase4Error("injected automatic backup failure")
+
+    monkeypatch.setattr(phase4_cli, "Ledger", PublishLedger)
+    monkeypatch.setattr(
+        phase4_cli, "_load", lambda _args: (deployment_value, policy_value, signer_value)
+    )
+    monkeypatch.setattr(
+        phase4_cli, "_paper_stack", lambda: (broker, FakeQuotes(broker))
+    )
+    monkeypatch.setattr(phase4_cli, "_publisher", lambda *_args, **_kwargs: publisher)
+    monkeypatch.setattr(phase4_cli, "ResearchHistoricalDataSource", StaticHistory)
+    monkeypatch.setattr(phase4_cli, "_automatic_backup", backup_then_fail)
+    args = phase4_cli.argparse.Namespace(
+        db=str(db),
+        deployment=str(deployment_path),
+        policy=str(policy_path),
+        cache_dir=str(tmp_path / "cache"),
+        snapshot_dir=str(tmp_path / "snapshots"),
+        mode=OperationMode.OBSERVE.value,
+        confirm_manual_catch_up=False,
+    )
+
+    with pytest.raises(Phase4Error, match="injected automatic backup failure"):
+        phase4_cli._publish(args)
+
+    with Ledger(db, clock=lambda: PUBLISH_TIME) as ledger:
+        schedule = ledger.conn.execute("SELECT * FROM scheduler_runs").fetchone()
+        assert schedule["status"] == "published"
+        assert schedule["snapshot_id"]
+        assert ledger.conn.execute("SELECT COUNT(*) FROM target_snapshots").fetchone()[0] == 1
+    assert len(backup_rows) == 1
+    backup_db = Path(backup_rows[0]["backup_path"]) / "execution-ledger.sqlite3"
+    connection = sqlite3.connect(f"file:{backup_db}?mode=ro&immutable=1", uri=True)
+    try:
+        assert connection.execute("SELECT status FROM scheduler_runs").fetchone()[0] == "published"
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase4Error, match="already published"):
+        phase4_cli._publish(args)
+    with Ledger(db, clock=lambda: PUBLISH_TIME) as ledger:
+        assert ledger.conn.execute("SELECT COUNT(*) FROM target_snapshots").fetchone()[0] == 1
+        assert ledger.conn.execute("SELECT status FROM scheduler_runs").fetchone()[0] == "published"
+
+
 def test_observe_and_shadow_can_never_submit(tmp_path):
     for mode in (OperationMode.OBSERVE, OperationMode.SHADOW):
         values = execution_stack(tmp_path / mode.value, mode)
@@ -616,6 +715,39 @@ def test_observe_and_shadow_can_never_submit(tmp_path):
                         ledger, broker, FakeQuotes(broker), clock=clock
                     ).execute(plan.batch_id, operator="op", reason="bypass attempt")
                 assert broker.submission_count == 0
+
+
+def test_phase4_ledger_profile_blocks_legacy_preview_and_approval(tmp_path):
+    values = execution_stack(tmp_path, OperationMode.PAPER_MANUAL)
+    deployment_value, policy_value, signer_value, publisher, snapshot, clock, broker, db = values
+    with Ledger(db, clock=clock) as ledger:
+        assert ledger.execution_profile() == "phase4"
+        with pytest.raises(ExecutionBlocked, match="Legacy Phase-3 preview"):
+            PaperExecutionService(
+                ledger, broker, FakeQuotes(broker), clock=clock
+            ).preview(
+                deployment_value,
+                publisher.to_execution_targets(snapshot),
+                confirm_new_equity_session=True,
+            )
+        supervisor = Phase4Supervisor(
+            ledger, deployment_value, policy_value, publisher, broker, FakeQuotes(broker),
+            signer=signer_value, clock=clock,
+        )
+        plan, _created = supervisor.prepare_plan(
+            snapshot.snapshot_id, confirm_new_equity_session=True
+        )
+        with pytest.raises(LedgerConflict, match="Phase4Supervisor"):
+            ledger.approve_execution_batch(
+                plan.batch_id, plan.plan_hash, approved_by="legacy", reason="bypass"
+            )
+        supervisor.approve(plan.batch_id, plan.plan_hash, operator="op", reason="reviewed")
+        with pytest.raises(sqlite3.IntegrityError, match="execution profile is immutable"):
+            ledger.conn.execute(
+                "UPDATE metadata SET value='phase3' WHERE key='execution_profile'"
+            )
+        ledger.conn.rollback()
+        assert ledger.execution_profile() == "phase4"
 
 
 def test_manual_paper_requires_approval_stream_recovery_and_all_submissions_use_oms(tmp_path):
@@ -660,6 +792,73 @@ def test_manual_paper_requires_approval_stream_recovery_and_all_submissions_use_
         assert result.status == "complete"
         assert broker.submission_count > 0
         assert all(row["client_order_id"].startswith("wslab-") for row in ledger.list_orders())
+
+
+def test_phase4_policy_is_rechecked_with_current_equity_before_execution(tmp_path, monkeypatch):
+    values = execution_stack(tmp_path, OperationMode.PAPER_MANUAL)
+    deployment_value, policy_value, signer_value, publisher, snapshot, clock, broker, db = values
+    with Ledger(db, clock=clock) as ledger:
+        supervisor = Phase4Supervisor(
+            ledger, deployment_value, policy_value, publisher, broker, FakeQuotes(broker),
+            signer=signer_value, clock=clock,
+        )
+        plan, _created = supervisor.prepare_plan(
+            snapshot.snapshot_id, confirm_new_equity_session=True
+        )
+        quotes = FakeQuotes(broker).get_quotes(deployment_value.managed_symbols)
+        with pytest.raises(Phase4Error, match="max_cash_deployment_pct"):
+            supervisor._validate_phase4_plan(
+                plan, Decimal("50000"),
+                snapshot.content["expected_execution_session"], quotes,
+            )
+
+        supervisor.approve(
+            plan.batch_id, plan.plan_hash, operator="op", reason="reviewed"
+        )
+        Phase4Store(ledger).set_stream_state(
+            STREAM_NAME, connected=True, recovering=False, recovery_completed=True
+        )
+
+        def runtime_policy_failure(*_args, **_kwargs):
+            raise Phase4Error("execution-time Phase-4 policy rejection")
+
+        monkeypatch.setattr(supervisor, "_validate_phase4_plan", runtime_policy_failure)
+        with pytest.raises(Phase4Error, match="execution-time Phase-4 policy"):
+            supervisor.run_paper(plan.batch_id, operator="op", reason="runtime recheck")
+        assert broker.submission_count == 0
+
+
+def test_final_submit_fence_blocks_disconnect_after_outer_authorization(tmp_path, monkeypatch):
+    values = execution_stack(tmp_path, OperationMode.PAPER_MANUAL)
+    deployment_value, policy_value, signer_value, publisher, snapshot, clock, broker, db = values
+    with Ledger(db, clock=clock) as ledger:
+        supervisor = Phase4Supervisor(
+            ledger, deployment_value, policy_value, publisher, broker, FakeQuotes(broker),
+            signer=signer_value, clock=clock,
+        )
+        plan, _created = supervisor.prepare_plan(
+            snapshot.snapshot_id, confirm_new_equity_session=True
+        )
+        supervisor.approve(plan.batch_id, plan.plan_hash, operator="op", reason="reviewed")
+        stream = OrderStreamSupervisor(ledger, broker, clock=clock)
+        stream.connected()
+        assert stream.recover("initial recovery").clean
+        original = supervisor._authorize_submit_fence
+        injected = False
+
+        def disconnect_at_final_fence(batch_id):
+            nonlocal injected
+            if not injected:
+                injected = True
+                stream.disconnected("disconnect raced with final submit authorization")
+            original(batch_id)
+
+        monkeypatch.setattr(supervisor, "_authorize_submit_fence", disconnect_at_final_fence)
+        with pytest.raises(Phase4Error, match="control|stream|alert"):
+            supervisor.run_paper(plan.batch_id, operator="op", reason="race regression")
+        assert injected
+        assert broker.submission_count == 0
+        assert ledger.get_control_state("PAPER")["armed"] is False
 
 
 def test_full_mocked_lifecycle_survives_partial_fill_disconnect_restart_and_backup(tmp_path):
@@ -856,6 +1055,47 @@ def _seed_stream_order(ledger, broker, clock):
     return row, broker_order
 
 
+def _alpaca_trade_update_payload(*, stream="trade_updates", event="new"):
+    return {
+        "stream": stream,
+        "data": {
+            "event": event,
+            "event_id": "wire-event-1",
+            "timestamp": "2026-07-01T14:00:00Z",
+            "order": {
+                "asset_class": "us_equity",
+                "id": "wire-order-1",
+                "client_order_id": "wslab-wire-order-1",
+                "symbol": "AAPL",
+                "side": "buy",
+                "qty": "1",
+                "filled_qty": "0",
+                "status": "new",
+                "submitted_at": "2026-07-01T14:00:00Z",
+                "updated_at": "2026-07-01T14:00:00Z",
+                "type": "market",
+                "time_in_force": "day",
+            },
+        },
+    }
+
+
+def test_trade_update_parser_requires_exact_channel_and_supported_event_type():
+    transport = AlpacaPaperTradeUpdateStream(
+        AlpacaPaperConfig("paper-key", "paper-secret"), "PAPER"
+    )
+    parsed = transport._parse(json.dumps(_alpaca_trade_update_payload()))
+    assert parsed.event_type == "new"
+    assert parsed.broker_order.account_id == "PAPER"
+
+    with pytest.raises(Phase4Error, match="Malformed"):
+        transport._parse(json.dumps(_alpaca_trade_update_payload(stream="account_updates")))
+    # Trade corrections and busts need reversal accounting; accepting them as
+    # ordinary append-only fills would corrupt expected cash and positions.
+    with pytest.raises(Phase4Error, match="Malformed"):
+        transport._parse(json.dumps(_alpaca_trade_update_payload(event="trade_bust")))
+
+
 def test_stream_multiple_partials_duplicate_out_of_order_fill_after_cancel_request(tmp_path):
     clock = FixedClock(EXECUTION_TIME)
     broker = Phase4FakeBroker("PAPER", "100000", auto_fill=False, clock=clock)
@@ -899,6 +1139,57 @@ def test_stream_disconnect_rest_recovery_and_external_order_block(tmp_path):
         assert state["connected"] == 1 and state["recovering"] == 0
         stream.disconnected("network outage")
         assert Phase4Store(ledger).stream_state()["disconnect_count"] == 1
+
+
+def test_stream_recovery_uses_bounded_recent_window_with_over_500_historical_orders(
+    tmp_path,
+):
+    class PageLimitedHistoryBroker(Phase4FakeBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.recent_queries = []
+
+        def get_recent_orders(self, since=None):
+            self.recent_queries.append(since)
+            orders = list(self._orders_by_client.values())
+            if since is not None:
+                orders = [order for order in orders if order.submitted_at > since]
+            if len(orders) >= 500:
+                raise BrokerError("simulated Alpaca all-status order page limit")
+            return sorted(
+                orders, key=lambda order: (order.submitted_at, order.broker_order_id)
+            )
+
+    clock = FixedClock(EXECUTION_TIME)
+    broker = PageLimitedHistoryBroker(
+        "PAPER", "100000", auto_fill=False, clock=clock
+    )
+    with Ledger(tmp_path / "bounded-recovery.sqlite3", clock=clock) as ledger:
+        reconciler = Reconciler(ledger, broker, clock=clock)
+        reconciler.bootstrap_positions()
+        assert reconciler.reconcile().clean
+
+        old = EXECUTION_TIME - timedelta(days=30)
+        for index in range(501):
+            order = BrokerOrder(
+                broker_order_id=f"historical-order-{index}",
+                client_order_id=f"historical-client-{index}",
+                account_id="PAPER",
+                symbol="AAPL",
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0"),
+                status=OrderStatus.CANCELED,
+                submitted_at=old + timedelta(seconds=index),
+                updated_at=old + timedelta(seconds=index),
+            )
+            broker._store_order(order)
+
+        stream = OrderStreamSupervisor(ledger, broker, clock=clock)
+        stream.connected()
+        assert stream.recover("bounded historical-order recovery").clean
+        assert broker.recent_queries
+        assert all(value is not None for value in broker.recent_queries)
 
 
 def test_stream_is_not_marked_ready_until_transport_callback_and_renews_lease(tmp_path):
@@ -949,6 +1240,60 @@ def test_alert_dedupe_ack_escalation_and_health(tmp_path):
         assert report["database_integrity"]
 
 
+def test_alert_severity_upgrade_is_delivered_immediately(tmp_path):
+    delivered = []
+
+    class Sink:
+        def send(self, alert):
+            delivered.append((alert["alert_id"], alert["severity"]))
+
+    with Ledger(tmp_path / "alert-upgrade.sqlite3", clock=lambda: EXECUTION_TIME) as ledger:
+        manager = AlertManager(Phase4Store(ledger), (Sink(),))
+        manager.emit("warning", "stream", "degraded", dedupe_key="same-incident")
+        manager.emit("critical", "stream", "failed", dedupe_key="same-incident")
+        manager.emit("critical", "stream", "still failed", dedupe_key="same-incident")
+        assert [severity for _alert_id, severity in delivered] == ["warning", "critical"]
+
+
+def test_health_never_claims_offline_or_non_submitting_submission_readiness(tmp_path):
+    clock = FixedClock(EXECUTION_TIME)
+    with Ledger(tmp_path / "health-readiness.sqlite3", clock=clock) as ledger:
+        store = Phase4Store(ledger)
+        observe = HealthReporter(
+            ledger,
+            policy(OperationMode.OBSERVE),
+            alerts=AlertManager(store),
+            clock=clock,
+        ).report("PAPER")
+        assert not observe["submission_ready"]
+        assert "operating_mode_non_submitting" in observe["submission_blockers"]
+        categories = {row["category"] for row in store.list_alerts(unresolved_only=True)}
+        assert "broker_disconnection" not in categories
+        assert "reconciliation_mismatch" not in categories
+
+        offline_paper = HealthReporter(
+            ledger, policy(OperationMode.PAPER_MANUAL), clock=clock
+        ).report("PAPER")
+        assert not offline_paper["submission_ready"]
+        assert "broker_connectivity_unchecked" in offline_paper["submission_blockers"]
+
+
+def test_health_rejects_connected_but_trading_blocked_account(tmp_path):
+    class BlockedBroker(FakeBroker):
+        def get_account(self):
+            return replace(super().get_account(), trading_blocked=True)
+
+    clock = FixedClock(EXECUTION_TIME)
+    broker = BlockedBroker("PAPER", "100000", clock=clock)
+    with Ledger(tmp_path / "health-blocked.sqlite3", clock=clock) as ledger:
+        report = HealthReporter(
+            ledger, policy(OperationMode.PAPER_MANUAL), broker=broker, clock=clock
+        ).report("PAPER")
+        assert report["broker_connectivity"] is False
+        assert report["broker_error_type"] == "AccountNotReady"
+        assert "broker_connectivity" in report["submission_blockers"]
+
+
 def test_sqlite_backup_restore_hash_retention_and_failure(tmp_path):
     clock = FixedClock(EXECUTION_TIME)
     ledger_path = tmp_path / "ledger.sqlite3"
@@ -963,6 +1308,11 @@ def test_sqlite_backup_restore_hash_retention_and_failure(tmp_path):
         assert len(list((tmp_path / "backups").glob("backup-*"))) == 1
         backup_dir = Path(second["backup_path"])
         manager.verify(backup_dir)
+        with pytest.raises(LedgerError, match="destination ledger is open"):
+            manager.restore(
+                backup_dir, ledger_path,
+                active_ledger_path=ledger_path, confirm_replace=True,
+            )
         restored = manager.restore(backup_dir, tmp_path / "restored.sqlite3")
         with Ledger(restored) as reopened:
             assert reopened.conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
@@ -1101,6 +1451,22 @@ def test_phase4_examples_and_cli_have_no_live_endpoint_or_implicit_confirmation(
         ])
 
 
+def test_recovery_configuration_can_load_without_a_signing_key(monkeypatch):
+    args = phase4_cli.argparse.Namespace(
+        deployment="examples/live/phase4_deployment.example.json",
+        policy="examples/live/phase4_policy.example.json",
+    )
+    monkeypatch.delenv("WSLAB_PHASE4_SIGNING_KEY_FILE", raising=False)
+    with pytest.raises(Phase4Error, match="SIGNING_KEY_FILE"):
+        phase4_cli._load(args)
+    deployment_value, policy_value, signer_value = phase4_cli._load(
+        args, require_signer=False, load_signer=False
+    )
+    assert deployment_value.account_id == "REPLACE_WITH_DEDICATED_PAPER_ACCOUNT_ID"
+    assert policy_value.require_signing is True
+    assert signer_value is None
+
+
 def test_publisher_rejects_short_nonfinite_and_exactly_repeated_history(tmp_path):
     _deployment, _policy, _signer, publisher, _snapshot = published(tmp_path)
     account = Phase4FakeBroker("PAPER", "100000", clock=lambda: PUBLISH_TIME).get_account()
@@ -1139,6 +1505,28 @@ def test_publisher_rejects_short_nonfinite_and_exactly_repeated_history(tmp_path
             decision_day=decision, execution_day=execution, account=account, positions=[],
             assets=assets(), market_data=repeated,
         )
+
+
+@pytest.mark.parametrize("extra_session_kind", ["weekend", "intraday"])
+def test_publisher_rejects_noncanonical_symbol_sessions(tmp_path, extra_session_kind):
+    bundle = market_bundle()
+    symbol = config.MEAN_REVERSION_UNIVERSE[0]
+    frame = bundle.frames[symbol]
+    source_session = bundle.calendar[-20]
+    if extra_session_kind == "weekend":
+        extra_session = next(
+            value
+            for value in pd.date_range(bundle.calendar[-30], bundle.calendar[-1], freq="D")
+            if value.weekday() >= 5
+        )
+    else:
+        extra_session = source_session + pd.Timedelta(hours=12)
+    injected = frame.loc[[source_session]].copy()
+    injected.index = pd.DatetimeIndex([extra_session])
+    bundle.frames[symbol] = pd.concat([frame, injected]).sort_index()
+
+    with pytest.raises(Phase4Error, match="session index"):
+        published(tmp_path, bundle=bundle)
 
 
 def test_dirty_labelled_snapshot_freezes_exact_dirty_file_content(monkeypatch, tmp_path):
@@ -1189,6 +1577,38 @@ def test_pending_stream_event_forces_recovery_before_replay(tmp_path):
         assert stream.recover("recover incomplete durable event").clean
         assert store.stream_event(event.event_id)["disposition"] == "recovered"
         assert stream.process(event) == "duplicate"
+
+
+def test_stream_event_persistence_atomically_revokes_submit_readiness_before_apply(
+    tmp_path, monkeypatch
+):
+    clock = FixedClock(EXECUTION_TIME)
+    broker = Phase4FakeBroker("PAPER", "100000", auto_fill=False, clock=clock)
+    with Ledger(tmp_path / "stream-ingest-fence.sqlite3", clock=clock) as ledger:
+        _row, order = _seed_stream_order(ledger, broker, clock)
+        stream = OrderStreamSupervisor(ledger, broker, clock=clock)
+        stream.connected()
+        assert stream.recover("establish healthy stream state").clean
+        store = Phase4Store(ledger)
+        assert store.stream_state(STREAM_NAME)["recovering"] == 0
+
+        event = OrderStreamEvent("crash-after-durable-ingest", "new", order, (), 1)
+
+        def crash_before_order_application(*_args, **_kwargs):
+            # The event insert must revoke submission authority before any
+            # fallible application step begins. SystemExit models abrupt
+            # process death, bypassing ordinary exception recovery.
+            state = store.stream_state(STREAM_NAME)
+            assert state["connected"] == 1
+            assert state["recovering"] == 1
+            raise SystemExit("simulated crash after durable stream ingest")
+
+        monkeypatch.setattr(ledger, "acknowledge_order", crash_before_order_application)
+        with pytest.raises(SystemExit, match="simulated crash"):
+            stream.process(event)
+
+        assert store.stream_event(event.event_id)["disposition"] == "pending"
+        assert store.stream_state(STREAM_NAME)["recovering"] == 1
 
 
 def test_ledger_paths_are_canonical_and_symlinks_fail_closed(monkeypatch, tmp_path):

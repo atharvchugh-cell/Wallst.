@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -45,6 +46,10 @@ class Phase4Store:
         if missing:
             raise LedgerConflict(f"Snapshot content is missing required metadata: {sorted(missing)}")
         snapshot_json = canonical_bytes(parsed.to_payload()).decode("utf-8")
+        # Publication is the irreversible boundary between the legacy Phase-3
+        # approval model and signed Phase-4 authority. A ledger can never mix
+        # both profiles, even if a caller later uses the older CLI.
+        self.ledger.bind_execution_profile("phase4")
         now = self.ledger.clock().isoformat()
         with self.ledger._tx() as cur:
             row = cur.execute(
@@ -227,23 +232,31 @@ class Phase4Store:
     ) -> dict:
         if status not in SCHEDULER_STATUSES:
             raise ValueError("Invalid scheduler status")
+        normalized_detail = detail.strip()[:1000]
         now = self.ledger.clock().isoformat()
         with self.ledger._tx() as cur:
             row = cur.execute("SELECT * FROM scheduler_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise LedgerError(f"Unknown scheduler run: {run_id}")
-            if row["status"] == "published" and (
-                status != "published" or (snapshot_id and snapshot_id != row["snapshot_id"])
-            ):
-                raise LedgerConflict("A published scheduler run cannot be rewritten")
+            if row["status"] in {"published", "skipped"}:
+                effective_snapshot = snapshot_id if snapshot_id is not None else row["snapshot_id"]
+                if (
+                    status == row["status"]
+                    and normalized_detail == row["detail"]
+                    and effective_snapshot == row["snapshot_id"]
+                ):
+                    return dict(row)
+                raise LedgerConflict(
+                    f"A {row['status']} scheduler run cannot be rewritten"
+                )
             cur.execute(
                 """UPDATE scheduler_runs SET status=?, detail=?, snapshot_id=COALESCE(?,snapshot_id),
                      updated_at=? WHERE run_id=?""",
-                (status, detail.strip()[:1000], snapshot_id, now, run_id),
+                (status, normalized_detail, snapshot_id, now, run_id),
             )
             self.ledger._audit(
                 cur, "scheduler_run_updated", "scheduler_run", run_id,
-                {"status": status, "detail": detail.strip()[:1000], "snapshot_id": snapshot_id},
+                {"status": status, "detail": normalized_detail, "snapshot_id": snapshot_id},
             )
             return dict(cur.execute(
                 "SELECT * FROM scheduler_runs WHERE run_id=?", (run_id,)
@@ -263,6 +276,22 @@ class Phase4Store:
         entity_id: str = "",
         dedupe_key: str | None = None,
     ) -> tuple[dict, bool]:
+        alert, created, _upgraded = self.emit_alert_with_transition(
+            severity, category, message,
+            entity_id=entity_id, dedupe_key=dedupe_key,
+        )
+        return alert, created
+
+    def emit_alert_with_transition(
+        self,
+        severity: str,
+        category: str,
+        message: str,
+        *,
+        entity_id: str = "",
+        dedupe_key: str | None = None,
+    ) -> tuple[dict, bool, bool]:
+        """Emit and atomically report whether an existing incident upgraded."""
         severity = severity.strip().lower()
         if severity not in ALERT_SEVERITIES:
             raise ValueError("Invalid alert severity")
@@ -275,11 +304,15 @@ class Phase4Store:
             f"{category}\0{entity_id}\0{message}".encode("utf-8")
         ).hexdigest()
         now = self.ledger.clock().isoformat()
-        with self.ledger._tx() as cur:
+        # A critical alert revokes Phase-4 submit authority. Serialize that
+        # durable state transition against the final broker-submission fence.
+        guard = self.ledger.execution_guard() if severity == "critical" else nullcontext()
+        with guard, self.ledger._tx() as cur:
             row = cur.execute(
                 "SELECT * FROM alerts WHERE dedupe_key=? AND resolved_at IS NULL", (key,)
             ).fetchone()
             if row is not None:
+                previous_severity = row["severity"]
                 cur.execute(
                     """UPDATE alerts SET last_seen_at=?, occurrence_count=occurrence_count+1,
                          severity=CASE
@@ -290,9 +323,11 @@ class Phase4Store:
                        WHERE alert_id=?""",
                     (now, severity, severity, severity, row["alert_id"]),
                 )
-                return dict(cur.execute(
+                alert = dict(cur.execute(
                     "SELECT * FROM alerts WHERE alert_id=?", (row["alert_id"],)
-                ).fetchone()), False
+                ).fetchone())
+                ranks = {"info": 0, "warning": 1, "high": 2, "critical": 3}
+                return alert, False, ranks[alert["severity"]] > ranks[previous_severity]
             alert_id = f"alert-{uuid.uuid4().hex[:24]}"
             cur.execute(
                 """INSERT INTO alerts(
@@ -307,7 +342,7 @@ class Phase4Store:
             )
             return dict(cur.execute(
                 "SELECT * FROM alerts WHERE alert_id=?", (alert_id,)
-            ).fetchone()), True
+            ).fetchone()), True, False
 
     def acknowledge_alert(self, alert_id: str, *, operator: str, note: str) -> dict:
         operator, note = operator.strip()[:100], note.strip()[:500]
@@ -401,34 +436,68 @@ class Phase4Store:
         broker_updated_at: str,
         payload: dict[str, Any],
         disposition: str,
+        recovery_stream_name: str | None = None,
     ) -> bool:
         encoded = canonical_bytes(payload).decode("utf-8")
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         now = self.ledger.clock().isoformat()
-        with self.ledger._tx() as cur:
+        payload_conflict = False
+        created = False
+        guard = (
+            self.ledger.execution_guard()
+            if recovery_stream_name is not None else nullcontext()
+        )
+        with guard, self.ledger._tx() as cur:
             existing = cur.execute(
                 "SELECT * FROM stream_events WHERE event_id=?", (event_id,)
             ).fetchone()
             if existing is not None:
                 if existing["payload_hash"] != digest:
-                    raise LedgerConflict("Stream event ID was replayed with different content")
-                return False
-            cur.execute(
-                """INSERT INTO stream_events(
-                       event_id, stream_sequence, client_order_id, event_type,
-                       broker_updated_at, payload_hash, payload_json, received_at, disposition
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event_id, sequence, client_order_id, event_type, broker_updated_at,
-                    digest, encoded, now, disposition,
-                ),
-            )
-            self.ledger._audit(
-                cur, "stream_event_recorded", "broker_order", client_order_id,
-                {"event_id": event_id, "sequence": sequence, "event_type": event_type,
-                 "disposition": disposition},
-            )
-            return True
+                    payload_conflict = True
+                needs_recovery = (
+                    payload_conflict
+                    or existing["disposition"] not in {"applied", "recovered"}
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO stream_events(
+                           event_id, stream_sequence, client_order_id, event_type,
+                           broker_updated_at, payload_hash, payload_json, received_at, disposition
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_id, sequence, client_order_id, event_type, broker_updated_at,
+                        digest, encoded, now, disposition,
+                    ),
+                )
+                self.ledger._audit(
+                    cur, "stream_event_recorded", "broker_order", client_order_id,
+                    {"event_id": event_id, "sequence": sequence, "event_type": event_type,
+                     "disposition": disposition},
+                )
+                created = True
+                needs_recovery = True
+
+            if recovery_stream_name is not None and needs_recovery:
+                # Event ingestion and submit-authority revocation are one
+                # transaction under the same cross-process execution fence as
+                # the final OMS authorizer. A crash can therefore leave either
+                # the old healthy state with no event or a durable recovering
+                # state with the event, never a healthy pending-event gap.
+                cur.execute(
+                    """INSERT INTO stream_state(
+                           stream_name, connected, recovering, last_sequence,
+                           last_event_at, last_recovery_at, disconnect_count,
+                           recovery_count, updated_at
+                       ) VALUES (?, 0, 1, NULL, NULL, NULL, 0, 0, ?)
+                       ON CONFLICT(stream_name) DO UPDATE SET
+                         recovering=1,
+                         updated_at=excluded.updated_at""",
+                    (recovery_stream_name, now),
+                )
+
+        if payload_conflict:
+            raise LedgerConflict("Stream event ID was replayed with different content")
+        return created
 
     def stream_event(self, event_id: str) -> dict | None:
         row = self.ledger.conn.execute(
@@ -478,7 +547,9 @@ class Phase4Store:
         disconnected: bool = False,
     ) -> dict:
         now = self.ledger.clock().isoformat()
-        with self.ledger._tx() as cur:
+        # Stream health is a submit-authority input. Its transition and the
+        # final OMS authorization check must have one linearizable order.
+        with self.ledger.execution_guard(), self.ledger._tx() as cur:
             cur.execute(
                 """INSERT INTO stream_state(
                        stream_name, connected, recovering, last_sequence, last_event_at,
@@ -500,6 +571,22 @@ class Phase4Store:
                     int(disconnected), int(recovery_completed),
                 ),
             )
+            if disconnected:
+                self.ledger._audit(
+                    cur,
+                    "stream_disconnected",
+                    "stream",
+                    stream_name,
+                    {"connected": connected, "recovering": recovering},
+                )
+            if recovery_completed:
+                self.ledger._audit(
+                    cur,
+                    "stream_recovery_completed",
+                    "stream",
+                    stream_name,
+                    {"connected": connected, "recovering": recovering},
+                )
             return dict(cur.execute(
                 "SELECT * FROM stream_state WHERE stream_name=?", (stream_name,)
             ).fetchone())

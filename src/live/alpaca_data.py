@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -23,8 +23,8 @@ DATA_FEED = "iex"
 
 @dataclass(frozen=True)
 class AlpacaDataConfig:
-    api_key: str
-    api_secret: str
+    api_key: str = field(repr=False)
+    api_secret: str = field(repr=False)
     base_url: str = DATA_BASE_URL
     feed: str = DATA_FEED
     timeout_seconds: float = 10.0

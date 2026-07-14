@@ -54,6 +54,12 @@ def test_data_adapter_is_hard_pinned_to_data_host_and_iex():
         AlpacaDataConfig("key", "secret", feed="sip")
 
 
+def test_data_config_repr_never_exposes_credentials():
+    rendered = repr(AlpacaDataConfig("paper-key", "paper-secret"))
+    assert "paper-key" not in rendered
+    assert "paper-secret" not in rendered
+
+
 def test_snapshot_maps_quote_and_uses_oldest_required_timestamp():
     session = Session(Response(200, snapshot(), {"X-Request-ID": "data-request-1"}))
     adapter = AlpacaPaperMarketData(

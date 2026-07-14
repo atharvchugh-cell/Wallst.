@@ -2,6 +2,10 @@
 
 State-changing trading-workflow commands (including `soak-observe`) automatically create a versioned
 backup in the configured directory (relative paths resolve beside the ledger).
+They attempt the backup on failure as well as success so a partial submission or
+failed reconciliation still leaves recoverable evidence. If that failure-path
+backup also fails, the original workflow error remains the command's primary
+error and the backup failure is attached for diagnosis.
 Stream events are durable in the WAL ledger and covered by scheduled/manual
 backups. To make an extra backup, use `phase4_cli backup` with explicit
 confirmation.
@@ -38,6 +42,13 @@ Restore copies from a no-follow source descriptor, verifies the copied
 temporary ledger's expected hash and SQLite structure, atomically replaces the
 destination, and fsyncs the file and parent directory. It never needs to open
 the unavailable or corrupt active database.
+
+Every file-backed `Ledger` holds a process-lifetime shared lock at
+`<ledger>.active.lock`. Restore must obtain the matching nonblocking exclusive
+lock and refuses replacement if any cooperating process still has that
+destination open. This is a code-enforced split-brain fence, not a substitute
+for step 1: stop all processes and confirm the refusal drill before a real
+replacement.
 
 Drill process crash, computer restart, network outage, stale stream, lost
 acknowledgement, database unavailability, materialized-state corruption, and

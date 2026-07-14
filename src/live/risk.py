@@ -80,12 +80,27 @@ class PreTradeRiskEngine:
         market_open: bool,
         signal_at: datetime,
         now: datetime | None = None,
+        reserved_buy_values: dict[str, Decimal] | None = None,
+        reserved_turnover: Decimal = ZERO,
     ) -> RiskDecision:
         now = ensure_aware(now or self.clock(), "risk.now")
         signal_at = ensure_aware(signal_at, "signal_at")
         daily_turnover = as_decimal(daily_turnover)
+        reserved_turnover = as_decimal(reserved_turnover)
         day_start_equity = as_decimal(day_start_equity)
         high_water_equity = as_decimal(high_water_equity)
+        normalized_reserved_buys: dict[str, Decimal] = {}
+        for raw_symbol, raw_value in (reserved_buy_values or {}).items():
+            symbol = str(raw_symbol).strip().upper()
+            value = as_decimal(raw_value)
+            if not symbol or value < ZERO:
+                raise ValueError("reserved buy values require symbols and nonnegative notionals")
+            normalized_reserved_buys[symbol] = (
+                normalized_reserved_buys.get(symbol, ZERO) + value
+            )
+        if reserved_turnover < ZERO:
+            raise ValueError("reserved_turnover cannot be negative")
+        reserved_buy_notional = sum(normalized_reserved_buys.values(), ZERO)
         violations: list[RiskViolation] = []
 
         def reject(code: str, message: str) -> None:
@@ -159,15 +174,20 @@ class PreTradeRiskEngine:
             reject("SHORT_SALE", "Order would create a short position")
 
         if request.side == Side.BUY:
-            if order_notional > account.buying_power:
+            if reserved_buy_notional + order_notional > account.buying_power:
                 reject("BUYING_POWER", "Order exceeds broker-reported buying power")
-            if account.cash - order_notional < self.limits.min_cash_buffer:
+            if (
+                account.cash - reserved_buy_notional - order_notional
+                < self.limits.min_cash_buffer
+            ):
                 reject("CASH_BUFFER", "Order would breach the minimum cash buffer")
 
         projected_values: dict[str, Decimal] = {}
         for p in positions:
             px = quote.mid if p.symbol == request.symbol else p.market_price
             projected_values[p.symbol] = p.quantity * px
+        for symbol, value in normalized_reserved_buys.items():
+            projected_values[symbol] = projected_values.get(symbol, ZERO) + value
         if projected_qty == ZERO:
             projected_values.pop(request.symbol, None)
         else:
@@ -178,10 +198,16 @@ class PreTradeRiskEngine:
         else:
             if gross / account.equity > self.limits.max_gross_exposure_pct:
                 reject("GROSS_EXPOSURE", "Projected gross exposure exceeds its account limit")
-            symbol_value = abs(projected_values.get(request.symbol, ZERO))
-            if symbol_value / account.equity > self.limits.max_symbol_exposure_pct:
+            excessive_symbols = sorted(
+                symbol for symbol, value in projected_values.items()
+                if abs(value) / account.equity > self.limits.max_symbol_exposure_pct
+            )
+            if excessive_symbols:
                 reject("SYMBOL_EXPOSURE", "Projected symbol concentration exceeds its limit")
-            if (daily_turnover + order_notional) / account.equity > self.limits.max_daily_turnover_pct:
+            if (
+                (daily_turnover + reserved_turnover + order_notional) / account.equity
+                > self.limits.max_daily_turnover_pct
+            ):
                 reject("DAILY_TURNOVER", "Projected daily turnover exceeds its limit")
 
         if day_start_equity <= ZERO:

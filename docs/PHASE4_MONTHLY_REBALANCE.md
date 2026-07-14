@@ -7,7 +7,11 @@
    signature. A missing ticker is a stop, never a substitution.
 3. If late, investigate why the scheduled run was missed and use explicit
    catch-up confirmation only before the expected next session closes. After
-   that close the scheduler records failure and refuses publication.
+   that close the scheduler records failure and refuses publication. Use the
+   offline `skip-schedule` command with the exact run ID, operator, reason, and
+   `--confirm-skip-schedule`; never rewrite the ledger or publish the stale
+   target. The immutable skipped disposition lets the scheduler surface the
+   next missing month.
 4. Before the next regular session, reconcile, start the stream, and verify REST
    recovery and a clear kill switch.
 5. During the regular session run `prepare-plan`; inspect every current/target/

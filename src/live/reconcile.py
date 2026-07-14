@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from .broker import Broker
+from .broker import BROKER_ACTIVITY_WATERMARK_OVERLAP, Broker
 from .ledger import Ledger, LedgerConflict
 from .models import (
     ACTIVE_ORDER_STATUSES,
@@ -19,6 +20,9 @@ from .models import (
     json_safe,
     utc_now,
 )
+
+
+RECENT_ORDER_WATERMARK_OVERLAP = timedelta(seconds=60)
 
 
 @dataclass(frozen=True)
@@ -58,19 +62,25 @@ class Reconciler:
         self.ledger.bootstrap_positions(account, self.broker.get_positions())
 
     def reconcile(self, *, synchronize_known_orders: bool = True) -> ReconciliationReport:
-        started = self.clock()
-        try:
-            account = self.broker.get_account()
-        except Exception as exc:
-            self._record_failed_reconciliation(None, exc)
-            raise
-        try:
-            return self._reconcile_account(
-                started, account, synchronize_known_orders=synchronize_known_orders
-            )
-        except Exception as exc:
-            self._record_failed_reconciliation(account.account_id, exc)
-            raise
+        # The guard spans acquisition through durable completion. Without it,
+        # an older clean snapshot can pause, a newer dirty run can commit and
+        # disarm, and then the stale clean run can commit last and become the
+        # apparent arming baseline. The separate fence avoids holding the
+        # submission/control fence across broker network calls.
+        with self.ledger.reconciliation_guard():
+            started = self.clock()
+            try:
+                account = self.broker.get_account()
+            except Exception as exc:
+                self._record_failed_reconciliation(None, exc)
+                raise
+            try:
+                return self._reconcile_account(
+                    started, account, synchronize_known_orders=synchronize_known_orders
+                )
+            except Exception as exc:
+                self._record_failed_reconciliation(account.account_id, exc)
+                raise
 
     def _reconcile_account(
         self,
@@ -112,15 +122,21 @@ class Reconciler:
         local_by_client = {o["client_order_id"]: o for o in local_orders}
 
         latest_run = self.ledger.latest_reconciliation(account.account_id)
-        recent_since = (
+        activity_watermark = (
             ensure_aware(
-                datetime.fromisoformat(latest_run["completed_at"]),
+                datetime.fromisoformat(latest_run["started_at"]),
                 "reconciliation watermark",
             )
             if latest_run is not None
             else ensure_aware(started, "reconciliation start") - timedelta(days=7)
         )
+        recent_since = activity_watermark - RECENT_ORDER_WATERMARK_OVERLAP
         recent_orders = self.broker.get_recent_orders(recent_since)
+        fill_since = activity_watermark - BROKER_ACTIVITY_WATERMARK_OVERLAP
+        # One bounded activity snapshot is shared by known-order import and
+        # untracked-fill detection. Repeated lifetime scans eventually exceed
+        # Alpaca's pagination safety bound and can make recovery unavailable.
+        broker_fills = self.broker.get_fills(fill_since)
         recent_broker_ids = [order.broker_order_id for order in recent_orders]
         recent_client_ids = [order.client_order_id for order in recent_orders]
         if (
@@ -159,7 +175,6 @@ class Reconciler:
             ))
 
         if synchronize_known_orders:
-            broker_fills = self.broker.get_fills()
             for local in local_orders:
                 broker_order = self.broker.get_order_by_client_id(local["client_order_id"])
                 if broker_order is None:
@@ -233,14 +248,16 @@ class Reconciler:
                     broker_order.client_order_id,
                 ))
 
-        for fill in self.broker.get_fills():
-            if (
-                fill.client_order_id.startswith(self.client_id_prefix)
-                and fill.client_order_id not in local_by_client
-            ):
+        for fill in broker_fills:
+            if fill.client_order_id not in local_by_client:
+                system_fill = fill.client_order_id.startswith(self.client_id_prefix)
                 issues.append(ReconciliationIssue(
-                    "UNTRACKED_SYSTEM_FILL",
-                    "Broker has a namespaced fill with no matching local order",
+                    "UNTRACKED_SYSTEM_FILL" if system_fill else "EXTERNAL_FILL",
+                    (
+                        "Broker has a namespaced fill with no matching local order"
+                        if system_fill
+                        else "Broker has an external fill with no matching local order"
+                    ),
                     fill.fill_id,
                 ))
 
@@ -294,13 +311,12 @@ class Reconciler:
         issue_payload = [json_safe({
             "code": i.code, "message": i.message, "entity_id": i.entity_id
         }) for i in issues]
-        self.ledger.record_reconciliation(
-            run_id,
-            account.account_id,
-            started.isoformat(),
-            completed.isoformat(),
-            not issues,
-            issue_payload,
+        self._record_reconciliation_state(
+            run_id=run_id,
+            account_id=account.account_id,
+            started_at=started.isoformat(),
+            completed_at=completed.isoformat(),
+            issue_payload=issue_payload,
         )
         if issues:
             # Persist every reconciliation incident at the reconciliation
@@ -316,6 +332,7 @@ class Reconciler:
                     "POSITION_MISMATCH": "unexpected_position",
                     "EXTERNAL_OPEN_ORDER": "externally_created_order",
                     "EXTERNAL_RECENT_ORDER": "externally_created_order",
+                    "EXTERNAL_FILL": "externally_created_fill",
                     "UNTRACKED_SYSTEM_ORDER": "duplicate_or_untracked_intent",
                     "DUPLICATE_BROKER_OPEN_ORDER": "duplicate_intent",
                     "DUPLICATE_BROKER_RECENT_ORDER": "duplicate_intent",
@@ -325,13 +342,6 @@ class Reconciler:
                     entity_id=entity_id,
                     dedupe_key=f"reconcile:{issue.code}:{entity_id}",
                 )
-            control = self.ledger.get_control_state(account.account_id)
-            self.ledger.set_control_state(
-                account.account_id,
-                armed=False,
-                kill_switch=control["kill_switch"],
-                reason=f"reconciliation {run_id} found {len(issues)} issue(s)",
-            )
         return ReconciliationReport(
             run_id=run_id,
             account_id=account.account_id,
@@ -340,6 +350,78 @@ class Reconciler:
             started_at=started.isoformat(),
             completed_at=completed.isoformat(),
         )
+
+    def _record_reconciliation_state(
+        self,
+        *,
+        run_id: str,
+        account_id: str,
+        started_at: str,
+        completed_at: str,
+        issue_payload: list[dict],
+    ) -> None:
+        """Persist a dirty report and fail-closed control state atomically.
+
+        The execution fence prevents a cooperating submitter from observing a
+        newly dirty reconciliation while an earlier armed state is still
+        durable. Alert creation deliberately follows this transaction so an
+        alert-delivery crash cannot preserve submit authority.
+        """
+        if not issue_payload:
+            self.ledger.record_reconciliation(
+                run_id, account_id, started_at, completed_at, True, issue_payload
+            )
+            return
+
+        now = self.ledger.clock().isoformat()
+        reason = f"reconciliation {run_id} found {len(issue_payload)} issue(s)"
+        with self.ledger.execution_guard():
+            with self.ledger._tx() as cur:
+                cur.execute(
+                    """INSERT INTO reconciliation_runs(
+                           run_id, account_id, started_at, completed_at, clean,
+                           issue_count, payload_json
+                       ) VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                    (
+                        run_id, account_id, started_at, completed_at,
+                        len(issue_payload),
+                        json.dumps(
+                            json_safe({"issues": issue_payload}), sort_keys=True
+                        ),
+                    ),
+                )
+                self.ledger._audit(
+                    cur, "reconciliation_completed", "reconciliation", run_id,
+                    {
+                        "account_id": account_id,
+                        "clean": False,
+                        "issue_count": len(issue_payload),
+                    },
+                )
+                current = cur.execute(
+                    "SELECT kill_switch FROM control_state WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+                kill_switch = bool(current["kill_switch"]) if current is not None else False
+                cur.execute(
+                    """INSERT INTO control_state(
+                           account_id, armed, kill_switch, reason, updated_at
+                       ) VALUES (?, 0, ?, ?, ?)
+                       ON CONFLICT(account_id) DO UPDATE SET
+                         armed=0,
+                         kill_switch=excluded.kill_switch,
+                         reason=excluded.reason,
+                         updated_at=excluded.updated_at""",
+                    (account_id, int(kill_switch), reason, now),
+                )
+                self.ledger._audit(
+                    cur, "control_state_changed", "account", account_id,
+                    {
+                        "armed": False,
+                        "kill_switch": kill_switch,
+                        "reason": reason,
+                    },
+                )
 
     def _record_failed_reconciliation(
         self, observed_account_id: str | None, exc: Exception

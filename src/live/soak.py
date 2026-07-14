@@ -59,13 +59,13 @@ class PaperSoakReporter:
         ).fetchall()
         slippage_weighted = Decimal("0")
         slippage_qty = Decimal("0")
-        order_by_id = {row["broker_order_id"]: row for row in orders if row["broker_order_id"]}
-        # Cumulative fill reports need all orders for the reference lookup.
-        if not day:
-            order_by_id = {
-                row["broker_order_id"]: row for row in self.ledger.conn.execute("SELECT * FROM orders")
-                if row["broker_order_id"]
-            }
+        # A fill may be recorded after midnight or during restart recovery for
+        # an order created on an earlier day. Daily fill selection and order
+        # attribution are intentionally independent.
+        order_by_id = {
+            row["broker_order_id"]: row for row in self.ledger.conn.execute("SELECT * FROM orders")
+            if row["broker_order_id"]
+        }
         for fill in fills:
             order = order_by_id.get(fill["broker_order_id"])
             if order is None:
@@ -90,6 +90,22 @@ class PaperSoakReporter:
             except Exception:
                 pass
         stream = self.store.stream_state()
+        audit_events = self.ledger.list_audit_events()
+        daily_audit_events = (
+            [row for row in audit_events if row["occurred_at"].startswith(day)]
+            if day else audit_events
+        )
+        if day:
+            stream_disconnects = sum(
+                row["event_type"] == "stream_disconnected" for row in daily_audit_events
+            )
+            stream_recoveries = sum(
+                row["event_type"] == "stream_recovery_completed"
+                for row in daily_audit_events
+            )
+        else:
+            stream_disconnects = stream["disconnect_count"] if stream else 0
+            stream_recoveries = stream["recovery_count"] if stream else 0
         unresolved = self.store.list_alerts(unresolved_only=True)
         if day:
             unresolved = [row for row in unresolved if row["first_seen_at"].startswith(day)]
@@ -121,13 +137,11 @@ class PaperSoakReporter:
             ),
             "process_uptime_seconds": self._sum(observations["process_uptime_seconds"]),
             "unresolved_alerts": len(unresolved),
-            "stream_disconnects": stream["disconnect_count"] if stream else 0,
-            "stream_recoveries": stream["recovery_count"] if stream else 0,
-            "recovery_events": len([
-                row for row in self.ledger.list_audit_events()
-                if row["event_type"] in {"reconciliation_completed", "alert_escalated"}
-                and (day is None or row["occurred_at"].startswith(day))
-            ]),
+            "stream_disconnects": stream_disconnects,
+            "stream_recoveries": stream_recoveries,
+            # Routine reconciliations and alert escalation are health work,
+            # not recovery incidents. Count completed stream recoveries only.
+            "recovery_events": stream_recoveries,
             "database_integrity": bool(quick and quick[0] == "ok"),
             "duplicate_prevention": {
                 "unique_client_order_ids": self._is_unique("orders", "client_order_id"),

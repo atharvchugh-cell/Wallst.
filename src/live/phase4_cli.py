@@ -60,6 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--confirm-publish", action="store_true")
     publish.add_argument("--confirm-manual-catch-up", action="store_true")
 
+    skip_schedule = sub.add_parser(
+        "skip-schedule",
+        help="offline operator disposition of a scheduler run; never contacts a broker",
+    )
+    _common(skip_schedule, db=True)
+    skip_schedule.add_argument("--run-id", required=True)
+    skip_schedule.add_argument("--operator", required=True)
+    skip_schedule.add_argument("--reason", required=True)
+    skip_schedule.add_argument("--confirm-skip-schedule", action="store_true")
+
     inspect = sub.add_parser(
         "inspect-snapshot",
         help="offline structural/hash inspection; signature authenticity is not checked",
@@ -169,13 +179,22 @@ def _require(value: bool, message: str, parser: argparse.ArgumentParser) -> None
         parser.error(message)
 
 
-def _load(args) -> tuple[DeploymentConfig, Phase4Policy, object | None]:
+def _load(
+    args, *, require_signer: bool = True, load_signer: bool = True
+) -> tuple[DeploymentConfig, Phase4Policy, object | None]:
     deployment = DeploymentConfig.from_file(args.deployment)
     policy = Phase4Policy.from_file(args.policy)
     policy.validate_deployment(deployment)
-    key_path = os.getenv("WSLAB_PHASE4_SIGNING_KEY_FILE", "").strip()
-    signer = HMACFileSigner(key_path, policy.signing_key_id) if key_path else None
-    if policy.require_signing and signer is None:
+    signer = None
+    if load_signer:
+        key_path = os.getenv("WSLAB_PHASE4_SIGNING_KEY_FILE", "").strip()
+        try:
+            signer = HMACFileSigner(key_path, policy.signing_key_id) if key_path else None
+        except (OSError, Phase4Error):
+            if require_signer:
+                raise
+            signer = None
+    if require_signer and policy.require_signing and signer is None:
         raise Phase4Error(
             "Set WSLAB_PHASE4_SIGNING_KEY_FILE to an operator-owned mode-0600 key file"
         )
@@ -213,6 +232,49 @@ def _automatic_backup(ledger, policy, args, alerts):
     ).create((args.deployment, args.policy))
 
 
+def _automatic_backup_after_failure(
+    ledger: Ledger,
+    policy: Phase4Policy,
+    args,
+    alerts: AlertManager,
+    original: Exception,
+    *,
+    workflow: str,
+) -> None:
+    """Best-effort backup without replacing the workflow's original failure.
+
+    A command can fail after its durable transaction has committed (for
+    example, reconciliation can be recorded before alert delivery fails, or a
+    broker submit can precede post-submit reconciliation).  Always attempt the
+    same automatic backup used on success while the ledger is still open.  If
+    that attempt also fails, keep the workflow exception as the raised error
+    and retain a bounded, credential-free secondary-failure audit record where
+    SQLite is still writable.
+    """
+
+    try:
+        _automatic_backup(ledger, policy, args, alerts)
+    except Exception as backup_exc:
+        try:
+            ledger.record_audit(
+                "automatic_backup_failed_after_workflow_error",
+                "phase4_workflow",
+                workflow,
+                {
+                    "workflow_error_type": type(original).__name__,
+                    "backup_error_type": type(backup_exc).__name__,
+                },
+            )
+        except Exception:
+            # The original workflow error is always authoritative, including
+            # when the ledger itself is the reason evidence cannot be written.
+            pass
+        try:
+            original.__cause__ = backup_exc
+        except Exception:
+            pass
+
+
 def _print(payload) -> None:
     print(json.dumps(json_safe(payload), indent=2, sort_keys=True))
 
@@ -226,11 +288,13 @@ def _publish(args) -> dict:
         store = Phase4Store(ledger)
         alerts = _alerts(store)
         scheduler = SupervisedMonthlyScheduler(broker, store, alerts=alerts)
-        due, run, _created = scheduler.claim_due(
-            confirm_manual_catch_up=args.confirm_manual_catch_up
-        )
         publisher = _publisher(deployment, policy, signer)
+        snapshot = None
+        run = None
         try:
+            due, run, _created = scheduler.claim_due(
+                confirm_manual_catch_up=args.confirm_manual_catch_up
+            )
             account = broker.get_account()
             ledger.assert_account_binding(account.account_id)
             if not ledger.positions_bootstrapped(account.account_id):
@@ -268,27 +332,91 @@ def _publish(args) -> dict:
                 signer=signer, alerts=alerts,
             )
             row, created = supervisor.persist_snapshot(snapshot, output_path=output)
+            # The immutable snapshot and scheduler state are one publication
+            # boundary. Finalize the schedule before any best-effort evidence
+            # work so a backup failure cannot rewrite a real publication as
+            # failed, and so the backup contains the published schedule row.
+            scheduler.mark_published(run["run_id"], snapshot.snapshot_id)
             ledger.record_audit(
                 "phase4_paper_request_ids", "target_snapshot", snapshot.snapshot_id,
                 {"request_ids": list(broker.drain_request_ids())},
             )
-            backup = _automatic_backup(ledger, policy, args, alerts)
-            scheduler.mark_published(run["run_id"], snapshot.snapshot_id)
-            return {
+            result = {
                 "paper_only": True, "network_orders_submitted": False,
                 "snapshot": snapshot.to_payload(), "snapshot_path": str(output.resolve()),
                 "created": created, "scheduler_run": run["run_id"],
-                "automatic_backup": backup,
             }
         except Exception as exc:
             lowered = str(exc).lower()
-            if any(token in lowered for token in ("stale", "missing finalized", "calendar incomplete")):
-                alerts.emit(
-                    "critical", "stale_data", f"Publication data rejected: {type(exc).__name__}",
-                    entity_id=run["run_id"], dedupe_key=f"stale-data:{run['run_id']}",
+            if (
+                run is not None
+                and any(
+                    token in lowered
+                    for token in ("stale", "missing finalized", "calendar incomplete")
                 )
-            scheduler.mark_failed(run["run_id"], exc)
+            ):
+                try:
+                    alerts.emit(
+                        "critical", "stale_data",
+                        f"Publication data rejected: {type(exc).__name__}",
+                        entity_id=run["run_id"],
+                        dedupe_key=f"stale-data:{run['run_id']}",
+                    )
+                except Exception:
+                    # Alert delivery must not prevent scheduler recovery or the
+                    # failure-path backup attempt.
+                    pass
+            try:
+                persisted_snapshot = None
+                if snapshot is not None:
+                    persisted_snapshot = ledger.conn.execute(
+                        "SELECT snapshot_id, content_hash FROM target_snapshots WHERE snapshot_id=?",
+                        (snapshot.snapshot_id,),
+                    ).fetchone()
+                    if (
+                        persisted_snapshot is not None
+                        and persisted_snapshot["content_hash"] != snapshot.content_hash
+                    ):
+                        persisted_snapshot = None
+                if run is not None and persisted_snapshot is None:
+                    scheduler.mark_failed(run["run_id"], exc)
+                elif run is not None:
+                    # persist_snapshot writes the ledger before its optional file
+                    # export, so even an export error can arrive after publication.
+                    # Recover/finalize that exact durable fact; never downgrade it.
+                    current_run = ledger.conn.execute(
+                        "SELECT status, snapshot_id FROM scheduler_runs WHERE run_id=?",
+                        (run["run_id"],),
+                    ).fetchone()
+                    if not (
+                        current_run is not None
+                        and current_run["status"] == "published"
+                        and current_run["snapshot_id"] == snapshot.snapshot_id
+                    ):
+                        scheduler.mark_published(run["run_id"], snapshot.snapshot_id)
+            except Exception as recovery_exc:
+                try:
+                    ledger.record_audit(
+                        "publication_state_recovery_failed",
+                        "phase4_workflow",
+                        "publish",
+                        {
+                            "workflow_error_type": type(exc).__name__,
+                            "recovery_error_type": type(recovery_exc).__name__,
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    exc.__cause__ = recovery_exc
+                except Exception:
+                    pass
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="publish"
+            )
             raise
+        result["automatic_backup"] = _automatic_backup(ledger, policy, args, alerts)
+        return result
 
 
 def _prepare(args) -> dict:
@@ -302,10 +430,16 @@ def _prepare(args) -> dict:
             ledger, deployment, policy, publisher, broker, market_data,
             signer=signer, alerts=alerts,
         )
-        plan, created = supervisor.prepare_plan(
-            args.snapshot_id,
-            confirm_new_equity_session=args.confirm_new_equity_session,
-        )
+        try:
+            plan, created = supervisor.prepare_plan(
+                args.snapshot_id,
+                confirm_new_equity_session=args.confirm_new_equity_session,
+            )
+        except Exception as exc:
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="prepare-plan"
+            )
+            raise
         backup = _automatic_backup(ledger, policy, args, alerts)
         return {
             "paper_only": True,
@@ -318,31 +452,66 @@ def _prepare(args) -> dict:
         }
 
 
+def _skip_schedule(args) -> dict:
+    _deployment, policy, _signer = _load(
+        args, require_signer=False, load_signer=False
+    )
+    with Ledger(args.db) as ledger:
+        store = Phase4Store(ledger)
+        alerts = _alerts(store)
+        # mark_skipped is deliberately offline and never consults the calendar
+        # source; None makes that non-network boundary explicit.
+        scheduler = SupervisedMonthlyScheduler(None, store, alerts=alerts)
+        try:
+            row = scheduler.mark_skipped(
+                args.run_id, operator=args.operator, reason=args.reason
+            )
+        except Exception as exc:
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="skip-schedule"
+            )
+            raise
+        backup = _automatic_backup(ledger, policy, args, alerts)
+        return {
+            "paper_only": True,
+            "network_used": False,
+            "scheduler_run": row,
+            "automatic_backup": backup,
+        }
+
+
 def _approve(args) -> dict:
     deployment, policy, signer = _load(args)
     with Ledger(args.db) as ledger:
         store = Phase4Store(ledger)
         alerts = _alerts(store)
-        link = store.execution_plan_link(args.batch_id)
-        if link is None or not link["paper_submission_allowed"]:
-            raise Phase4Error("Batch is not an executable Phase-4 paper plan")
-        if link["operation_mode"] not in {
-            OperationMode.PAPER_MANUAL.value, OperationMode.PAPER_SUPERVISED.value,
-        }:
-            raise Phase4Error("Only manual/supervised paper plans may be approved")
-        snapshot = store.load_snapshot(link["snapshot_id"])
-        snapshot.verify(policy, signer, now=ledger.clock())
-        if snapshot.content["account_id_fingerprint"] != account_fingerprint(
-            deployment.account_id, policy.system_id
-        ):
-            raise Phase4Error("Snapshot account fingerprint mismatch")
-        _publisher(deployment, policy, signer).to_execution_targets(snapshot)
-        row = ledger.approve_execution_batch(
-            args.batch_id, args.plan_hash, approved_by=args.operator, reason=args.reason
-        )
+        try:
+            link = store.execution_plan_link(args.batch_id)
+            if link is None or not link["paper_submission_allowed"]:
+                raise Phase4Error("Batch is not an executable Phase-4 paper plan")
+            if link["operation_mode"] not in {
+                OperationMode.PAPER_MANUAL.value, OperationMode.PAPER_SUPERVISED.value,
+            }:
+                raise Phase4Error("Only manual/supervised paper plans may be approved")
+            snapshot = store.load_snapshot(link["snapshot_id"])
+            snapshot.verify(policy, signer, now=ledger.clock())
+            if snapshot.content["account_id_fingerprint"] != account_fingerprint(
+                deployment.account_id, policy.system_id
+            ):
+                raise Phase4Error("Snapshot account fingerprint mismatch")
+            _publisher(deployment, policy, signer).to_execution_targets(snapshot)
+            row = ledger.approve_phase4_execution_batch(
+                args.batch_id, args.plan_hash, approved_by=args.operator, reason=args.reason
+            )
+        except Exception as exc:
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="approve"
+            )
+            raise
+        backup = _automatic_backup(ledger, policy, args, alerts)
         return {
             "paper_only": True, "network_used": False, "batch": row,
-            "automatic_backup": _automatic_backup(ledger, policy, args, alerts),
+            "automatic_backup": backup,
         }
 
 
@@ -356,45 +525,62 @@ def _run_paper(args) -> dict:
             ledger, deployment, policy, _publisher(deployment, policy, signer),
             broker, market_data, signer=signer, alerts=alerts,
         )
-        result = supervisor.run_paper(args.batch_id, operator=args.operator, reason=args.reason)
-        ledger.record_audit(
-            "phase4_paper_request_ids", "execution_batch", args.batch_id,
-            {"trading_request_ids": list(broker.drain_request_ids()),
-             "data_request_ids": list(market_data.drain_request_ids())},
-        )
-        payload = result.to_payload()
+        try:
+            result = supervisor.run_paper(
+                args.batch_id, operator=args.operator, reason=args.reason
+            )
+            ledger.record_audit(
+                "phase4_paper_request_ids", "execution_batch", args.batch_id,
+                {"trading_request_ids": list(broker.drain_request_ids()),
+                 "data_request_ids": list(market_data.drain_request_ids())},
+            )
+            payload = result.to_payload()
+        except Exception as exc:
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="run-paper"
+            )
+            raise
         payload["automatic_backup"] = _automatic_backup(ledger, policy, args, alerts)
         return payload
 
 
 def _reconcile(args) -> dict:
-    deployment, policy, signer = _load(args)
+    deployment, policy, _signer = _load(
+        args, require_signer=False, load_signer=False
+    )
     broker, _market_data = _paper_stack()
     with Ledger(args.db) as ledger:
         store = Phase4Store(ledger)
         alerts = _alerts(store)
-        report = Reconciler(ledger, broker).reconcile()
-        for issue in report.issues:
-            category = {
-                "CASH_MISMATCH": "cash_mismatch",
-                "POSITION_MISMATCH": "unexpected_position",
-                "EXTERNAL_OPEN_ORDER": "externally_created_order",
-                "DUPLICATE_BROKER_OPEN_ORDER": "duplicate_intent",
-            }.get(issue.code, "reconciliation_mismatch")
-            alerts.emit(
-                "critical", category, issue.message,
-                entity_id=issue.entity_id or report.run_id,
-                dedupe_key=f"reconcile:{issue.code}:{issue.entity_id}",
+        try:
+            report = Reconciler(ledger, broker).reconcile()
+            for issue in report.issues:
+                category = {
+                    "CASH_MISMATCH": "cash_mismatch",
+                    "POSITION_MISMATCH": "unexpected_position",
+                    "EXTERNAL_OPEN_ORDER": "externally_created_order",
+                    "DUPLICATE_BROKER_OPEN_ORDER": "duplicate_intent",
+                }.get(issue.code, "reconciliation_mismatch")
+                alerts.emit(
+                    "critical", category, issue.message,
+                    entity_id=issue.entity_id or report.run_id,
+                    dedupe_key=f"reconcile:{issue.code}:{issue.entity_id}",
+                )
+            result = {
+                "run_id": report.run_id, "clean": report.clean,
+                "issues": [issue.__dict__ for issue in report.issues],
+            }
+        except Exception as exc:
+            _automatic_backup_after_failure(
+                ledger, policy, args, alerts, exc, workflow="reconcile"
             )
-        return {
-            "run_id": report.run_id, "clean": report.clean,
-            "issues": [issue.__dict__ for issue in report.issues],
-            "automatic_backup": _automatic_backup(ledger, policy, args, alerts),
-        }
+            raise
+        result["automatic_backup"] = _automatic_backup(ledger, policy, args, alerts)
+        return result
 
 
 def _health(args) -> dict:
-    deployment, policy, signer = _load(args)
+    deployment, policy, signer = _load(args, require_signer=False)
     broker = None
     scheduler = None
     with Ledger(args.db) as ledger:
@@ -414,7 +600,9 @@ def _health(args) -> dict:
 
 
 def _stream(args) -> None:
-    deployment, policy, signer = _load(args)
+    deployment, _policy, _signer = _load(
+        args, require_signer=False, load_signer=False
+    )
     broker, _market_data = _paper_stack()
     with Ledger(args.db) as ledger:
         account = broker.get_account()
@@ -475,6 +663,13 @@ def main(argv: list[str] | None = None) -> int:
             _require(args.confirm_paper_network, "publish requires --confirm-paper-network", parser)
             _require(args.confirm_publish, "publish requires --confirm-publish", parser)
             _print(_publish(args))
+        elif args.command == "skip-schedule":
+            _require(
+                args.confirm_skip_schedule,
+                "skip-schedule requires --confirm-skip-schedule",
+                parser,
+            )
+            _print(_skip_schedule(args))
         elif args.command == "inspect-snapshot":
             if args.snapshot:
                 snapshot = PublishedTargetSnapshot.from_file(args.snapshot)
@@ -542,18 +737,27 @@ def main(argv: list[str] | None = None) -> int:
                     _require(args.confirm_alert_change, "alert change requires confirmation", parser)
                     _require(bool(args.operator and args.note), "alert change requires operator/note", parser)
                     if args.resolve:
-                        _assert_alert_resolution_safe(ledger, store, args.resolve)
-                    row = (
-                        store.acknowledge_alert(args.acknowledge, operator=args.operator, note=args.note)
-                        if args.acknowledge else
-                        store.resolve_alert(args.resolve, operator=args.operator, note=args.note)
-                    )
+                        # Critical emission uses the same fence. Keep the safety
+                        # decision and resolution write in one linearizable
+                        # interval so a repeated incident cannot refresh
+                        # last_seen_at between the check and the write.
+                        with ledger.execution_guard():
+                            _assert_alert_resolution_safe(ledger, store, args.resolve)
+                            row = store.resolve_alert(
+                                args.resolve, operator=args.operator, note=args.note
+                            )
+                    else:
+                        row = store.acknowledge_alert(
+                            args.acknowledge, operator=args.operator, note=args.note
+                        )
                     _print(row)
                 else:
                     _print(store.list_alerts(unresolved_only=args.unresolved_only))
         elif args.command == "backup":
             _require(args.confirm_create_backup, "backup requires --confirm-create-backup", parser)
-            deployment, policy, signer = _load(args)
+            deployment, policy, _signer = _load(
+                args, require_signer=False, load_signer=False
+            )
             with Ledger(args.db) as ledger:
                 row = BackupManager(
                     ledger, args.backup_dir, retention=policy.backup_retention,
@@ -578,7 +782,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.confirm_record_soak_observation,
                 "soak-observe requires --confirm-record-soak-observation", parser,
             )
-            deployment, policy, signer = _load(args)
+            deployment, policy, _signer = _load(
+                args, require_signer=False, load_signer=False
+            )
             if not args.operator.strip() or not args.reason.strip():
                 raise Phase4Error("soak-observe requires non-empty operator and reason")
             with Ledger(args.db) as ledger:

@@ -48,8 +48,8 @@ session. It requires:
 - exact SPY calendar completion and exact required-symbol coverage;
 - a forced post-close refresh (same-day caches are never trusted for publication),
   at least 200 complete finalized sessions, finite/positive adjusted OHLCV across
-  the full indicator window, valid OHLC geometry, no repeated final bar, and no
-  strategy-dropped registered ticker;
+  the full indicator window, valid OHLC geometry, no carried-forward prior OHLC
+  row even if volume changes, and no strategy-dropped registered ticker;
 - current active, tradable US-equity asset metadata, supported exchange,
   stable asset ID, and no unresolved duplicate share class;
 - a dedicated paper account with no short, fractional, duplicate, or unmanaged
@@ -81,6 +81,12 @@ Snapshots are inserted once into the execution ledger and protected by SQLite
 update/delete triggers. Optional exported snapshot files are created with
 exclusive creation and mode `0400`.
 
+The first execution artifact irreversibly binds a ledger to either the legacy
+Phase-3 approval model or the Phase-4 signed-snapshot model. Migration refuses
+mixed artifacts, the profile is protected by update/delete triggers, and a
+Phase-4 plan can be approved only through its immutable snapshot link. Use a
+fresh ledger when changing execution phases; do not reuse a Phase-3 ledger.
+
 ## Research prices versus execution prices
 
 Adjusted research closes decide ranks and provide only a non-executable delta
@@ -90,10 +96,23 @@ adds exact quote coverage, maximum spread, and maximum deviation checks.
 Phase 3 independently repeats freshness, price-collar, account, position,
 turnover, concentration, cash, order-count, and OMS risk checks.
 
+Phase-4 deployment, minimum-trade, concentration, order-count, session, and
+cash-deployment limits are rechecked against current account equity and current
+quotes at both preview and execution. Every active order reserves its remaining
+quantity at a durable conservative risk price against account-wide cash,
+buying-power, exposure, concentration, and turnover limits.
+
 Orders are regular-hours `market` / `day`, whole-share, long-only target
 position orders. Sells sort before buys. At most one unresolved order is
 allowed; a later order requires fill recovery and clean reconciliation. An
 exit never exceeds the reconciled broker quantity.
+
+Immediately before the broker POST, after repeating deterministic client-ID
+discovery, OMS invokes the Phase-4 durable authorizer while holding the same
+cross-process fence used by disarm/kill, critical-alert, and stream-recovery
+writers. Any intervening mode, batch, snapshot, reconciliation, stream, alert,
+or control-state change blocks the POST and disarms the account before the
+fence is released.
 
 A market order does **not** reproduce the backtest's synthetic next-session
 adjusted close. Paper fills also do not reproduce live queue position, market
@@ -126,16 +145,31 @@ prevents duplicate decisions. Runs are recorded as due, published, skipped,
 delayed, or failed. Publication after the expected next open is a catch-up and
 requires explicit operator confirmation.
 
+An outstanding due/delayed/failed run remains the oldest next action, including
+across month and year boundaries. After a prior terminal run, restart recovery
+walks forward to the earliest missing due month with a bounded 24-month scan;
+a fresh ledger does not invent older obligations. A missed run whose execution
+window closed must be explicitly dispositioned with the offline
+`skip-schedule` command, operator, reason, and confirmation. Skipped evidence is
+terminal and immutable, and the scheduler then advances to the next missing
+month.
+
 Correctness does not depend on a continuously running process. A one-shot
 scheduler can be invoked by `launchd`, cron, or another supervisor; after a
-restart it reads the durable run/snapshot state and refuses duplicates.
+restart it reads the durable run/snapshot state and refuses duplicates. Health
+computes the next action in the exchange session timezone and surfaces an
+outstanding prior-month due/delayed/failed run instead of hiding it behind the
+next calendar month.
 
 ## Stream and reconciliation semantics
 
 The Alpaca paper `trade_updates` transport is hard-pinned to the paper
 websocket. It handles bounded exponential reconnect, local sequence tracking,
 duplicate event IDs, out-of-order events, multiple partial fills, fills while
-cancel is pending, cancellation, rejection, expiration, and disconnects.
+cancel is pending, cancellation, rejection, expiration, and disconnects. The
+top-level channel and event allowlist are strict; unsupported correction/bust
+events and non-US-equity payloads fail closed into REST recovery rather than
+being guessed at.
 
 The durable stream state is not marked ready until websocket authentication,
 `trade_updates` subscription, and REST reconciliation succeed. The stream
@@ -150,9 +184,12 @@ as terminal, while any successor not created under the known deterministic
 client ID is an external-order mismatch requiring operator resolution.
 
 The ledger remains authoritative locally. Every connect/reconnect first blocks
-submission, then fetches account, positions, open orders, recent orders in all
-statuses (including terminal orders), recent fills and known client IDs through
-REST, recovers unresolved orders, and reconciles.
+submission, then fetches account, positions, open orders, overlap-watermarked
+recent orders in all statuses (including terminal orders), bounded recent fills
+and known client IDs through REST, recovers unresolved orders, and reconciles.
+The watermark starts before the previous reconciliation began, so activity that
+arrived during that run is not skipped; recovery does not issue lifetime-wide
+order or fill scans.
 Only a clean result clears the recovery block. Unknown orders, positions, cash
 differences, duplicate identifiers, missing local/broker state, or conflicts
 stay recorded and generate critical alerts; nothing is silently deleted or
@@ -167,19 +204,25 @@ submission blocker after recovery until an operator resolves them. Structured
 console output is available;
 an HTTPS webhook sink is optional, sends no broker credentials, disables
 redirects and environment proxies, requires an explicit hostname allowlist,
-rejects non-public literal/resolved addresses, and has a bounded timeout. No
-URL is committed or persisted.
+rejects non-public literal/resolved addresses, pins the request to a validated
+public address while retaining TLS SNI/hostname verification, and has a bounded
+timeout. No URL is committed or persisted.
 
 The health command is read-only unless explicit alert-write flags are used. It
 reports mode, armed/kill state, broker connectivity, stream state, recent
 reconciliation, latest signature- and provenance-valid snapshot, unresolved/overdue orders,
 alerts, backup, database integrity, next action, and blockers.
 `armed=false` is the safe boundary state and is not itself a readiness failure;
-Phase 3 arms only inside the guarded submission sequence.
+Phase 3 arms only inside the guarded submission sequence. Observe/shadow and
+offline paper inspection are never reported submission-ready. Connected checks
+also validate account identity, active status, USD currency, trade/account
+blocks, cash, equity, buying power, and available account-age metadata.
 
-Every state-changing trading-workflow command (`publish`, `prepare-plan`,
-`approve`, `run-paper`, `reconcile`, and `soak-observe`) creates a SQLite-safe
-versioned backup automatically. Stream event ingestion remains in the durable WAL ledger
+Every state-changing trading-workflow command (`publish`, `skip-schedule`,
+`prepare-plan`, `approve`, `run-paper`, `reconcile`, and `soak-observe`) creates a SQLite-safe
+versioned backup automatically. If the workflow fails after or during a durable
+state transition, it still attempts that evidence backup and preserves the
+original workflow exception if backup also fails. Stream event ingestion remains in the durable WAL ledger
 and is covered by scheduled/manual backups rather than copying on every frame.
 Backups include a verified SQLite snapshot plus
 credential-scanned deployment/policy copies and SHA-256 manifest. The backup
@@ -191,10 +234,19 @@ atomic replacement, and fsyncs the replacement. Colocated SHA-256 files prove
 consistency/corruption detection, not hostile authenticity; signed/off-host
 manifests remain a deployment responsibility.
 
+Every file-backed ledger holds a shared lifetime lock. Restore requires a
+nonblocking exclusive lock on the destination and therefore refuses replacement
+while any cooperating scheduler, stream, CLI, or other ledger process remains
+open; the runbook still requires stopping everything before replacement.
+
 Soak reports provide daily and cumulative decisions, snapshots, plans, orders,
 fills, rejects, cancellations, partials, reconciliation, reference slippage,
 optional next-close slippage, target-weight error, alerts, uptime,
 disconnect/recovery counts, database integrity, and uniqueness evidence.
+Daily fill slippage joins fills to their originating order even when the order
+was created on a prior day. Daily stream disconnect/recovery counts come from
+dated state-transition audit events; routine reconciliations are not mislabeled
+as recovery events.
 
 ## CLI and credentials
 
@@ -210,6 +262,12 @@ The CLI rejects live-style environment names. There is no base-URL option and
 the adapters remain pinned to `https://paper-api.alpaca.markets`,
 `https://data.alpaca.markets`, and the paper websocket. Secrets are never
 printed, persisted, included in snapshots, or passed as normal CLI arguments.
+
+The signing key is required for publish, prepare, approve, and paper execution.
+It is deliberately not required merely to reconcile, start REST/websocket
+recovery, create/verify a backup, inspect health, or record/report soak evidence;
+those recovery paths must remain available after key loss. They do not authenticate
+or authorize a target without the key.
 
 Create a key once outside the repository:
 
@@ -234,6 +292,12 @@ POLICY="$HOME/.wallst-strategy-lab/phase4-policy.json"
 SNAPSHOTS="$HOME/.wallst-strategy-lab/snapshots"
 ```
 
+The shipped example policy is deliberately `observe`. The shadow rehearsal
+below requires a copied policy whose JSON `mode` is exactly `shadow`; the CLI
+flag is an assertion and will not override the file. Likewise, moving to
+`paper_manual` or `paper_supervised` requires changing the policy first and
+publishing a fresh signed snapshot—never reuse the shadow snapshot or plan.
+
 After the official final monthly close, publish only:
 
 ```bash
@@ -245,6 +309,19 @@ python3 -m src.live.phase4_cli publish \
 
 If the process missed the expected next open, add
 `--confirm-manual-catch-up` only after following the monthly checklist.
+If the signed next-session execution window has closed, never catch up that
+target. Record the reviewed disposition offline so later months can proceed:
+
+```bash
+python3 -m src.live.phase4_cli skip-schedule \
+  --db "$DB" --deployment "$DEPLOYMENT" --policy "$POLICY" \
+  --run-id schedule-REVIEWED_ID --operator 'operator-name' \
+  --reason 'execution window closed; incident and broker state reviewed' \
+  --confirm-skip-schedule
+```
+
+This command does not load the signing key or contact the broker. Resolve its
+missed-run critical alert only after the alert-response recovery checks.
 
 Start/order-stream recovery in a supervised terminal:
 
